@@ -440,6 +440,14 @@ impl World {
             World::StreamingAiPlugin => "streaming-ai-plugin",
         }
     }
+
+    /// Whether the world imports `wasi:sockets` / `wasi:http`, so its
+    /// `[capabilities] network` rules mean something: `streaming-plugin`
+    /// and `streaming-ai-plugin`.
+    #[must_use]
+    pub const fn has_network(self) -> bool {
+        matches!(self, World::StreamingPlugin | World::StreamingAiPlugin)
+    }
 }
 
 /// Phase-13 `[ui]` block. Asset paths are accepted in 0.1 so plugins

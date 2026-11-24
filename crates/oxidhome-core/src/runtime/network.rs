@@ -34,7 +34,7 @@ mod policy;
 mod sockets;
 
 pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
-pub(crate) use policy::NetworkPolicy;
+pub(crate) use policy::{NetworkPolicy, covers as rule_covers};
 pub(crate) use sockets::address_check;
 
 use oxidhome_manifest::World;
@@ -62,7 +62,7 @@ pub(crate) async fn in_invocation<F: std::future::Future>(
 
 /// Whether `world` gets WASI sockets and HTTP.
 pub(crate) const fn is_streaming(world: World) -> bool {
-    matches!(world, World::StreamingPlugin | World::StreamingAiPlugin)
+    world.has_network()
 }
 
 /// A streaming world's component must export `oxidhome:plugin/streaming`

@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use oxidhome_manifest::{CapabilitiesSection, PluginManifest, ServiceGrant};
+use oxidhome_manifest::{CapabilitiesSection, NetworkRule, PluginManifest, ServiceGrant};
 use rand::TryRng;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
@@ -501,7 +501,8 @@ fn read_no_follow_within_bounded(
 /// leave the operator holding a broader grant on a package that
 /// no longer needs it.
 ///
-/// Set-shaped fields (`network`, `declares_devices`,
+/// `network` rules narrow by containment ([`effective_network_rules`]);
+/// the other set-shaped fields (`declares_devices`,
 /// `declares_services`) intersect on equality; quotas take the
 /// minimum (so does `script_sandboxes`); `subscribes_events` and
 /// `reads_event_bytes` are a boolean AND.
@@ -525,7 +526,7 @@ pub fn effective_capabilities(
     granted: &CapabilitiesSection,
 ) -> CapabilitiesSection {
     CapabilitiesSection {
-        network: intersect_by_eq(&requested.network, &granted.network),
+        network: effective_network_rules(&requested.network, &granted.network),
         storage_quota_kb: requested.storage_quota_kb.min(granted.storage_quota_kb),
         blob_quota_mb: requested.blob_quota_mb.min(granted.blob_quota_mb),
         declares_devices: intersect_by_eq(&requested.declares_devices, &granted.declares_devices),
@@ -541,6 +542,40 @@ pub fn effective_capabilities(
         reads_state: intersect_by_eq(&requested.reads_state, &granted.reads_state),
         reads_event_bytes: requested.reads_event_bytes && granted.reads_event_bytes,
     }
+}
+
+/// The effective `network` rules: every granted rule some requested rule
+/// covers (the operator narrowed it, e.g. `192.168.0.0/16` to one
+/// camera), then every requested rule some granted rule covers (the
+/// operator granted something wider), without duplicates. A rule that
+/// only partly overlaps the other side grants nothing. At most
+/// `requested.len() + granted.len()` rules.
+#[must_use]
+pub fn effective_network_rules(
+    requested: &[NetworkRule],
+    granted: &[NetworkRule],
+) -> Vec<NetworkRule> {
+    let mut out: Vec<NetworkRule> = Vec::new();
+    let narrowed = granted
+        .iter()
+        .filter(|g| requested.iter().any(|r| network_rule_covers(r, g)));
+    let within = requested
+        .iter()
+        .filter(|r| granted.iter().any(|g| network_rule_covers(g, r)));
+    for rule in narrowed.chain(within) {
+        if !out.contains(rule) {
+            out.push(rule.clone());
+        }
+    }
+    out
+}
+
+/// Whether network rule `wide` grants everything `narrow` does, so a
+/// grant of `narrow` against a request for `wide` widens nothing. See
+/// `ARCHITECTURE.md` *Network access* for the rules.
+#[must_use]
+pub fn network_rule_covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
+    crate::runtime::network_rule_covers(wide, narrow)
 }
 
 fn intersect_by_eq<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
@@ -3461,6 +3496,47 @@ wasm = "plugin.wasm"
         };
         let effective = effective_capabilities(&requested, &narrow);
         assert!(!effective.subscribes_events);
+    }
+
+    /// Phase 8: `network` grants narrow by containment — the operator
+    /// can grant one host out of a requested range, a requested host
+    /// out of a granted range, but nothing partly outside the request.
+    #[test]
+    fn effective_network_rules_narrow_by_containment() {
+        let rules = |rs: &[&str]| -> Vec<NetworkRule> {
+            rs.iter().map(|r| r.parse().expect("rule")).collect()
+        };
+        let requested = rules(&[
+            "tcp://192.168.0.0/16:*",
+            "udp://10.0.0.5:9999",
+            "tcp://*.example.com:443",
+        ]);
+        let granted = rules(&[
+            "tcp://192.168.1.20:80",
+            "udp://10.0.0.0/8:*",
+            "tcp://mqtt.example.com:443",
+            "tcp://172.16.0.0/12:*",
+            "tcp://*.example.com:1-1000",
+        ]);
+        assert_eq!(
+            effective_network_rules(&requested, &granted),
+            rules(&[
+                "tcp://192.168.1.20:80",
+                "tcp://mqtt.example.com:443",
+                "udp://10.0.0.5:9999",
+                "tcp://*.example.com:443",
+            ])
+        );
+        // Equal lists stay as they are.
+        assert_eq!(effective_network_rules(&requested, &requested), requested);
+        let effective = effective_capabilities(
+            &CapabilitiesSection {
+                network: requested.clone(),
+                ..CapabilitiesSection::default()
+            },
+            &CapabilitiesSection::default(),
+        );
+        assert_eq!(effective.network, Vec::<NetworkRule>::new());
     }
 
     /// H10 round-4: `effective_capabilities` carries the granted

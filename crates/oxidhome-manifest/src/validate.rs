@@ -119,6 +119,13 @@ pub enum ValidationError {
     )]
     TooManyNetworkRules { count: usize, max: usize },
 
+    #[error(
+        "capabilities.network has {count} rules, but world `{world}` has no network \
+         access; only `streaming-plugin` and `streaming-ai-plugin` do. Set \
+         `[plugin] world = \"streaming-plugin\"` or remove the rules."
+    )]
+    NetworkRulesWithoutNetworkWorld { world: &'static str, count: usize },
+
     #[error("plugin.keywords[{index}] `{got}` is invalid: {reason}")]
     InvalidKeyword {
         index: usize,
@@ -654,6 +661,13 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         errors.push(ValidationError::RuntimeTickIntervalTooSmall {
             got: interval,
             min: MIN_TICK_INTERVAL_MS,
+        });
+    }
+
+    if !m.capabilities.network.is_empty() && !m.plugin.world.has_network() {
+        errors.push(ValidationError::NetworkRulesWithoutNetworkWorld {
+            world: m.plugin.world.as_str(),
+            count: m.capabilities.network.len(),
         });
     }
 
@@ -1395,6 +1409,7 @@ mod tests {
     #[test]
     fn network_rules_reject_over_cap() {
         let mut m = ok_manifest();
+        m.plugin.world = crate::World::StreamingPlugin;
         let rule: crate::NetworkRule = "tcp://192.168.1.2:1883".parse().unwrap();
         m.capabilities.network = vec![rule; MAX_NETWORK_RULES];
         assert!(validate(&m).is_ok());
@@ -1407,6 +1422,37 @@ mod tests {
             ValidationError::TooManyNetworkRules { count, max }
                 if *max == MAX_NETWORK_RULES && *count == MAX_NETWORK_RULES + 1
         )));
+    }
+
+    /// Phase 8: only the streaming worlds have network access, so rules
+    /// on another world are an error rather than silently inert.
+    #[test]
+    fn network_rules_need_a_streaming_world() {
+        let rule: crate::NetworkRule = "tcp://192.168.1.2:1883".parse().unwrap();
+        for world in [crate::World::Plugin, crate::World::AiPlugin] {
+            let mut m = ok_manifest();
+            m.plugin.world = world;
+            assert!(validate(&m).is_ok(), "{world:?} without rules");
+            m.capabilities.network = vec![rule.clone()];
+            let errs = validate(&m).unwrap_err();
+            assert!(
+                errs.iter().any(|e| matches!(
+                    e,
+                    ValidationError::NetworkRulesWithoutNetworkWorld { world: w, count: 1 }
+                        if *w == world.as_str()
+                )),
+                "{errs:?}"
+            );
+        }
+        for world in [
+            crate::World::StreamingPlugin,
+            crate::World::StreamingAiPlugin,
+        ] {
+            let mut m = ok_manifest();
+            m.plugin.world = world;
+            m.capabilities.network = vec![rule.clone()];
+            assert!(validate(&m).is_ok(), "{world:?}");
+        }
     }
 
     /// ADR-0001: a singleton can't run sandboxes.

@@ -6,10 +6,14 @@
 //! manifest parser turns each into a [`NetworkRule`] eagerly so a
 //! malformed rule fails install, not first-connect.
 //!
-//! The host enforces the rules for `streaming-plugin` /
-//! `streaming-ai-plugin` instances (`oxidhome-core`'s
+//! Only `streaming-plugin` / `streaming-ai-plugin` manifests may
+//! declare rules (validation refuses them on other worlds, which have no
+//! network access). The host enforces them (`oxidhome-core`'s
 //! `runtime::network`): every connect, send, name lookup and HTTP
-//! request is checked against the resolved IP address.
+//! request is checked against the resolved IP address. A name rule
+//! reaches private addresses only under a local-only suffix (`.local`,
+//! `.lan`, `.home.arpa`, `.internal`); other LAN hosts need an IP or
+//! CIDR rule.
 //!
 //! ## Grammar
 //!

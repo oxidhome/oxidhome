@@ -21,7 +21,9 @@ manifest's `[capabilities] network` rules:
 - the socket may only bind to the unspecified address (`0.0.0.0:0`).
 
 Network rules are granted explicitly at install time; a rule the
-operator didn't grant has no effect.
+operator didn't grant has no effect, and the operator may grant a
+narrower rule than the manifest asks for (one host out of the subnet,
+say). Only streaming-world manifests may declare network rules.
 
 ## Build
 
