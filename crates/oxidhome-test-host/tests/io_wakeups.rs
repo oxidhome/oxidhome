@@ -190,8 +190,11 @@ async fn a_flood_is_coalesced_into_one_rate_bounded_wakeup() {
     tokio::time::sleep(QUIET).await;
     assert_eq!(int(&storage, "ticks"), 1);
 
+    // Not a moment before the gap ends.
+    host.advance(GAP - Duration::from_millis(1)).await.unwrap();
+    assert_eq!(int(&storage, "ticks"), 1);
     // The gap ends: one tick reads the whole flood.
-    host.advance(GAP).await.unwrap();
+    host.advance(Duration::from_millis(1)).await.unwrap();
     assert_eq!(int(&storage, "ticks"), 2);
     assert_eq!(int(&storage, "received"), 101);
     assert_eq!(string(&storage, "last"), "flood 99");

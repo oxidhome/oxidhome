@@ -27,8 +27,8 @@
 //!   after it as after any tick.
 //!
 //! A datagram the network policy drops on receive (its sender isn't
-//! allowed) can still make the stream readable, so it may cost the
-//! plugin one rate-bounded early tick in which it reads nothing.
+//! allowed) never makes the stream readable: `wasmtime-wasi` discards it
+//! inside the receive that readiness waits on.
 
 use std::any::Any;
 use std::collections::HashSet;

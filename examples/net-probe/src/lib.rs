@@ -98,9 +98,10 @@ impl Plugin for NetProbe {
                 Err(e) => return e.kind() == ErrorKind::WouldBlock,
             }
         });
+        // `received` last: a test that sees it can read `last`.
         if let Some(last) = last {
-            set_int("received", self.received);
             let _ = storage::set("last", &Value::StringVal(last));
+            set_int("received", self.received);
         }
     }
 }

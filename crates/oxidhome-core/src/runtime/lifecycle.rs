@@ -1893,32 +1893,49 @@ enum Wakeup {
     Io(Option<Sleep>),
 }
 
+/// The rate gate after a tick that returned at `last_tick`: a sleep
+/// until [`super::io_wakeup::IO_WAKE_MIN_GAP`] later, or `None` once
+/// that has passed.
+fn io_gate_after(clock: &Clock, last_tick: Option<Instant>) -> Option<Sleep> {
+    last_tick
+        .map(|at| at + super::io_wakeup::IO_WAKE_MIN_GAP)
+        .filter(|at| *at > clock.instant())
+        .map(|at| clock.sleep_until(at))
+}
+
 /// Wait until a socket the guest holds open is readable, but not
-/// before [`super::io_wakeup::IO_WAKE_MIN_GAP`] after `last_tick`
-/// ended. Never completes while the guest holds no socket: it can only
-/// open one in a call, after which the serve loop waits again.
+/// before the `gate` (see [`io_gate_after`]) has fired. Never completes
+/// while the guest holds no socket: it can only open one in a call,
+/// after which the serve loop waits again.
 ///
-/// When the gap is what held a ready socket back, the fired gate sleep
-/// is returned and kept until the tick it triggers is done (a virtual
-/// clock then waits for that tick, see [`Clock::sleep_until`]). A wait
-/// that then goes on for real I/O drops it first: the clock didn't
-/// trigger what follows.
+/// The serve loop creates each gate as soon as the tick returns, so a
+/// virtual clock sees it registered without a gap. When the gate is
+/// what held a ready socket back, the fired gate is returned and kept
+/// until the tick it triggers is done (a virtual clock then waits for
+/// that tick, see [`Clock::sleep_until`]). A wait that then goes on for
+/// real I/O drops it first: the clock didn't trigger what follows.
 async fn io_ready(
     instance: &mut PluginInstance,
     clock: &Clock,
     last_tick: Option<Instant>,
+    gate: &mut Option<Sleep>,
 ) -> Option<Sleep> {
     let mut readable = instance.io_readable();
     if readable.is_empty() {
+        *gate = None;
         return std::future::pending().await;
     }
-    let mut gate = last_tick
-        .map(|at| at + super::io_wakeup::IO_WAKE_MIN_GAP)
-        .filter(|at| *at > clock.instant())
-        .map(|at| clock.sleep_until(at));
+    if gate.is_none() {
+        *gate = io_gate_after(clock, last_tick);
+    }
     if let Some(sleep) = gate.as_mut() {
         sleep.await;
+        // A periodic tick due at the same instant goes first (the
+        // `select!` polls the other arms before this one again), and
+        // its own gate then defers this wakeup: one tick, not two.
+        tokio::task::yield_now().await;
     }
+    let gate = gate.take();
     let now = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(std::pin::Pin::new(&mut readable).poll(cx))
     })
@@ -1962,6 +1979,8 @@ async fn serve_loop(
     // after it. None until the first, so a socket readable straight
     // after `init` is served at once.
     let mut last_tick: Option<Instant> = None;
+    // The rate gate the next early tick waits for.
+    let mut next_gate: Option<Sleep> = None;
     loop {
         // The gate of an early tick, held until its drain is done.
         let mut io_gate: Option<Sleep> = None;
@@ -1979,7 +1998,9 @@ async fn serve_loop(
                 // matching publishes drains together in one pass —
                 // exactly the behaviour we want.
                 () = wake.notified() => Wakeup::Event,
-                gate = io_ready(instance, &clock, last_tick), if io_wakeups => Wakeup::Io(gate),
+                gate = io_ready(instance, &clock, last_tick, &mut next_gate), if io_wakeups => {
+                    Wakeup::Io(gate)
+                }
             }
         };
         // A requested stop goes first: queued commands are then refused
@@ -1995,11 +2016,21 @@ async fn serve_loop(
             Wakeup::Control(ctrl) => {
                 handle_control(instance, state_tx, stop, instance_id, ctrl).await
             }
-            Wakeup::Tick => tick_now(instance, stop, &clock, &mut last_tick).await,
+            Wakeup::Tick => {
+                let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
+                if io_wakeups {
+                    next_gate = io_gate_after(&clock, last_tick);
+                }
+                outcome
+            }
             Wakeup::Io(gate) => {
                 tracing::trace!(instance_id, "socket readable: ticking early");
                 io_gate = gate;
-                tick_now(instance, stop, &clock, &mut last_tick).await
+                let outcome = tick_now(instance, stop, &clock, &mut last_tick).await;
+                // Registered before `io_gate` goes, so a virtual clock
+                // never sees neither.
+                next_gate = io_gate_after(&clock, last_tick);
+                outcome
             }
             Wakeup::Event => Ok(LoopAction::Continue),
         };
