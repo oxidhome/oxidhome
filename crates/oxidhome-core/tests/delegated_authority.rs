@@ -325,7 +325,8 @@ async fn reactions_record_what_caused_them() {
     let row = &rows[0];
     assert_eq!(row.decision, "allow");
     assert_eq!(row.caused_by.as_deref(), Some(call_id.as_str()));
-    assert_ne!(row.call_id.as_deref(), Some(call_id.as_str()));
+    let own = row.call_id.as_deref().expect("the reaction's own call id");
+    assert!(own.starts_with("call-") && own != call_id, "{own}");
     assert_eq!(row.token_id, "beta");
     assert_eq!(row.actor_kind, "plugin");
     assert_eq!(

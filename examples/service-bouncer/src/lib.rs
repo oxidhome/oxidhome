@@ -69,10 +69,14 @@ impl Plugin for Bouncer {
         if !matches!(&event.payload, EventPayload::Custom(c) if c.topic == RELAY_TOPIC) {
             return;
         }
-        if let Some(target) = kv_string(RELAY_KEY)
-            && let Err(e) = host::call_service(&target, "kick", &[])
-        {
-            oxidhome_sdk::tracing::warn!("relay kick failed: {e:?}");
+        if let Some(target) = kv_string(RELAY_KEY) {
+            match host::call_service(&target, "kick", &[]) {
+                Ok(CommandResult::Err(e)) => {
+                    oxidhome_sdk::tracing::warn!("relay kick refused: {e:?}");
+                }
+                Err(e) => oxidhome_sdk::tracing::warn!("relay kick failed: {e:?}"),
+                Ok(_) => {}
+            }
         }
     }
 

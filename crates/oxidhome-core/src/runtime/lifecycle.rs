@@ -2940,7 +2940,10 @@ mod tests {
 
     /// Play a service call to `inst-a`: the supervisor starts it, and
     /// the result is sent before or after the caller is dropped.
-    async fn play_service(send_first: bool) -> Vec<crate::state::AuditEntry> {
+    async fn play_service(
+        send_first: bool,
+        root: InvocationContext,
+    ) -> Vec<crate::state::AuditEntry> {
         use crate::auth::invocation::DelegationHop;
         use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
         let (audit, pending) = journaled();
@@ -2959,7 +2962,7 @@ mod tests {
             .expect("register");
         let (control, mut rx) = mpsc::channel(4);
         let handle = InstanceHandle::with_pending_for_test("inst-a", control, &pending);
-        let ctx = api_ctx().delegate(DelegationHop {
+        let ctx = root.delegate(DelegationHop {
             caller_instance: "caller".into(),
             target_plugin: "test.plugin".into(),
             target_instance: "inst-a".into(),
@@ -3010,14 +3013,34 @@ mod tests {
     /// whether it was sent before or after the caller was dropped.
     #[tokio::test]
     async fn an_unread_service_result_is_recorded_exactly_once_in_either_order() {
+        // An external root, and (H6 slice 4) a reaction to an
+        // attributed event, recorded with what caused it.
+        let roots = || {
+            [
+                (api_ctx(), "tok-1", None),
+                (
+                    InvocationContext::reacting_to("caller", "call-cause"),
+                    "caller",
+                    Some("call-cause"),
+                ),
+            ]
+        };
         for send_first in [true, false] {
-            let rows = play_service(send_first).await;
-            assert_eq!(rows.len(), 1, "send_first={send_first}: {rows:?}");
-            let row = &rows[0];
-            assert_eq!(row.path, "service.call/test.plugin/inst-a/svc/go");
-            assert_eq!(row.execution_outcome.as_deref(), Some("success"));
-            assert_eq!(row.command_outcome.as_deref(), Some("completed"));
-            assert_eq!(row.token_id, "tok-1");
+            for (root, token_id, caused_by) in roots() {
+                let rows = play_service(send_first, root).await;
+                assert_eq!(rows.len(), 1, "send_first={send_first}: {rows:?}");
+                let row = &rows[0];
+                assert_eq!(row.path, "service.call/test.plugin/inst-a/svc/go");
+                assert_eq!(row.execution_outcome.as_deref(), Some("success"));
+                assert_eq!(row.command_outcome.as_deref(), Some("completed"));
+                assert_eq!(row.token_id, token_id);
+                assert_eq!(row.caused_by.as_deref(), caused_by);
+            }
+        }
+        // Host-origin work stays out of the ledger.
+        for send_first in [true, false] {
+            let rows = play_service(send_first, InvocationContext::host_origin("caller")).await;
+            assert_eq!(rows, Vec::new(), "send_first={send_first}");
         }
     }
 

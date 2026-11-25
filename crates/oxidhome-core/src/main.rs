@@ -32,7 +32,7 @@
 //!   without a grant; only the bootstrap / recovered owner token holds
 //!   them all.
 //! - **`token create <label> [--role <name>]... [--scope <scope>]...
-//!   [--sensitive <category>]... [--deny <actions>[@<categories>]]...`
+//!   [--sensitive <category>]... [--deny <actions>[@<categories>|{<services>}]]...`
 //!   (H6 slice 3)** — offline: mint a token holding owner-defined
 //!   roles, printing its secret once.
 //! - **`role list|create <name> <json>|update <name> <json>|delete
@@ -571,7 +571,7 @@ fn parse_stdio_args() -> anyhow::Result<Option<StdioOptions>> {
 fn run_token() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome token list\n       \
          oxidhome token create <label> [--role <name>]... [--scope <scope>]... \
-         [--sensitive <lock|opener|alarm|camera>]... [--deny <action,...|*>[@<category,...>]]...\n       \
+         [--sensitive <lock|opener|alarm|camera>]... [--deny <action,...|*>[@<category,...>|{<service,...>}]]...\n       \
          oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera> [--device <dev-id>]...\n       \
          oxidhome token revoke-sensitive <token-id> <lock|opener|alarm|camera>";
     let args: Vec<String> = std::env::args().skip(2).collect();
@@ -853,15 +853,22 @@ fn parse_token_create(
             "--sensitive" => req.sensitive.push(value()?),
             "--deny" => {
                 let v = value()?;
-                let (actions, category) = match v.split_once('@') {
-                    Some((a, c)) => (a, Some(c.split(',').map(str::to_owned).collect())),
-                    None => (v.as_str(), None),
-                };
+                let list = |l: &str| Some(l.split(',').map(str::to_owned).collect());
+                // `<actions>{<services>}` (as listings show it) or
+                // `<actions>[@<categories>]`.
+                let (actions, category, services) =
+                    match v.strip_suffix('}').and_then(|v| v.split_once('{')) {
+                        Some((a, svc)) => (a, None, list(svc)),
+                        None => match v.split_once('@') {
+                            Some((a, c)) => (a, list(c), None),
+                            None => (v.as_str(), None, None),
+                        },
+                    };
                 req.deny.push(SelectorSpec {
                     actions: actions.split(',').map(str::to_owned).collect(),
                     category,
                     devices: None,
-                    services: None,
+                    services,
                 });
             }
             other if other.starts_with('-') => anyhow::bail!("unexpected argument `{other}`"),
@@ -1486,6 +1493,38 @@ fn init_tracing(engine: &Engine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H6 slice 4: `--deny` takes services as listings show them.
+    #[test]
+    fn token_create_denies_services_or_categories() {
+        let args: Vec<String> = [
+            "kiosk",
+            "--deny",
+            "service.call{acme.notify/send,zwave.*}",
+            "--deny",
+            "device.command@lock,alarm",
+            "--deny",
+            "*",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let req = parse_token_create(&args).expect("parse");
+        assert_eq!(req.deny[0].actions, vec!["service.call"]);
+        assert_eq!(
+            req.deny[0].services,
+            Some(vec!["acme.notify/send".to_owned(), "zwave.*".to_owned()])
+        );
+        assert_eq!(req.deny[0].category, None);
+        assert_eq!(
+            req.deny[1].category,
+            Some(vec!["lock".to_owned(), "alarm".to_owned()])
+        );
+        assert_eq!(req.deny[1].services, None);
+        assert_eq!(
+            (req.deny[2].category.as_ref(), req.deny[2].services.as_ref()),
+            (None, None)
+        );
+    }
 
     #[test]
     fn tls_pin_reset_takes_no_option_as_an_instance() {
