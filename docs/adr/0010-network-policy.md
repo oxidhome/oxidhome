@@ -58,21 +58,25 @@ broadcast or multicast address. On a discovery socket:
 - The limited broadcast `255.255.255.255` and a multicast group (`224.0.0.251:5353` for mDNS,
   `239.255.255.250:1900` for SSDP, `ff02::fb`, …) are reached only through a `udp` rule naming that exact address
   and the port (`udp://255.255.255.255:9999`). No CIDR covers them, and in grant narrowing no IP range covers a rule
-  naming one: granting `udp://0.0.0.0/0:*` doesn't grant a requested `udp://255.255.255.255:9999`. Joining a group
-  needs a `udp` rule naming it. Multicast is sent with a TTL (hop limit) of 1.
+  naming one: granting `udp://0.0.0.0/0:*` doesn't grant a requested `udp://255.255.255.255:9999`, nor does an `any`
+  rule naming the address. Joining a group needs a `udp` rule naming it. Multicast is sent with a TTL (hop limit) of 1,
+  and on Linux a socket hears only the groups it joined itself (`IP_MULTICAST_ALL` off).
 - A subnet-directed broadcast (the last address of one of the host's IPv4 networks, `192.168.1.255` on
-  `192.168.1.0/24`) reaches every host of that network, so it needs a rule naming it or an IP rule covering the
-  whole network; a rule for part of the network doesn't do.
+  `192.168.1.0/24`) reaches every host of that network, so it needs a `udp` (or `any`) IP rule covering the whole
+  network, and every interface network it is the broadcast address of; a rule for part of the network, or a literal
+  naming the address (which a partial range covers in grant narrowing), doesn't do. When the host can't list its
+  networks, every IPv4 destination but a named group is refused.
 - Every other destination is checked as a UDP send. Datagrams from senders a UDP send couldn't reach are dropped,
   by `receive` and while the socket waits for readiness, so a flood from a refused sender never wakes the plugin.
   Devices answer a broadcast from their own address, so a plugin needs a rule for them too.
-- The socket binds to the unspecified address. A fixed local port needs a broadcast or multicast rule for that port,
-  and is opened with `SO_REUSEADDR` (and `SO_REUSEPORT` where it exists) so it can share `5353` or `1900` with the
+- The socket binds to the unspecified address. A fixed local port needs a broadcast or multicast rule of the socket's
+  family for that port, and is opened with `SO_REUSEADDR` (and `SO_REUSEPORT` where it exists) so it can share `5353` or `1900` with the
   system's responder.
 
-`local-networks` returns the host's interface networks as far as the grant's IP and CIDR rules cover them (a network
-inside a rule whole, a rule inside a network as the rule's range, under the class rules above), so a plugin can
-sweep its LAN without being configured with it. Name rules list nothing. Discovery sockets count towards the socket
+`local-networks` returns the host's interface networks that one of the grant's IP or CIDR rules covers whole, under
+the class rules above (a network mixing classes, like `172.0.0.0/11`, is covered by no CIDR), so a plugin can sweep
+its LAN without being configured with it. A rule narrower than a network lists nothing: the plugin would take the
+listed range for the whole network and broadcast to a host address. Name rules list nothing. Discovery sockets count towards the socket
 ceiling.
 
 **HTTP.** `wasi:http` never follows redirects; every hop the plugin (or the SDK client, at most 5 hops, never from

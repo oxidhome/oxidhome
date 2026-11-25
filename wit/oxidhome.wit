@@ -1558,13 +1558,15 @@ interface host-state {
 ///   (`udp://255.255.255.255:9999`, `udp://224.0.0.251:5353`). A CIDR rule
 ///   never covers them. Joining a group needs a `udp` rule naming it.
 /// - A subnet-directed broadcast (`192.168.1.255` on `192.168.1.0/24`)
-///   reaches every host of that network, so it needs a `udp` rule naming
-///   it, or a `udp` IP rule covering the whole network.
+///   reaches every host of that network, so it needs a `udp` (or `any`)
+///   IP rule covering the whole network. When the host can't list its
+///   networks, IPv4 destinations other than named groups are refused.
 /// - Any other destination is checked as a `wasi:sockets/udp` send is.
 /// - A received datagram is kept only when its sender would pass that
 ///   check; others are dropped silently.
 /// - The socket binds to the unspecified address. A fixed local port
-///   needs a broadcast or multicast rule with that port, and is shared
+///   needs a broadcast or multicast rule of the socket's family with that
+///   port, and is shared
 ///   with other sockets on the host (`SO_REUSEADDR`), so a plugin can
 ///   listen next to the system's mDNS responder.
 ///
@@ -1581,10 +1583,10 @@ interface host-network {
     prefix-len: u8,
   }
 
-  /// The networks of the host's interfaces, as far as the instance's
-  /// granted IP and CIDR rules cover them: a network inside a rule is
-  /// listed whole, and a rule inside a network is listed as the rule's
-  /// range. Name rules list nothing. Sorted, without duplicates; empty
+  /// The networks of the host's interfaces that one of the instance's
+  /// granted IP or CIDR rules covers whole (`192.168.1.0/24` under
+  /// `udp://192.168.0.0/16:*`, not under `udp://192.168.1.0/25:*`), at
+  /// most 64. Name rules list nothing. Sorted, without duplicates; empty
   /// when nothing is covered or the host can't list its interfaces.
   local-networks: func() -> list<local-network>;
 

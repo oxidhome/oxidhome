@@ -179,15 +179,19 @@ fn disc(target: &str) -> Result<String, String> {
     let target = parse_addr(target)?;
     let socket = disc_socket(target)?;
     socket.send_to(b"ping", target).map_err(io_err)?;
-    let deadline = Instant::now() + UDP_WAIT;
+    // Wait on the socket's pollable, bounded by a timer.
+    let ready = socket.subscribe();
+    let timeout = oxidhome_sdk::streaming::wasi::clocks::monotonic_clock::subscribe_duration(
+        UDP_WAIT.as_nanos().try_into().unwrap_or(u64::MAX),
+    );
     loop {
         if let Some(d) = socket.recv(1).map_err(io_err)?.pop() {
             return Ok(format!("{}@{}", String::from_utf8_lossy(&d.data), d.from));
         }
-        if Instant::now() > deadline {
+        if timeout.ready() {
             return Err("no reply".into());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        oxidhome_sdk::streaming::wasi::io::poll::poll(&[&ready, &timeout]);
     }
 }
 

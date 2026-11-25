@@ -683,11 +683,14 @@ async fn discovery_sockets_reach_broadcast_and_multicast_only_through_named_rule
         format!("disc-bind {}", port.wrapping_add(1)),
     ];
     let results = probe(&host, "disc", &rules, &ops).await;
-    // Allowed by the policy; whether the OS can send it depends on the
-    // machine's interfaces (a host without a route says so).
-    for (i, allowed) in [(0, "ok:sent"), (4, "ok:joined")] {
+    // Allowed by the policy; a machine without a route for broadcast
+    // or multicast says so instead.
+    for (i, allowed, no_route) in [
+        (0, "ok:sent", "err:HostUnreachable"),
+        (4, "ok:joined", "err:Other"),
+    ] {
         assert!(
-            results[i] == allowed || !results[i].contains("PermissionDenied"),
+            results[i] == allowed || results[i] == no_route,
             "{}: {}",
             ops[i],
             results[i]
@@ -737,7 +740,7 @@ async fn discovery_sockets_hear_only_allowed_senders() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn local_networks_are_listed_as_far_as_the_grant_covers_them() {
+async fn local_networks_are_listed_when_the_grant_covers_them_whole() {
     let host = TestHost::new().unwrap();
     let ops = ["nets -".to_owned()];
     let listed = probe(&host, "nets", &["tcp://127.0.0.0/8:*".to_owned()], &ops).await;
@@ -749,7 +752,8 @@ async fn local_networks_are_listed_as_far_as_the_grant_covers_them() {
         &ops,
     )
     .await;
-    assert_eq!(narrowed, vec!["ok:127.0.0.0/30".to_owned()]);
+    // A rule narrower than the network lists nothing.
+    assert_eq!(narrowed, vec!["ok:".to_owned()]);
     let none = probe(&host, "nets-none", &[], &ops).await;
     assert_eq!(none, vec!["ok:".to_owned()]);
 }

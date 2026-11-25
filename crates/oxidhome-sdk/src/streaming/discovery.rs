@@ -27,8 +27,8 @@
 //!   naming the group.
 //! - **A subnet-directed broadcast** (`192.168.1.255` on
 //!   `192.168.1.0/24`, see [`LocalNetwork::broadcast`]) reaches the whole
-//!   network, so it needs a rule naming it or an IP rule covering that
-//!   whole network (`udp://192.168.1.0/24:9999`).
+//!   network, so it needs an IP rule covering that whole network
+//!   (`udp://192.168.1.0/24:9999`).
 //! - **Other destinations** are checked like any UDP send.
 //! - **Replies** arrive only from senders a rule covers; others are
 //!   dropped by the host. Devices usually answer from their own unicast
@@ -43,9 +43,9 @@
 //! waiting. When the manifest sets `tick_interval_ms`, the host ticks the
 //! plugin early when a datagram is waiting, as for other sockets.
 //!
-//! [`local_networks`] lists the host's interface networks as far as the
-//! instance's IP and CIDR rules cover them, so a plugin can sweep (or
-//! broadcast to) its LAN without being configured with it.
+//! [`local_networks`] lists the host's interface networks that one of
+//! the instance's IP or CIDR rules covers whole, so a plugin can sweep
+//! (or broadcast to) its LAN without being configured with it.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -68,7 +68,7 @@ pub const SSDP_V4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255,
 /// Most datagrams one [`DiscoverySocket::recv`] returns.
 pub const MAX_RECV: usize = 32;
 
-/// A network the host is attached to, as far as the grant covers it.
+/// A network the host is attached to, which the grant covers whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalNetwork {
     /// The network's first address.
@@ -94,18 +94,19 @@ impl LocalNetwork {
     #[must_use]
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.address, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            (IpAddr::V4(net), IpAddr::V4(ip)) if self.prefix_len <= 32 => {
                 let mask = u32::MAX
                     .checked_shl(32 - u32::from(self.prefix_len))
                     .unwrap_or(0);
                 net.to_bits() & mask == ip.to_bits() & mask
             }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            (IpAddr::V6(net), IpAddr::V6(ip)) if self.prefix_len <= 128 => {
                 let mask = u128::MAX
                     .checked_shl(128 - u32::from(self.prefix_len))
                     .unwrap_or(0);
                 net.to_bits() & mask == ip.to_bits() & mask
             }
+            // Another family, or a prefix longer than the address.
             _ => false,
         }
     }
@@ -117,9 +118,9 @@ impl std::fmt::Display for LocalNetwork {
     }
 }
 
-/// The host's interface networks the instance's IP and CIDR rules cover:
-/// a network inside a rule whole, and a rule inside a network as the
-/// rule's range. Empty without such rules.
+/// The host's interface networks that one of the instance's IP or CIDR
+/// rules covers whole (`192.168.1.0/24` under `udp://192.168.0.0/16:*`).
+/// Empty without such rules.
 #[must_use]
 pub fn local_networks() -> Vec<LocalNetwork> {
     host_network::local_networks()
@@ -350,6 +351,7 @@ mod tests {
         assert!(net("0.0.0.0", 0).contains("8.8.8.8".parse().unwrap()));
         assert!(net("fd00::", 8).contains("fd12::1".parse().unwrap()));
         assert!(net("10.0.0.5", 32).contains("10.0.0.5".parse().unwrap()));
+        assert!(!net("10.0.0.0", 40).contains("10.0.0.5".parse().unwrap()));
         assert_eq!(lan.to_string(), "192.168.1.0/24");
     }
 

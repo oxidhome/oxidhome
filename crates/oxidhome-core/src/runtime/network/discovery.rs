@@ -22,7 +22,6 @@ use super::policy::{Denial, MAX_SOCKETS, NetworkPolicy, Use};
 use crate::host_impl::streaming_plugin::oxidhome::plugin::host_network::{
     self, Datagram, LocalNetwork,
 };
-use crate::host_impl::streaming_plugin::wasi::io::poll::Pollable as WitPollable;
 use crate::host_impl::streaming_plugin::wasi::sockets::network::{
     ErrorCode, IpAddress, IpAddressFamily, IpSocketAddress, Ipv4SocketAddress, Ipv6SocketAddress,
 };
@@ -90,34 +89,35 @@ pub(super) fn add_to_linker(linker: &mut Linker<PluginState>) -> anyhow::Result<
     Ok(())
 }
 
-/// The host's interface networks, reused for [`INTERFACES_TTL`]. Empty
-/// when they can't be listed.
-fn interface_networks() -> Arc<[IpNet]> {
+/// The host's interface networks, reused for [`INTERFACES_TTL`]. `None`
+/// when they can't be listed (not cached, so the next call retries).
+fn interface_networks() -> Option<Arc<[IpNet]>> {
     static CACHE: Mutex<Option<(Instant, Arc<[IpNet]>)>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((at, nets)) = cache.as_ref()
         && at.elapsed() < INTERFACES_TTL
     {
-        return Arc::clone(nets);
+        return Some(Arc::clone(nets));
     }
-    let nets: Arc<[IpNet]> = match if_addrs::get_if_addrs() {
-        Ok(interfaces) => interfaces
-            .iter()
-            .filter_map(|iface| {
-                let (ip, prefix) = match &iface.addr {
-                    if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), v4.prefixlen),
-                    if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen),
-                };
-                IpNet::new(ip, prefix).ok().map(|net| net.trunc())
-            })
-            .collect(),
+    let interfaces = match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces,
         Err(e) => {
             tracing::warn!(target: "host.network", error = %e, "listing network interfaces failed");
-            Arc::from([])
+            return None;
         }
     };
+    let nets: Arc<[IpNet]> = interfaces
+        .iter()
+        .filter_map(|iface| {
+            let (ip, prefix) = match &iface.addr {
+                if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), v4.prefixlen),
+                if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen),
+            };
+            IpNet::new(ip, prefix).ok().map(|net| net.trunc())
+        })
+        .collect();
     *cache = Some((Instant::now(), Arc::clone(&nets)));
-    nets
+    Some(nets)
 }
 
 fn ip_from_wit(ip: IpAddress) -> IpAddr {
@@ -208,6 +208,14 @@ fn bind(ipv6: bool, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
         socket.set_broadcast(true)?;
         socket.set_multicast_ttl_v4(MULTICAST_HOPS)?;
     }
+    // Linux otherwise delivers every group joined on the host (by any
+    // socket) to a wildcard-bound socket on that port.
+    #[cfg(target_os = "linux")]
+    if ipv6 {
+        socket.set_multicast_all_v6(false)?;
+    } else {
+        socket.set_multicast_all_v4(false)?;
+    }
     if port != 0 {
         // Shared with the system's responder on 5353 / 1900.
         socket.set_reuse_address(true)?;
@@ -246,8 +254,9 @@ impl PluginState {
 
 impl host_network::Host for PluginState {
     async fn local_networks(&mut self) -> Vec<LocalNetwork> {
+        let interfaces = interface_networks().unwrap_or_else(|| Arc::from([]));
         self.network
-            .local_networks(&interface_networks())
+            .local_networks(&interfaces)
             .into_iter()
             .map(|net| LocalNetwork {
                 address: ip_to_wit(net.network()),
@@ -264,7 +273,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         local_port: u16,
     ) -> Result<Resource<DiscoverySocket>, ErrorCode> {
         let ipv6 = matches!(family, IpAddressFamily::Ipv6);
-        if let Err(denial) = self.network.check_discovery_bind(local_port) {
+        if let Err(denial) = self.network.check_discovery_bind(local_port, ipv6) {
             let unspecified = if ipv6 { "[::]" } else { "0.0.0.0" };
             return Err(self.refuse("bind", &format!("{unspecified}:{local_port}"), &denial));
         }
@@ -331,12 +340,16 @@ impl host_network::HostDiscoverySocket for PluginState {
         }
         if let Err(denial) = self
             .network
-            .check_discovery_send(addr, &interface_networks())
+            .check_discovery_send(addr, interface_networks().as_deref())
         {
             return Err(self.refuse("send", &addr.to_string(), &denial));
         }
         let socket = &self.discovery_socket(&this)?.socket;
-        match socket.try_send_to(&data, addr) {
+        // Straight to the non-blocking socket: tokio's `try_send_to`
+        // answers `would-block` until the reactor has first seen the new
+        // socket writable, which would lose a probe sent right after
+        // `open`. Readiness is only ever awaited for reads.
+        match socket2::SockRef::from(socket).send_to(&data, &addr.into()) {
             Ok(_) => Ok(()),
             Err(e) => Err(error_code(&e)),
         }
@@ -372,11 +385,8 @@ impl host_network::HostDiscoverySocket for PluginState {
     async fn subscribe(
         &mut self,
         this: Resource<DiscoverySocket>,
-    ) -> wasmtime::Result<Resource<WitPollable>> {
-        let pollable = wasmtime_wasi::p2::subscribe(&mut self.table, this)?;
-        // The guest's handle is typed `wasi:io/poll.pollable`, which
-        // `wasmtime-wasi` serves from this `DynPollable` entry.
-        Ok(Resource::new_own(pollable.rep()))
+    ) -> wasmtime::Result<Resource<wasmtime_wasi::p2::DynPollable>> {
+        wasmtime_wasi::p2::subscribe(&mut self.table, this)
     }
 
     async fn drop(&mut self, this: Resource<DiscoverySocket>) -> wasmtime::Result<()> {
@@ -429,9 +439,21 @@ mod tests {
 
     #[test]
     fn interfaces_are_listed_and_cached() {
-        let first = interface_networks();
-        let second = interface_networks();
+        let first = interface_networks().expect("interfaces");
+        let second = interface_networks().expect("interfaces");
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.iter().all(|net| *net == net.trunc()));
+    }
+
+    #[tokio::test]
+    async fn a_send_right_after_bind_goes_out() {
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = bind(false, 0).unwrap();
+        socket2::SockRef::from(&socket)
+            .send_to(b"hi", &peer.local_addr().unwrap().into())
+            .unwrap();
+        let mut buf = [0u8; 2];
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(peer.recv_from(&mut buf).unwrap().0, 2);
     }
 }

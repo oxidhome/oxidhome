@@ -87,6 +87,10 @@ pub mod streaming_plugin {
             "oxidhome:plugin/media.pipeline-handle": super::HostPipelineHandle,
             "oxidhome:plugin/media.pipe-writer": super::HostPipeWriter,
             "oxidhome:plugin/host-network.discovery-socket": crate::runtime::network::DiscoverySocket,
+            // `discovery-socket.subscribe` hands out `wasmtime-wasi`'s
+            // pollable, so the host function's resource type matches the
+            // linked `wasi:io/poll`.
+            "wasi:io/poll.pollable": wasmtime_wasi::p2::DynPollable,
         },
     });
 }
@@ -120,6 +124,10 @@ pub mod streaming_ai_plugin {
             "oxidhome:plugin/media.pipeline-handle": super::HostPipelineHandle,
             "oxidhome:plugin/media.pipe-writer": super::HostPipeWriter,
             "oxidhome:plugin/host-network.discovery-socket": crate::runtime::network::DiscoverySocket,
+            // `discovery-socket.subscribe` hands out `wasmtime-wasi`'s
+            // pollable, so the host function's resource type matches the
+            // linked `wasi:io/poll`.
+            "wasi:io/poll.pollable": wasmtime_wasi::p2::DynPollable,
             "oxidhome:plugin/inference.model": super::HostModel,
         },
     });
