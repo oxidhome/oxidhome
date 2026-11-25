@@ -2247,7 +2247,14 @@ impl NetworkGrantChange {
             let items: Vec<String> = rules
                 .iter()
                 .map(|r| {
-                    serde_json::Value::String(r.to_string())
+                    // A host the runtime would never look up may be
+                    // anything, a credential included: not logged.
+                    let shown = if is_plain_host(&r.host) {
+                        r.to_string()
+                    } else {
+                        "<redacted: not an IP, CIDR or DNS name>".to_owned()
+                    };
+                    serde_json::Value::String(shown)
                         .to_string()
                         .replace(':', "\\u003a")
                         .replace('=', "\\u003d")
@@ -2303,22 +2310,22 @@ pub fn narrowed_network_grant(
     Ok(out)
 }
 
-/// Whether a granted rule's host is an IP literal, a CIDR, or a DNS
-/// name of letters, digits, `-` and `.` (after an optional `*.`). The
-/// manifest parser takes more (anything the runtime would refuse at
-/// lookup); a grant refuses it, so nothing like `token=…@host` is
-/// stored or written to the audit ledger.
+/// Whether a rule's host is an IP literal, a CIDR, or a DNS name the
+/// runtime would look up (LDH labels, checked by
+/// [`crate::native_policy::endpoint::validate_endpoint`]; a root dot
+/// and a `*.` prefix allowed). The manifest parser takes more; a grant
+/// refuses it, and an audit row redacts it, so nothing like
+/// `token=…@host` is stored or logged.
 fn is_plain_host(host: &oxidhome_manifest::HostMatch) -> bool {
     use oxidhome_manifest::HostMatch;
     let name = |n: &str| {
-        !n.is_empty()
-            && n.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        let n = n.strip_suffix('.').unwrap_or(n);
+        crate::native_policy::endpoint::validate_endpoint(n, None, "/").is_ok()
     };
     match host {
         HostMatch::Cidr(_) => true,
-        HostMatch::Exact(h) => h.parse::<std::net::IpAddr>().is_ok() || name(h),
-        HostMatch::SuffixWildcard(suffix) => name(suffix),
+        HostMatch::Exact(h) => name(h),
+        HostMatch::SuffixWildcard(suffix) => name(suffix.strip_prefix('.').unwrap_or(suffix)),
     }
 }
 
@@ -3272,7 +3279,24 @@ mod tests {
             narrowed_network_grant(&wide, Some(&[rule("https://token=x@api.example.com")])),
             Err(NetworkGrantError::BadHost(_))
         ));
+        assert!(matches!(
+            narrowed_network_grant(&wide, Some(&[rule("https://a..example.com")])),
+            Err(NetworkGrantError::BadHost(_))
+        ));
         assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com")])).is_ok());
+        assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com.")])).is_ok());
+        assert!(narrowed_network_grant(&wide, Some(&[rule("https://*.api.example.com")])).is_ok());
+        // An audit row never shows such a host, even from the request.
+        let change = NetworkGrantChange {
+            installation_uuid: "inst-1".into(),
+            old: vec![rule("https://token=hunter2@api.example.com")],
+            network: NetworkGrants::new(&[], &[]),
+        };
+        assert!(
+            !change.audit_detail().contains("hunter2"),
+            "{}",
+            change.audit_detail()
+        );
         let max = oxidhome_manifest::validate::MAX_NETWORK_RULES;
         assert!(matches!(
             narrowed_network_grant(&requested, Some(&vec![camera; max + 1])),
