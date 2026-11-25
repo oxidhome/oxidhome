@@ -253,21 +253,24 @@ fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
     specs
         .iter()
         .map(|spec| {
-            let (actions, categories, devices, services) = selector(spec, "deny")?;
-            let wildcard = spec.actions.iter().any(|a| a == "*");
+            let (_, categories, devices, services) = selector(spec, "deny")?;
             let to_devices = categories.is_some() || devices.is_some();
             // A narrowed `*` means what the selector can match; a named
             // action it can never match is refused.
-            let actions =
-                crate::auth::role::deny_actions(actions, wildcard, services.is_some(), to_devices)
-                    .ok_or_else(|| {
-                        invalid(if services.is_some() {
-                            "a deny entry narrowed to services can only name service.call"
-                        } else {
-                            "a deny entry narrowed to devices can't name service.call (narrow it \
+            let actions = crate::auth::role::deny_actions(
+                &spec.actions,
+                services.is_some(),
+                to_devices,
+                false,
+            )
+            .ok_or_else(|| {
+                invalid(if services.is_some() {
+                    "a deny entry narrowed to services can only name service.call"
+                } else {
+                    "a deny entry narrowed to devices can't name service.call (narrow it \
                              with `services` instead)"
-                        })
-                    })?;
+                })
+            })?;
             Ok(DenyRule {
                 actions,
                 categories,
@@ -1069,6 +1072,18 @@ mod tests {
                     ..req("x", &["resident"])
                 },
                 "can't name service.call",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["*".into(), "device.command".into()],
+                        category: None,
+                        devices: None,
+                        services: Some(vec!["acme.notify".into()]),
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "can only name service.call",
             ),
         ];
         for (r, needle) in cases {

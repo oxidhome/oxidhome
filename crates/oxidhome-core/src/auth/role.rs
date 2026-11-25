@@ -449,15 +449,10 @@ impl SelectorWire {
     /// written back as `"actions": []` it would not read again. A
     /// narrowed `*` means what the selector can match.
     pub(crate) fn into_deny(self) -> Option<DenyRule> {
-        let wildcard = self.actions.iter().any(|a| a == "*");
-        let (actions, categories, devices, services) = self.into_parts()?;
+        let names = self.actions.clone();
+        let (_, categories, devices, services) = self.into_parts()?;
         let to_devices = categories.is_some() || devices.is_some();
-        let actions = deny_actions(
-            actions,
-            wildcard || to_devices,
-            services.is_some(),
-            to_devices,
-        )?;
+        let actions = deny_actions(&names, services.is_some(), to_devices, to_devices)?;
         Some(DenyRule {
             actions,
             categories,
@@ -498,15 +493,17 @@ impl SelectorWire {
     }
 }
 
-/// The actions a deny entry covers, or `None` when an explicitly named
-/// action can never match its selector (see
-/// [`SelectorWire::into_deny`]).
+/// The actions a deny entry covers, or `None` when an action it names
+/// explicitly (not through `*`) can never match its selector (see
+/// [`SelectorWire::into_deny`]). `names` is the entry's action list;
+/// `lenient` drops such actions instead of refusing.
 pub(crate) fn deny_actions(
-    actions: ActionSet,
-    wildcard: bool,
+    names: &[String],
     to_services: bool,
     to_devices: bool,
+    lenient: bool,
 ) -> Option<ActionSet> {
+    let actions = ActionSet::parse(names.iter().map(String::as_str)).ok()?;
     let unmatchable = if to_services {
         ActionSet::ALL.without(SERVICE_NARROWABLE)
     } else if to_devices {
@@ -514,13 +511,11 @@ pub(crate) fn deny_actions(
     } else {
         return Some(actions);
     };
-    if wildcard {
-        Some(actions.without(unmatchable))
-    } else if actions.intersection(unmatchable).is_empty() {
-        Some(actions)
-    } else {
-        None
+    let explicit = ActionSet::parse(names.iter().map(String::as_str).filter(|n| *n != "*")).ok()?;
+    if !lenient && !explicit.intersection(unmatchable).is_empty() {
+        return None;
     }
+    Some(actions.without(unmatchable))
 }
 
 /// Longest service pattern a selector accepts.
@@ -540,13 +535,6 @@ pub fn is_service_pattern(pattern: &str) -> bool {
             && !half.contains('/')
             && half.find('*').is_none_or(|i| i == half.len() - 1)
     };
-    // A plugin id is reverse-DNS (`[a-z0-9.-]`); a half that can't be
-    // one would never match.
-    let plugin_chars = |half: &str| {
-        half.trim_end_matches('*')
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
-    };
     let (plugin, service) = match pattern.split_once('/') {
         Some((plugin, service)) => (plugin, Some(service)),
         None => (pattern, None),
@@ -554,8 +542,32 @@ pub fn is_service_pattern(pattern: &str) -> bool {
     pattern.len() <= MAX_SERVICE_PATTERN_BYTES
         && !pattern.chars().any(char::is_control)
         && well_formed(plugin)
-        && plugin_chars(plugin)
+        && could_name_plugin(plugin)
         && service.is_none_or(well_formed)
+}
+
+/// Can plugin pattern `half` (literal or `prefix*`) match some plugin
+/// id? Plugin ids are reverse-DNS: two or more dot-separated labels,
+/// each `[a-z0-9][a-z0-9-]*`. A pattern that matches none would let a
+/// typo'd deny refuse nothing.
+fn could_name_plugin(half: &str) -> bool {
+    let label = |l: &str| {
+        let mut chars = l.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    match half.strip_suffix('*') {
+        // A prefix: every complete label valid, the open one empty or
+        // the start of a valid label.
+        Some(prefix) => {
+            let mut labels: Vec<&str> = prefix.split('.').collect();
+            let open = labels.pop().unwrap_or_default();
+            labels.into_iter().all(label) && (open.is_empty() || label(open))
+        }
+        None => half.contains('.') && half.split('.').all(label),
+    }
 }
 
 /// Does service pattern `pattern` cover `service`? The plugin half
@@ -831,9 +843,11 @@ mod tests {
             "*",
             "acme.notify",
             "acme.*",
+            "acm*",
+            "acme.no*",
             "acme.notify/send",
             "acme.*/s*",
-            "a/*",
+            "a.b/*",
         ] {
             assert!(is_service_pattern(good), "{good}");
         }
@@ -849,6 +863,10 @@ mod tests {
             "acme/inst/bouncer",
             "acme.notify /send",
             "Acme/send",
+            "acme..notify/send",
+            "acme",
+            ".acme*",
+            "acme.-x",
             "a\nb",
             long.as_str(),
         ] {
@@ -873,9 +891,9 @@ mod tests {
         // `services` stands alone, narrows only `service.call`, and
         // names something.
         for bad in [
-            r#"{"grants":[{"actions":["service.call"],"services":["a"],"category":["light"]}]}"#,
-            r#"{"deny":[{"actions":["service.call"],"services":["a"],"devices":["dev-a*"]}]}"#,
-            r#"{"grants":[{"actions":["device.read"],"services":["a"]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"services":["a.b"],"category":["light"]}]}"#,
+            r#"{"deny":[{"actions":["service.call"],"services":["a.b"],"devices":["dev-a*"]}]}"#,
+            r#"{"grants":[{"actions":["device.read"],"services":["a.b"]}]}"#,
             r#"{"grants":[{"actions":["service.call"],"services":[]}]}"#,
             r#"{"grants":[{"actions":["service.call"],"services":["a*b"]}]}"#,
             r#"{"grants":[{"actions":["service.call"],"category":["light"]}]}"#,
@@ -947,7 +965,7 @@ mod tests {
             r#"{"grants":[{"actions":["device.read"],"devices":["lamp"]}]}"#,
             r#"{"sensitive":["door"]}"#,
             r#"{"deny":[{"actions":["nope"]}]}"#,
-            r#"{"deny":[{"actions":["device.command"],"services":["acme"]}]}"#,
+            r#"{"deny":[{"actions":["device.command"],"services":["acme.notify"]}]}"#,
             r#"{"scopes":["*"]}"#,
         ] {
             assert!(role(bad).is_none(), "{bad}");

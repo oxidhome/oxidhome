@@ -704,12 +704,14 @@ mod tests {
         // A deny that could never match what it names (H6 slice 4).
         assert!(
             parse_policy(
-                br#"{"scopes":["*"],"deny":[{"actions":["device.command"],"services":["acme"]}]}"#
+                br#"{"scopes":["*"],"deny":[{"actions":["device.command"],"services":["acme.notify"]}]}"#
             )
             .is_none()
         );
-        let p = parse_policy(br#"{"scopes":["*"],"deny":[{"actions":["*"],"services":["acme"]}]}"#)
-            .expect("narrowed wildcard");
+        let p = parse_policy(
+            br#"{"scopes":["*"],"deny":[{"actions":["*"],"services":["acme.notify"]}]}"#,
+        )
+        .expect("narrowed wildcard");
         assert_eq!(p.deny[0].actions, crate::auth::role::SERVICE_NARROWABLE);
         // A device deny naming only `service.call` never matched: it is
         // dropped rather than kept as an `actions: []` rule that would

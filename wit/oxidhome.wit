@@ -1287,6 +1287,14 @@ interface host-services {
   /// consulted, so the manifest still acts as a ceiling on what
   /// the plugin can be authorized to invoke.
   ///
+  /// **Root authority (H6).** When the invocation making the call
+  /// traces back to an external request (a token's command or
+  /// service call), the call also needs that request's own
+  /// permission for `service.call` on the target, and none of its
+  /// denies may match. A plugin's grant never extends what the
+  /// requester may do. Work the host started (`init`, `tick`,
+  /// `on-event`) is decided by the plugin's grants alone.
+  ///
   /// Because the authorization key is the service's immutable
   /// `local-id`, a callee that renames its service via
   /// `update-service` cannot silently shadow a grant. The
@@ -1325,7 +1333,7 @@ interface host-services {
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
-  /// grants); `invalid-argument` (same-instance target, A→…→A
+  /// grants, or the originating request may not make this call); `invalid-argument` (same-instance target, A→…→A
   /// cycle, a command the service's `command-spec` list doesn't
   /// declare, or `args` that violate its `params` schema);
   /// `internal` (the callee's `ok-with-state` reply violates the
