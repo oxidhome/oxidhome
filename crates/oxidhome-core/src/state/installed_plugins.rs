@@ -2318,13 +2318,17 @@ pub fn narrowed_network_grant(
 /// `token=…@host` is stored or logged.
 fn is_plain_host(host: &oxidhome_manifest::HostMatch) -> bool {
     use oxidhome_manifest::HostMatch;
+    // A DNS name, never IP-shaped once its root dot is dropped (the
+    // runtime compiles `192.168.1.20.` as a name, then refuses to look
+    // it up).
     let name = |n: &str| {
         let n = n.strip_suffix('.').unwrap_or(n);
-        crate::native_policy::endpoint::validate_endpoint(n, None, "/").is_ok()
+        n.parse::<std::net::IpAddr>().is_err()
+            && crate::native_policy::endpoint::validate_endpoint(n, None, "/").is_ok()
     };
     match host {
         HostMatch::Cidr(_) => true,
-        HostMatch::Exact(h) => name(h),
+        HostMatch::Exact(h) => h.parse::<std::net::IpAddr>().is_ok() || name(h),
         HostMatch::SuffixWildcard(suffix) => name(suffix.strip_prefix('.').unwrap_or(suffix)),
     }
 }
@@ -3284,6 +3288,19 @@ mod tests {
             Err(NetworkGrantError::BadHost(_))
         ));
         assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com")])).is_ok());
+        let lan = [
+            rule("tcp://192.168.1.20.:554"),
+            rule("tcp://*.192.168.1.20:554"),
+        ];
+        for bad in ["tcp://192.168.1.20.:554", "tcp://*.192.168.1.20:554"] {
+            assert!(
+                matches!(
+                    narrowed_network_grant(&lan, Some(&[rule(bad)])),
+                    Err(NetworkGrantError::BadHost(_))
+                ),
+                "{bad}"
+            );
+        }
         assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com.")])).is_ok());
         assert!(narrowed_network_grant(&wide, Some(&[rule("https://*.api.example.com")])).is_ok());
         // An audit row never shows such a host, even from the request.
