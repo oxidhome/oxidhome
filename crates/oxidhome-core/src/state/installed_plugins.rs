@@ -2926,16 +2926,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// Pins the `oxidhome:plugin-content:v1` digest: a change to the
-    /// tag or framing changes every stored digest.
-    #[test]
-    fn content_digest_is_pinned() {
-        assert_eq!(
-            content_digest(b"manifest", b"wasm", &[("ui/index.html", b"<p>")]),
-            "e2e2da66043894324ebc25f9c7ae543074d7941416e9e2c97d0034523d8e5f90"
-        );
-    }
-
     fn fresh_db() -> Arc<Db> {
         Arc::new(Db::open_in_memory().expect("in-memory db"))
     }
@@ -3319,6 +3309,16 @@ wasm = "plugin.wasm"
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Pins the `oxidhome:plugin-content:v1` digest: a change to the
+    /// tag or framing changes every stored digest.
+    #[test]
+    fn content_digest_is_pinned() {
+        assert_eq!(
+            content_digest(b"manifest", b"wasm", &[("ui/index.html", b"<p>")]),
+            "e2e2da66043894324ebc25f9c7ae543074d7941416e9e2c97d0034523d8e5f90"
+        );
     }
 
     /// C5 review F1 (fail-closed): a row with a NULL grant JSON and
