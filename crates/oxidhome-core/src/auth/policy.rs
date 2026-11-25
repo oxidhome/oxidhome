@@ -612,10 +612,7 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
                 .deny
                 .into_iter()
                 .map(crate::auth::role::SelectorWire::into_deny)
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .filter(|d| !d.is_void())
-                .collect(),
+                .collect::<Option<Vec<_>>>()?,
         },
     })
 }
@@ -713,15 +710,13 @@ mod tests {
         )
         .expect("narrowed wildcard");
         assert_eq!(p.deny[0].actions, crate::auth::role::SERVICE_NARROWABLE);
-        // A device deny naming only `service.call` never matched: it is
-        // dropped rather than kept as an `actions: []` rule that would
-        // not read back.
-        let p = parse_policy(
-            br#"{"scopes":["*"],"deny":[{"actions":["service.call"],"category":["lock"]}]}"#,
-        )
-        .expect("dropped rule");
-        assert_eq!(p.deny, Vec::new());
-        assert_eq!(parse_policy(&p.to_json()), Some(p));
+        // A device deny naming `service.call`, which it could never match.
+        assert!(
+            parse_policy(
+                br#"{"scopes":["*"],"deny":[{"actions":["service.call"],"category":["lock"]}]}"#,
+            )
+            .is_none()
+        );
         // Unknown field inside a constraint blob — same
         // rationale.
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"unknown":true}}}"#).is_none());

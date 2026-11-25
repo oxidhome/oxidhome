@@ -978,9 +978,11 @@ const MIGRATIONS: &[&str] = &[
     // the call id of the attributable invocation that published the
     // event (an external request, or an `on-event` reaction to one);
     // `audit_event.caused_by` is, on a reaction's rows, the call id of
-    // the event it reacts to. Both NULL on older rows.
+    // the event it reacts to. Both NULL on older rows; both indexed
+    // (partial) so "everything request X caused" is a lookup.
     "
     ALTER TABLE event_log ADD COLUMN call_id TEXT;
+    CREATE INDEX event_log_call_id ON event_log(call_id) WHERE call_id IS NOT NULL;
     ALTER TABLE audit_event ADD COLUMN caused_by TEXT;
     CREATE INDEX audit_caused_by ON audit_event(caused_by) WHERE caused_by IS NOT NULL;
     ",
@@ -1988,6 +1990,32 @@ mod tests {
         .expect("read");
     }
 
+    /// H6 slice 4 (migration 25): lookups by request call id use the
+    /// partial indexes on `event_log.call_id` and
+    /// `audit_event.caused_by`.
+    #[test]
+    fn attribution_lookups_are_indexed() {
+        let db = Db::open_in_memory().expect("open");
+        db.read(|c| -> rusqlite::Result<()> {
+            for (sql, index) in [
+                (
+                    "SELECT id FROM event_log WHERE call_id = 'call-x'",
+                    "event_log_call_id",
+                ),
+                (
+                    "SELECT id FROM audit_event WHERE caused_by = 'call-x'",
+                    "audit_caused_by",
+                ),
+            ] {
+                let plan: String =
+                    c.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), (), |row| row.get(3))?;
+                assert!(plan.contains(index), "{sql}: {plan}");
+            }
+            Ok(())
+        })
+        .expect("read");
+    }
+
     #[test]
     fn ping_ok_on_healthy_connection() {
         // The readiness probe (`GET /api/v1/readyz`) leans on this
@@ -2088,6 +2116,7 @@ mod tests {
                     "
                     DROP INDEX audit_caused_by;
                     ALTER TABLE audit_event DROP COLUMN caused_by;
+                    DROP INDEX event_log_call_id;
                     ALTER TABLE event_log DROP COLUMN call_id;
                     DROP TABLE network_tls_pin;
                     DROP TABLE auth_role;

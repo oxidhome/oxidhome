@@ -257,20 +257,16 @@ fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
             let to_devices = categories.is_some() || devices.is_some();
             // A narrowed `*` means what the selector can match; a named
             // action it can never match is refused.
-            let actions = crate::auth::role::deny_actions(
-                &spec.actions,
-                services.is_some(),
-                to_devices,
-                false,
-            )
-            .ok_or_else(|| {
-                invalid(if services.is_some() {
-                    "a deny entry narrowed to services can only name service.call"
-                } else {
-                    "a deny entry narrowed to devices can't name service.call (narrow it \
+            let actions =
+                crate::auth::role::deny_actions(&spec.actions, services.is_some(), to_devices)
+                    .ok_or_else(|| {
+                        invalid(if services.is_some() {
+                            "a deny entry narrowed to services can only name service.call"
+                        } else {
+                            "a deny entry narrowed to devices can't name service.call (narrow it \
                              with `services` instead)"
-                })
-            })?;
+                        })
+                    })?;
             Ok(DenyRule {
                 actions,
                 categories,

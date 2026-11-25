@@ -1315,6 +1315,14 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
+        if !oxidhome_manifest::is_service_local_id(&info.local_id) {
+            return Err(WitError::InvalidArgument(format!(
+                "service local-id `{}` must be 1-{} of `a-z`, `0-9`, `.`, `_`, `-`, \
+                 starting with a letter or digit",
+                info.local_id,
+                oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES,
+            )));
+        }
         check_no_wildcard_command_names(&info)?;
         super::schema::check_service_info(&info)?;
         // H10: registry now enforces `(owner_instance, local_id)`
@@ -3689,6 +3697,25 @@ mod tests {
             matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("one-of")),
             "got {err:?}",
         );
+        assert!(services.list().is_empty(), "registry must be untouched");
+
+        // H6 slice 4: a local-id outside the service grammar (no `*`,
+        // no `/`, lower-case) is refused before anything registers.
+        for local_id in ["send*", "a/b", "Svc", "", "-svc"] {
+            let err = host_services::Host::register_service(
+                &mut state,
+                ServiceInfo {
+                    local_id: local_id.into(),
+                    ..info(None)
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("local-id")),
+                "{local_id}: {err:?}",
+            );
+        }
         assert!(services.list().is_empty(), "registry must be untouched");
 
         let id = host_services::Host::register_service(&mut state, info(None))

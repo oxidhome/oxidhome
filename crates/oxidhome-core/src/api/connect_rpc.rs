@@ -1596,6 +1596,8 @@ fn wit_event_to_proto(mut event: WitEvent, gate: &BytesGate) -> ProtoEvent {
         // code paths that don't hit the durable log — matches the
         // proto3 default and the field's docstring.
         row_id: event.row_id.unwrap_or(0),
+        // H6 slice 4: host-stamped attribution, as on REST.
+        call_id: event.call_id,
         payload,
         ..Default::default()
     }
@@ -2230,6 +2232,31 @@ fn connect_error_response(err: ConnectError, req_headers: &HeaderMap) -> AxumRes
 #[cfg(test)]
 mod command_report_tests {
     use super::*;
+
+    /// H6 slice 4: a Connect event carries the host-stamped call id,
+    /// and leaves it unset when the host started the work.
+    #[test]
+    fn events_carry_their_call_id() {
+        use crate::host_impl::plugin::oxidhome::plugin::events::{CustomEvent, EventPayload};
+        let engine = Engine::new().expect("engine");
+        let gate = BytesGate::deny_all(&engine);
+        let event = |call_id: Option<&str>| WitEvent {
+            device: None,
+            timestamp: 1,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: "t".into(),
+                payload: "{}".into(),
+            }),
+            origin_plugin_id: "p".into(),
+            origin_instance_id: "i".into(),
+            row_id: Some(7),
+            call_id: call_id.map(str::to_owned),
+        };
+        let proto = wit_event_to_proto(event(Some("call-0123")), &gate);
+        assert_eq!(proto.call_id.as_deref(), Some("call-0123"));
+        assert_eq!(proto.row_id, 7);
+        assert_eq!(wit_event_to_proto(event(None), &gate).call_id, None);
+    }
 
     /// H6 slice 4: a Connect role or token selector keeps its
     /// `services` narrowing (dropping it would widen the grant).

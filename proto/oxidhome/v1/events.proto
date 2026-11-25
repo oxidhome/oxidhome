@@ -113,6 +113,13 @@ message Event {
   // `host.event_log.gap` marker row on recovery) or the event came
   // from a host-side simulator. Don't advance the cursor on `0`.
   uint64 row_id = 9;
+  // H6: call id (`call-<32 hex>`) of the external request this event
+  // traces back to (the publishing call's own, or for an `on-event`
+  // reaction the one it reacts to). Unset for work the host started
+  // on its own. **Host-populated**; attribution only, it grants
+  // nothing. Mirror of WIT `event.call-id`; follow it into the audit
+  // ledger with `GET /api/v1/audit?call_id=` / `?caused_by=`.
+  optional string call_id = 10;
 }
 
 // Wire mirror of WIT `state-change` — the full record, not just

@@ -539,6 +539,7 @@ fn restore_migrates_an_archive_at_the_schema_floor() {
         conn.execute_batch(
             "DROP INDEX audit_caused_by;
              ALTER TABLE audit_event DROP COLUMN caused_by;
+             DROP INDEX event_log_call_id;
              ALTER TABLE event_log DROP COLUMN call_id;
              DROP TABLE network_tls_pin;
              DROP TABLE auth_role;

@@ -523,7 +523,12 @@ interface services {
 
   record service-info {
     /// Plugin-instance-local id, echoed back so the plugin can map the
-    /// host-assigned `service-id` to its own bookkeeping.
+    /// host-assigned `service-id` to its own bookkeeping. The
+    /// service's immutable key: grants (`consumes_services.service`)
+    /// and role selectors (`<plugin>/<local-id>`) name it. 1-64 of
+    /// `a-z`, `0-9`, `.`, `_`, `-`, starting with a letter or digit
+    /// (so never `*` or `/`); `register-service` refuses anything
+    /// else with `invalid-argument`.
     local-id: local-id,
     /// Human-readable name. Also the capability key gated by the
     /// manifest's `[capabilities] declares_services`.
@@ -1217,7 +1222,9 @@ interface host-services {
   /// with an already-registered service in the same instance
   /// (`invalid-argument`). Callers of `resolve-service` /
   /// `call-service` address the service by this key, and no
-  /// downstream call can mutate it.
+  /// downstream call can mutate it. A `local-id` outside the
+  /// service grammar (see `service-info.local-id`) is refused with
+  /// `invalid-argument`.
   register-service: func(info: service-info) -> result<service-id, error>;
   /// Replace an already-registered service's info. H10: `local-id`
   /// is immutable — a call whose `info.local-id` differs from the

@@ -400,10 +400,7 @@ impl RoleDef {
         }
         let mut deny = Vec::with_capacity(wire.deny.len());
         for d in wire.deny {
-            let rule = d.into_deny()?;
-            if !rule.is_void() {
-                deny.push(rule);
-            }
+            deny.push(d.into_deny()?);
         }
         Some(Self {
             id: id.to_owned(),
@@ -443,20 +440,15 @@ impl SelectorWire {
     /// device or service pattern nothing can match, or `services`
     /// mixed with a device selector: a selector that names nothing
     /// would silently match nothing.
-    /// A stored deny entry. One narrowed to `services` is refused
-    /// (`None`) when it names an action other than `service.call`, which
-    /// it could never match. One narrowed to devices drops `service.call`
-    /// instead of refusing: the admin surfaces stored a narrowed `*` as
-    /// every action name before slice 4, and a device selector never
-    /// matched a service then either. A rule left with no action never
-    /// matched anything: callers drop it ([`DenyRule::is_void`]), since
-    /// written back as `"actions": []` it would not read again. A
-    /// narrowed `*` means what the selector can match.
+    /// A stored deny entry, refused (`None`) when it explicitly names an
+    /// action its selector could never match: a `services` selector
+    /// covers only `service.call`, and a device selector never matches
+    /// a service. A narrowed `*` means what the selector can match.
     pub(crate) fn into_deny(self) -> Option<DenyRule> {
         let names = self.actions.clone();
         let (_, categories, devices, services) = self.into_parts()?;
         let to_devices = categories.is_some() || devices.is_some();
-        let actions = deny_actions(&names, services.is_some(), to_devices, to_devices)?;
+        let actions = deny_actions(&names, services.is_some(), to_devices)?;
         Some(DenyRule {
             actions,
             categories,
@@ -500,12 +492,10 @@ impl SelectorWire {
 /// The actions a deny entry covers, or `None` when an action it names
 /// explicitly (not through `*`) can never match its selector (see
 /// [`SelectorWire::into_deny`]). `names` is the entry's action list;
-/// `lenient` drops such actions instead of refusing.
 pub(crate) fn deny_actions(
     names: &[String],
     to_services: bool,
     to_devices: bool,
-    lenient: bool,
 ) -> Option<ActionSet> {
     let actions = ActionSet::parse(names.iter().map(String::as_str)).ok()?;
     let unmatchable = if to_services {
@@ -516,7 +506,7 @@ pub(crate) fn deny_actions(
         return Some(actions);
     };
     let explicit = ActionSet::parse(names.iter().map(String::as_str).filter(|n| *n != "*")).ok()?;
-    if !lenient && !explicit.intersection(unmatchable).is_empty() {
+    if !explicit.intersection(unmatchable).is_empty() {
         return None;
     }
     Some(actions.without(unmatchable))
@@ -526,28 +516,33 @@ pub(crate) fn deny_actions(
 pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
 
 /// `true` for a service pattern: `<plugin>` or `<plugin>/<local-id>`,
-/// each half non-empty, literal or `prefix*` (`*` alone is every
-/// plugin), without control characters, at most
-/// [`MAX_SERVICE_PATTERN_BYTES`]. The plugin half uses plugin-id
-/// characters only. A trailing `*` is always a prefix and `/` always
-/// splits, so a service whose `local-id` ends in `*` or contains `/`
-/// can be named exactly only by its plugin (`<plugin>`).
+/// at most [`MAX_SERVICE_PATTERN_BYTES`]. Each half is literal or
+/// `prefix*` (`*` alone matches everything) and must be able to match
+/// a real id: a reverse-DNS plugin id, and a service local-id
+/// ([`oxidhome_manifest::is_service_local_id`], which excludes `*` and
+/// `/`, so every service can be named exactly).
 #[must_use]
 pub fn is_service_pattern(pattern: &str) -> bool {
-    let well_formed = |half: &str| {
-        !half.is_empty()
-            && !half.contains('/')
-            && half.find('*').is_none_or(|i| i == half.len() - 1)
-    };
     let (plugin, service) = match pattern.split_once('/') {
         Some((plugin, service)) => (plugin, Some(service)),
         None => (pattern, None),
     };
     pattern.len() <= MAX_SERVICE_PATTERN_BYTES
-        && !pattern.chars().any(char::is_control)
-        && well_formed(plugin)
         && could_name_plugin(plugin)
-        && service.is_none_or(well_formed)
+        && service.is_none_or(could_name_local_id)
+}
+
+/// Can local-id pattern `half` (literal or `prefix*`) match some
+/// service local-id?
+fn could_name_local_id(half: &str) -> bool {
+    match half.strip_suffix('*') {
+        Some("") => true,
+        Some(prefix) => {
+            prefix.len() < oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES
+                && oxidhome_manifest::is_service_local_id(prefix)
+        }
+        None => oxidhome_manifest::is_service_local_id(half),
+    }
 }
 
 /// Can plugin pattern `half` (literal or `prefix*`) match some plugin
@@ -705,12 +700,6 @@ pub struct DenyRule {
 }
 
 impl DenyRule {
-    /// `true` when the rule names no action, so it matches nothing.
-    #[must_use]
-    pub fn is_void(&self) -> bool {
-        self.actions.is_empty()
-    }
-
     /// `true` when this rule refuses `action` on `resource`.
     #[must_use]
     pub fn matches(&self, action: Action, resource: &Resource) -> bool {
@@ -993,18 +982,12 @@ mod tests {
             r#"{"grants":[{"actions":["*","device.command"],"services":["acme.notify"]}]}"#,
             r#"{"grants":[{"actions":["*","token.manage"]}]}"#,
             r#"{"scopes":["*"]}"#,
+            r#"{"deny":[{"actions":["service.call","device.command"],"category":["lock"]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"services":["acme.notify/send*x"]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"services":["acme.notify/Send"]}]}"#,
         ] {
             assert!(role(bad).is_none(), "{bad}");
         }
-        // A device-narrowed deny stored before slice 4 listed every
-        // action, `service.call` included; it still reads, without it.
-        let legacy =
-            role(r#"{"deny":[{"actions":["service.call","device.command"],"category":["lock"]}]}"#)
-                .expect("legacy deny");
-        assert_eq!(
-            legacy.deny[0].actions,
-            ActionSet::of(&[Action::DeviceCommand])
-        );
     }
 
     #[test]

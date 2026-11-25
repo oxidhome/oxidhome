@@ -756,6 +756,20 @@ pub struct Event {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_u64"
     )]
     pub row_id: u64,
+    /// H6: call id (`call-<32 hex>`) of the external request this event
+    /// traces back to (the publishing call's own, or for an `on-event`
+    /// reaction the one it reacts to). Unset for work the host started
+    /// on its own. **Host-populated**; attribution only, it grants
+    /// nothing. Mirror of WIT `event.call-id`; follow it into the audit
+    /// ledger with `GET /api/v1/audit?call_id=` / `?caused_by=`.
+    ///
+    /// Field 10: `call_id`
+    #[serde(
+        rename = "callId",
+        alias = "call_id",
+        skip_serializing_if = "::core::option::Option::is_none"
+    )]
+    pub call_id: ::core::option::Option<::buffa::alloc::string::String>,
     #[serde(flatten)]
     pub payload: ::core::option::Option<__buffa::oneof::event::Payload>,
     #[serde(skip)]
@@ -770,6 +784,7 @@ impl ::core::fmt::Debug for Event {
             .field("origin_plugin_id", &self.origin_plugin_id)
             .field("origin_instance_id", &self.origin_instance_id)
             .field("row_id", &self.row_id)
+            .field("call_id", &self.call_id)
             .field("payload", &self.payload)
             .finish()
     }
@@ -790,6 +805,16 @@ impl Event {
         value: impl Into<::buffa::alloc::string::String>,
     ) -> Self {
         self.device_id = Some(value.into());
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::call_id`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_call_id(
+        mut self,
+        value: impl Into<::buffa::alloc::string::String>,
+    ) -> Self {
+        self.call_id = Some(value.into());
         self
     }
 }
@@ -869,6 +894,9 @@ impl ::buffa::Message for Event {
         if self.row_id != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.row_id) as u64;
         }
+        if let Some(ref v) = self.call_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -929,6 +957,9 @@ impl ::buffa::Message for Event {
         }
         if self.row_id != 0u64 {
             ::buffa::types::put_uint64_field(9u32, self.row_id, buf);
+        }
+        if let Some(ref v) = self.call_id {
+            ::buffa::types::put_string_field(10u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1063,6 +1094,16 @@ impl ::buffa::Message for Event {
                 )?;
                 self.row_id = ::buffa::types::decode_uint64(buf)?;
             }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(
+                    self.call_id.get_or_insert_with(::buffa::alloc::string::String::new),
+                    buf,
+                )?;
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -1077,6 +1118,7 @@ impl ::buffa::Message for Event {
         self.origin_plugin_id.clear();
         self.origin_instance_id.clear();
         self.row_id = 0u64;
+        self.call_id = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1115,6 +1157,9 @@ impl<'de> serde::Deserialize<'de> for Event {
                     ::buffa::alloc::string::String,
                 > = None;
                 let mut __f_row_id: ::core::option::Option<u64> = None;
+                let mut __f_call_id: ::core::option::Option<
+                    ::core::option::Option<::buffa::alloc::string::String>,
+                > = None;
                 let mut __oneof_payload: ::core::option::Option<
                     __buffa::oneof::event::Payload,
                 > = None;
@@ -1193,6 +1238,14 @@ impl<'de> serde::Deserialize<'de> for Event {
                                 }
                                 map.next_value_seed(_S)?
                             });
+                        }
+                        "callId" | "call_id" => {
+                            __f_call_id = Some(
+                                map
+                                    .next_value::<
+                                        ::core::option::Option<::buffa::alloc::string::String>,
+                                    >()?,
+                            );
                         }
                         "stateChanged" | "state_changed" => {
                             let v: ::core::option::Option<StateChanged> = map
@@ -1310,6 +1363,9 @@ impl<'de> serde::Deserialize<'de> for Event {
                 }
                 if let ::core::option::Option::Some(v) = __f_row_id {
                     __r.row_id = v;
+                }
+                if let ::core::option::Option::Some(v) = __f_call_id {
+                    __r.call_id = v;
                 }
                 __r.payload = __oneof_payload;
                 Ok(__r)
