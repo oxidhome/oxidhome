@@ -31,11 +31,13 @@
 //! Refusals are audited (`method = NET`) through the shared deny-audit
 //! worker, rate-limited per instance.
 
+mod dns;
 mod http;
 mod policy;
 mod sockets;
 mod tls;
 
+pub(crate) use dns::DnsOverrides;
 pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
 pub(crate) use policy::{NetworkPolicy, covers as rule_covers};
 pub(crate) use sockets::address_check;

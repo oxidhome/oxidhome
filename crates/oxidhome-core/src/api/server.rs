@@ -1886,6 +1886,12 @@ struct PluginSummary {
     /// it's how the CLI distinguishes "ready to start" from
     /// "actively running".
     instance_count: u32,
+    /// Phase 8.5: the installation's network rules — `requested` by
+    /// the manifest, `granted` by the operator, and the `effective`
+    /// rules instances get (the grant narrowed by containment). Empty
+    /// lists for a plugin without network rules; `null` for the
+    /// running-but-not-installed case.
+    network: Option<crate::state::NetworkGrants>,
 }
 
 /// `GET /api/v1/plugins` — list of every plugin known to the host:
@@ -1918,6 +1924,7 @@ async fn list_plugins(
         plugins.push(PluginSummary {
             plugin_id: id,
             installed: true,
+            network: Some(installed.network_grants()),
             version: Some(installed.version),
             instance_count: count,
         });
@@ -1930,6 +1937,7 @@ async fn list_plugins(
             installed: false,
             version: None,
             instance_count,
+            network: None,
         });
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));

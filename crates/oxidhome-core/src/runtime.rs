@@ -190,6 +190,9 @@ pub struct Engine {
     /// Phase 8.2: TLS for streaming instances' `https://` requests —
     /// the system roots and the trust-on-first-use pins.
     tls: Arc<network::TlsClient>,
+    /// Test seam: the names streaming instances' lookups resolve, in
+    /// place of the platform resolver. Always `None` in the daemon.
+    dns: Option<Arc<network::DnsOverrides>>,
 }
 
 /// Round-7 F1: error returned by
@@ -475,6 +478,7 @@ impl Engine {
         purge_tls_pins_of_removed_installations(&db, &tls_pins, &audit_log);
         Ok(Self {
             tls: Arc::new(network::TlsClient::new(Arc::new(tls_pins))),
+            dns: None,
             inner,
             pending_commands,
             sensitive,
@@ -525,6 +529,27 @@ impl Engine {
             roots,
         ));
         self
+    }
+
+    /// Test hook: resolve streaming instances' name lookups (sockets and
+    /// HTTP) from `entries` instead of the platform resolver. A name the
+    /// table doesn't list is unresolvable, so results don't depend on
+    /// the machine's DNS. Answers still go through the network policy.
+    /// Call before loading plugins; replaces any earlier table. Not for
+    /// production.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_dns_overrides_for_tests(
+        mut self,
+        entries: impl IntoIterator<Item = (String, Vec<std::net::IpAddr>)>,
+    ) -> Self {
+        self.dns = Some(Arc::new(network::DnsOverrides::new(entries)));
+        self
+    }
+
+    /// The resolver test seam, if one is set.
+    pub(crate) fn dns_overrides(&self) -> Option<Arc<network::DnsOverrides>> {
+        self.dns.clone()
     }
 
     /// The TLS client streaming instances' `https://` requests use.

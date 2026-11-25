@@ -9,7 +9,7 @@
 mod support;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -347,13 +347,19 @@ async fn only_granted_rules_are_enforced_as_allowed() {
     .await;
 }
 
+fn ip(addr: &str) -> IpAddr {
+    addr.parse().expect("ip literal")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_name_resolving_to_a_forbidden_address_is_refused() {
-    let host = TestHost::new().unwrap();
+    // `localhost` answers loopback: a name rule never reaches it
+    // (rebinding protection), and a name without a rule isn't looked up.
+    let host = TestHost::new()
+        .unwrap()
+        .with_dns_overrides([("localhost", vec![ip("127.0.0.1")])]);
     let tcp = TcpServer::line();
     let web = TcpServer::http(|_| http_ok("secret"));
-    // `localhost` resolves to loopback: a name rule never reaches it
-    // (rebinding protection), and a name without a rule isn't looked up.
     let results = probe(
         &host,
         "rebind",
@@ -375,18 +381,71 @@ async fn a_name_resolving_to_a_forbidden_address_is_refused() {
     assert_eq!(tcp.accepted(), 0);
     assert_eq!(web.accepted(), 0);
     wait_for_deny(&host, "lookup", "rebind", "unlisted.example.com").await;
-    // Where the platform resolver answers `localhost.` (the host looks
-    // names up as absolute names), the refusal is a policy one: audited,
-    // and HTTP reports it as denied rather than as a DNS failure.
-    if !results[3].contains("DnsError") {
-        let row = wait_for_deny(&host, "lookup", "rebind", "localhost").await;
+    // The refusal is a policy one, not a DNS failure: audited, and HTTP
+    // reports it as denied.
+    let row = wait_for_deny(&host, "lookup", "rebind", "localhost").await;
+    assert!(
+        row.domain_error
+            .is_some_and(|e| e.contains("no network rule allows")),
+        "rebinding refusal"
+    );
+    assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lookups_hand_over_only_the_answers_the_rules_allow() {
+    let host = TestHost::new().unwrap().with_dns_overrides([
+        ("camera.lan", vec![ip("192.168.1.20")]),
+        ("api.example.com", vec![ip("1.1.1.1"), ip("192.168.1.30")]),
+        ("rebind.example.com", vec![ip("192.168.1.21")]),
+        ("metadata.google.internal", vec![ip("169.254.169.254")]),
+    ]);
+    let names = [
+        "camera.lan",
+        "api.example.com",
+        "rebind.example.com",
+        "metadata.google.internal",
+        "missing.example.com",
+    ];
+    let rules: Vec<String> = names.iter().map(|n| format!("tcp://{n}:443")).collect();
+    let ops: Vec<String> = names.iter().map(|n| format!("dns {n}")).collect();
+    let results = probe(&host, "lookups", &rules, &ops).await;
+    // A local-only name reaches the LAN; a public name keeps only its
+    // public answers.
+    assert_eq!(results[0], "ok:192.168.1.20", "{results:?}");
+    assert_eq!(results[1], "ok:1.1.1.1", "{results:?}");
+    // A public name answering only a LAN address, and a local-only name
+    // answering link-local, are refused and audited.
+    for (result, name) in results[2..4].iter().zip(&names[2..4]) {
+        assert!(result.starts_with("err:"), "{results:?}");
+        let row = wait_for_deny(&host, "lookup", "lookups", name).await;
         assert!(
             row.domain_error
                 .is_some_and(|e| e.contains("no network rule allows")),
-            "rebinding refusal"
+            "{name}"
         );
-        assert_eq!(results[3], "err:ErrorCode::HttpRequestDenied");
     }
+    // A name the table doesn't list is unresolvable: a DNS failure, not
+    // a policy refusal, and never sent to the machine's resolver.
+    assert!(results[4].starts_with("err:"), "{results:?}");
+    assert_ne!(results[4], results[2], "{results:?}");
+    // Every queued denial is written before checking none names it.
+    let engine = host.engine().clone();
+    assert!(
+        tokio::task::spawn_blocking(move || engine.drain_state_read_audit(Duration::from_secs(10)))
+            .await
+            .unwrap(),
+        "deny-audit queue drained"
+    );
+    let rows = host
+        .engine()
+        .audit_log()
+        .query(&AuditQuery::default(), 256)
+        .expect("audit query");
+    assert!(
+        !rows.iter().any(|r| r.path.contains("missing.example.com")),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -796,6 +855,45 @@ async fn https_reaches_servers_the_roots_vouch_for() {
             .list(&oxidhome_core::state::PinFilter::default()),
         Vec::new()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_by_name_checks_the_certificate_against_that_name() {
+    // The name resolves to loopback, which only an IP rule reaches; the
+    // name rule lets the host look it up. SNI and the certificate check
+    // use the name the request used.
+    let (ca, issuer) = test_ca();
+    let host = TestHost::new()
+        .unwrap()
+        .with_tls_for_tests(vec![ca])
+        .with_dns_overrides([
+            ("camera.example", vec![ip("127.0.0.1")]),
+            ("doorbell.example", vec![ip("127.0.0.1")]),
+        ]);
+    let server = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("secure"));
+    let port = server.port();
+    let results = probe(
+        &host,
+        "by-name",
+        &[
+            format!("https://camera.example:{port}"),
+            format!("https://doorbell.example:{port}"),
+            format!("https://127.0.0.1:{port}"),
+        ],
+        &[
+            format!("get https://camera.example:{port}/ok"),
+            format!("get https://doorbell.example:{port}/ok"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec![
+            "ok:200:secure".to_owned(),
+            "err:Http(ErrorCode::TlsCertificateError)".to_owned()
+        ]
+    );
+    assert_eq!(server.served(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

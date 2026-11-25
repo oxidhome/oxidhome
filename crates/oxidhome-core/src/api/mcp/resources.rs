@@ -137,7 +137,10 @@ pub(super) fn list_resources() -> Vec<Resource> {
             .with_description(
                 "JSON list of every plugin known to the host: installed manifests \
                  plus running-but-not-installed instances, each with its live \
-                 instance count. Mirrors `oxidhome plugin list`.",
+                 instance count and, when installed, its `network` rules \
+                 (`requested`, `granted`, `effective`). Same body as the \
+                 `plugins.list` tool; the offline `oxidhome plugin list` shows \
+                 the same rules for installed plugins.",
             )
             .with_mime_type("application/json"),
         Resource::new("oxidhome://events", "events")
@@ -220,8 +223,9 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
             .with_title("One plugin")
             .with_description(
                 "JSON detail for a single installed plugin — version, manifest \
-                 digest, singleton flag, plus live instances. Mirrors \
-                 `oxidhome plugin show <plugin-id>`.",
+                 digest, singleton flag, `network` rules (`requested`, `granted`, \
+                 `effective`), plus live instances. Same body as the \
+                 `plugins.show` tool.",
             )
             .with_mime_type("application/json"),
         ResourceTemplate::new("oxidhome://blobs/{instance_id}/{name}", "blob")
@@ -1047,6 +1051,10 @@ pub(super) struct PluginListEntry {
     pub(super) installed: bool,
     pub(super) version: Option<String>,
     pub(super) instance_count: u32,
+    /// Phase 8.5: requested / granted / effective network rules;
+    /// `None` for a running-but-not-installed plugin. Same shape as
+    /// `GET /api/v1/plugins`.
+    pub(super) network: Option<crate::state::NetworkGrants>,
 }
 
 #[derive(Serialize)]
@@ -1070,6 +1078,7 @@ pub(super) fn plugins_list_body(engine: &Engine) -> PluginListBody {
         plugins.push(PluginListEntry {
             plugin_id: id,
             installed: true,
+            network: Some(installed.network_grants()),
             version: Some(installed.version),
             instance_count: count,
         });
@@ -1080,6 +1089,7 @@ pub(super) fn plugins_list_body(engine: &Engine) -> PluginListBody {
             installed: false,
             version: None,
             instance_count,
+            network: None,
         });
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
@@ -1122,6 +1132,9 @@ pub(super) struct PluginDetail {
     /// produces a different UUID. `None` alongside
     /// `content_digest` on the not-installed path.
     pub(super) installation_uuid: Option<String>,
+    /// Phase 8.5: requested / granted / effective network rules;
+    /// `None` on the not-installed path.
+    pub(super) network: Option<crate::state::NetworkGrants>,
     pub(super) instances: Vec<PluginInstanceDetail>,
 }
 
@@ -1153,6 +1166,9 @@ pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDet
         singleton: installed.as_ref().map(|p| p.singleton),
         content_digest: installed.as_ref().map(|p| p.content_digest.to_string()),
         installation_uuid: installed.as_ref().map(|p| p.installation_uuid.to_string()),
+        network: installed
+            .as_ref()
+            .map(crate::state::InstalledPlugin::network_grants),
         instances,
     })
 }

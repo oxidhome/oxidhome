@@ -268,7 +268,8 @@ const MAX_HOST_LOOKUPS: usize = 32;
 
 /// Resolve `name` (already allowed by `rules`) on the blocking pool,
 /// holding one of the instance's lookup permits until `getaddrinfo`
-/// returns, so timed-out lookups can't pile up threads.
+/// returns, so timed-out lookups can't pile up threads. With the
+/// engine's DNS test seam in place, the seam's table answers instead.
 pub(super) async fn resolve(
     policy: &Arc<NetworkPolicy>,
     permits: LookupPermits,
@@ -278,21 +279,26 @@ pub(super) async fn resolve(
     target: &str,
     only: Option<(Use, u16)>,
 ) -> Result<Vec<IpAddr>, ErrorCode> {
-    let LookupPermits { permit, global } = permits;
-    // Resolved as an absolute name, so a resolver search list can't
-    // turn it into a different name than the one the rules matched.
-    let host = format!("{}.", super::policy::normalize_name(name));
-    let blocking = tokio::task::spawn_blocking(move || {
-        let _permits = (permit, global);
-        (host.as_str(), 0)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())
-    });
-    let addrs = match tokio::time::timeout(LOOKUP_TIMEOUT, blocking).await {
-        Err(_) => return Err(ErrorCode::TemporaryResolverFailure),
-        Ok(Err(_)) => return Err(ErrorCode::Unknown),
-        Ok(Ok(Err(_))) => return Err(ErrorCode::NameUnresolvable),
-        Ok(Ok(Ok(addrs))) => addrs,
+    let addrs = if let Some(dns) = &policy.dns {
+        drop(permits);
+        dns.lookup(name).ok_or(ErrorCode::NameUnresolvable)?
+    } else {
+        let LookupPermits { permit, global } = permits;
+        // Resolved as an absolute name, so a resolver search list can't
+        // turn it into a different name than the one the rules matched.
+        let host = format!("{}.", super::policy::normalize_name(name));
+        let blocking = tokio::task::spawn_blocking(move || {
+            let _permits = (permit, global);
+            (host.as_str(), 0)
+                .to_socket_addrs()
+                .map(|addrs| addrs.map(|a| a.ip()).collect::<Vec<_>>())
+        });
+        match tokio::time::timeout(LOOKUP_TIMEOUT, blocking).await {
+            Err(_) => return Err(ErrorCode::TemporaryResolverFailure),
+            Ok(Err(_)) => return Err(ErrorCode::Unknown),
+            Ok(Ok(Err(_))) => return Err(ErrorCode::NameUnresolvable),
+            Ok(Ok(Ok(addrs))) => addrs,
+        }
     };
     let admitted = policy.admit_resolved(addrs, rules, only);
     if admitted.is_empty() {

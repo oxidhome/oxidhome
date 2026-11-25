@@ -66,12 +66,12 @@ use oxidhome_proto::proto::oxidhome::v1::{
     ListDeviceStateRequest, ListDeviceStateResponse, ListDevicesRequest, ListDevicesResponse,
     ListInstancesRequest, ListInstancesResponse, ListPluginsRequest, ListPluginsResponse,
     LogEvent as ProtoLogEvent, LogField as ProtoLogField, LogLevel as ProtoLogLevel,
-    LogValue as ProtoLogValue, Plugin as ProtoPlugin, QueryLogsRequest, QueryLogsResponse,
-    StartPluginRequest, StartPluginResponse, StateChanged as ProtoStateChanged,
-    StateQuality as ProtoStateQuality, StopPluginRequest, StopPluginResponse, TailEventsRequest,
-    TailEventsResponse, UninstallPluginRequest, UninstallPluginResponse, Value as ProtoValue,
-    event as proto_event, execute_command_error, execute_command_response, log_value,
-    tail_events_response, value,
+    LogValue as ProtoLogValue, NetworkGrants as ProtoNetworkGrants, Plugin as ProtoPlugin,
+    QueryLogsRequest, QueryLogsResponse, StartPluginRequest, StartPluginResponse,
+    StateChanged as ProtoStateChanged, StateQuality as ProtoStateQuality, StopPluginRequest,
+    StopPluginResponse, TailEventsRequest, TailEventsResponse, UninstallPluginRequest,
+    UninstallPluginResponse, Value as ProtoValue, event as proto_event, execute_command_error,
+    execute_command_response, log_value, tail_events_response, value,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     CreateRoleRequest, CreateRoleResponse, CreateTokenRequest, CreateTokenResponse,
@@ -948,11 +948,18 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         for installed in self.engine.installed_plugins().list() {
             let id = installed.plugin_id.to_string();
             let count = by_plugin.remove(&id).unwrap_or(0);
+            let (requested, granted, effective) = installed.network_grants().to_strings();
             plugins.push(ProtoPlugin {
                 plugin_id: id,
                 installed: true,
                 version: Some(installed.version),
                 instance_count: count,
+                network: oxidhome_proto::runtime::MessageField::some(ProtoNetworkGrants {
+                    requested,
+                    granted,
+                    effective,
+                    ..Default::default()
+                }),
                 ..Default::default()
             });
         }

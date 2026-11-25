@@ -184,6 +184,31 @@ assert!(matches!(
 A grant asking for *more* than the manifest requests is refused with
 `TestHostError::GrantExceedsRequest`.
 
+## Name resolution
+
+A streaming plugin's name lookups (sockets and `wasi:http`) normally go
+to the machine's resolver. `TestHost::with_dns_overrides` answers them
+from a table instead, so a test can use any name and get the same
+answer on every machine; a name the table doesn't list is unresolvable.
+The network policy still checks every answer, so a public name that
+answers with a LAN address no IP or CIDR rule covers is refused, just
+as it would be in the daemon:
+
+```rust,no_run
+use std::net::IpAddr;
+
+use oxidhome_test_host::{TestHost, TestHostError};
+
+# fn demo() -> Result<(), TestHostError> {
+let camera: IpAddr = "192.168.1.20".parse().unwrap();
+let host = TestHost::new()?.with_dns_overrides([("camera.lan", vec![camera])]);
+# let _ = host;
+# Ok(())
+# }
+```
+
+Call it before loading plugins.
+
 ## Services, crashes, and hangs
 
 `TestHost::start` runs a plugin under the daemon's own supervisor

@@ -43,6 +43,9 @@
 //!   [<port>]]` / `tls-pin reset --all` (Phase 8.2)** — offline: list or
 //!   forget the certificates streaming instances trusted on first use for
 //!   LAN devices; the next request to a reset device pins again.
+//! - **`plugin list` (Phase 8.5)** — offline: the installed plugins
+//!   with their network rules (requested, granted, effective), read
+//!   without touching the registry.
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
 //!   of the database, the blob files it indexes and the installed
 //!   plugin packages to a new directory with a checksummed
@@ -91,7 +94,7 @@ use oxidhome_core::api::mcp::{
 use oxidhome_core::api::network_admin::reset_tls_pins;
 use oxidhome_core::api::sensitive_admin::{
     grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
-    with_offline_stores,
+    with_offline_db, with_offline_stores,
 };
 use oxidhome_core::api::{
     ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
@@ -390,6 +393,9 @@ async fn run_subcommand() -> Option<anyhow::Result<()>> {
             Some("role") => run_role(),
             Some("device") => run_device(),
             Some("tls-pin") => run_tls_pin(),
+            // `oxidhome plugin` alone still starts the daemon with a dev
+            // plugin directory named `plugin`.
+            Some("plugin") if std::env::args_os().nth(2).is_some() => run_plugin(),
             _ => return None,
         },
     )
@@ -988,6 +994,95 @@ fn run_tls_pin() -> anyhow::Result<()> {
     Ok(())
 }
 
+const PLUGIN_USAGE: &str = "usage: oxidhome plugin list";
+
+/// Phase 8.5: `oxidhome plugin list`. Offline and read-only.
+fn run_plugin() -> anyhow::Result<()> {
+    // `args_os`: a non-UTF-8 argument is a usage error, not a panic.
+    let args: Vec<Option<String>> = std::env::args_os()
+        .skip(2)
+        .map(|a| a.into_string().ok())
+        .collect();
+    match args
+        .iter()
+        .map(Option::as_deref)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [Some("list")] => {}
+        [Some("-h" | "--help")] => {
+            println!("{PLUGIN_USAGE}");
+            return Ok(());
+        }
+        _ => anyhow::bail!("{PLUGIN_USAGE}"),
+    }
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let plugins = with_offline_db(&state_dir, |db| {
+        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), db)
+    })?;
+    print!("{}", format_plugin_list(&plugins));
+    Ok(())
+}
+
+/// `text` with control characters escaped (`\u{1b}`), so a manifest
+/// can't steer the operator's terminal through what the CLI prints.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        // Bidirectional formatting characters aren't `is_control`, but
+        // reorder what a terminal shows.
+        let bidi = matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if c.is_control() || bidi {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `oxidhome plugin list` output: a tab-separated line per plugin, then
+/// one indented line per network rule, tagged `requested`, `granted` or
+/// `effective`. Control characters are escaped.
+fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for plugin in plugins {
+        match &plugin.status {
+            Ok((version, network)) => {
+                let _ = writeln!(
+                    out,
+                    "{}\t{}\tinstallation={}",
+                    printable(&plugin.plugin_id),
+                    printable(version),
+                    printable(&plugin.installation_uuid)
+                );
+                let (requested, granted, effective) = network.to_strings();
+                for (tag, rules) in [
+                    ("requested", requested),
+                    ("granted", granted),
+                    ("effective", effective),
+                ] {
+                    for rule in rules {
+                        let _ = writeln!(out, "\t{tag}\t{}", printable(&rule));
+                    }
+                }
+            }
+            Err(why) => {
+                let _ = writeln!(
+                    out,
+                    "{}\tunavailable\tinstallation={}\t{}",
+                    printable(&plugin.plugin_id),
+                    printable(&plugin.installation_uuid),
+                    printable(why)
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Stderr-only tracing for the offline / one-shot subcommands.
 fn init_cli_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -1415,5 +1510,48 @@ mod tests {
         assert!(reset);
         assert_eq!(filter.scope(), "*");
         assert!(parse_tls_pin_args(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn plugin_list_shows_each_rule_under_its_plugin() {
+        use oxidhome_core::state::{NetworkGrants, OfflinePlugin};
+        let rule = |r: &str| r.parse::<oxidhome_manifest::NetworkRule>().unwrap();
+        let plugins = [
+            OfflinePlugin {
+                plugin_id: "net.example.cam".into(),
+                installation_uuid: "inst-1".into(),
+                status: Ok((
+                    "1.2.0".into(),
+                    NetworkGrants::new(
+                        &[rule("tcp://192.168.0.0/16:554")],
+                        &[rule("tcp://192.168.1.20:554")],
+                    ),
+                )),
+            },
+            OfflinePlugin {
+                plugin_id: "net.example.old".into(),
+                installation_uuid: "inst-2".into(),
+                status: Err("contents changed since install; reinstall".into()),
+            },
+        ];
+        assert_eq!(
+            format_plugin_list(&plugins),
+            "net.example.cam\t1.2.0\tinstallation=inst-1\n\
+             \trequested\ttcp://192.168.0.0/16:554\n\
+             \tgranted\ttcp://192.168.1.20:554\n\
+             \teffective\ttcp://192.168.1.20:554\n\
+             net.example.old\tunavailable\tinstallation=inst-2\t\
+             contents changed since install; reinstall\n"
+        );
+    }
+
+    #[test]
+    fn plugin_list_escapes_control_characters() {
+        assert_eq!(
+            printable("tcp://a\u{1b}[2Jb.lan:1"),
+            "tcp://a\\u{1b}[2Jb.lan:1"
+        );
+        assert_eq!(printable("plain"), "plain");
+        assert_eq!(printable("a\u{202e}b"), "a\\u{202e}b");
     }
 }

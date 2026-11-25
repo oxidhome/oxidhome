@@ -112,6 +112,10 @@ name = "network_tls_pins"
 path = "tests/network_tls_pins.rs"
 
 [[test]]
+name = "plugin_network_grants"
+path = "tests/plugin_network_grants.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 
