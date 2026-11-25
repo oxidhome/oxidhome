@@ -363,3 +363,44 @@ async fn the_offline_listing_reports_a_changed_package_without_touching_it() {
     // Read-only: the row is still live and listed the same way.
     assert_eq!(listing(&db), offline);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_offline_listing_flags_what_scan_would_quarantine() {
+    let offline = |state: &support::TempDir| {
+        let db = oxidhome_core::state::Db::open_file(state.path()).expect("db");
+        oxidhome_core::state::list_installations_offline(&state.path().join("plugins"), &db)
+            .expect("offline listing")
+    };
+    let reason = |state: &support::TempDir| {
+        let listed = offline(state);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        listed[0].status.clone().expect_err("quarantined")
+    };
+
+    // A second directory claiming the id, even one without its wasm.
+    let state = support::tempdir("net-grants-dup");
+    drop(installed_and_narrowed(&state));
+    let copy = state.path().join("plugins").join(".camera");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("manifest.toml"), manifest()).unwrap();
+    assert!(reason(&state).contains("more than one package"));
+
+    // The package directory is gone.
+    let state = support::tempdir("net-grants-gone");
+    drop(installed_and_narrowed(&state));
+    std::fs::remove_dir_all(state.path().join("plugins").join(PLUGIN_ID)).unwrap();
+    assert!(reason(&state).contains("no readable package"));
+
+    // The persisted grant is unusable.
+    let state = support::tempdir("net-grants-null");
+    drop(installed_and_narrowed(&state));
+    let db = state.path().join(oxidhome_core::state::db::DB_FILE_NAME);
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE plugin_installation SET granted_capabilities_json = NULL",
+            [],
+        )
+        .unwrap();
+    assert!(reason(&state).contains("grant or content digest"));
+}

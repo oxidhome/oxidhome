@@ -1368,6 +1368,8 @@ async fn plugins_list_aggregates_running_instances() {
     assert_eq!(plugins.len(), 1, "expected one plugin row, got {body:?}");
     assert_eq!(plugins[0]["plugin_id"], "example.simulated-switch");
     assert_eq!(plugins[0]["instance_count"], 2);
+    // Not installed: no grant to show.
+    assert!(plugins[0]["network"].is_null(), "{body:?}");
 
     a.stop().await.expect("stop a");
     b.stop().await.expect("stop b");
@@ -1750,6 +1752,11 @@ async fn install_succeeds_and_shows_up_in_listing() {
     assert_eq!(plugins[0]["installed"], true);
     assert_eq!(plugins[0]["version"], "0.1.0");
     assert_eq!(plugins[0]["instance_count"], 0);
+    // A `plugin`-world manifest has no network rules.
+    assert_eq!(
+        plugins[0]["network"],
+        serde_json::json!({"requested": [], "granted": [], "effective": []})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

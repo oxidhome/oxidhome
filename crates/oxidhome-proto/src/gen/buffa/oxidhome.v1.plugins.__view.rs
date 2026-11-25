@@ -530,7 +530,8 @@ pub struct PluginView<'a> {
     pub instance_count: u32,
     /// The installation's network rules (Phase 8.5), present when
     /// `installed = true` (empty lists for a plugin without network
-    /// rules). Same shape as the JSON side's `network` object.
+    /// rules). Same lists as the JSON side's `network` object; ProtoJSON
+    /// omits an empty list, so a plugin without rules encodes as `{}`.
     ///
     /// Field 5: `network`
     pub network: ::buffa::MessageFieldView<
@@ -878,7 +879,8 @@ impl PluginOwnedView {
     }
     /// The installation's network rules (Phase 8.5), present when
     /// `installed = true` (empty lists for a plugin without network
-    /// rules). Same shape as the JSON side's `network` object.
+    /// rules). Same lists as the JSON side's `network` object; ProtoJSON
+    /// omits an empty list, so a plugin without rules encodes as `{}`.
     ///
     /// Field 5: `network`
     #[must_use]

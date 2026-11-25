@@ -1019,9 +1019,23 @@ fn run_plugin() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `text` with control characters escaped (`\u{1b}`), so a manifest
+/// can't steer the operator's terminal through what the CLI prints.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// `oxidhome plugin list` output: a tab-separated line per plugin, then
 /// one indented line per network rule, tagged `requested`, `granted` or
-/// `effective`.
+/// `effective`. Control characters are escaped.
 fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1030,8 +1044,10 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
             Ok((version, network)) => {
                 let _ = writeln!(
                     out,
-                    "{}\t{version}\tinstallation={}",
-                    plugin.plugin_id, plugin.installation_uuid
+                    "{}\t{}\tinstallation={}",
+                    printable(&plugin.plugin_id),
+                    printable(version),
+                    printable(&plugin.installation_uuid)
                 );
                 let (requested, granted, effective) = network.to_strings();
                 for (tag, rules) in [
@@ -1040,15 +1056,17 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
                     ("effective", effective),
                 ] {
                     for rule in rules {
-                        let _ = writeln!(out, "\t{tag}\t{rule}");
+                        let _ = writeln!(out, "\t{tag}\t{}", printable(&rule));
                     }
                 }
             }
             Err(why) => {
                 let _ = writeln!(
                     out,
-                    "{}\tquarantined\tinstallation={}\t{why}",
-                    plugin.plugin_id, plugin.installation_uuid
+                    "{}\tquarantined\tinstallation={}\t{}",
+                    printable(&plugin.plugin_id),
+                    printable(&plugin.installation_uuid),
+                    printable(why)
                 );
             }
         }
@@ -1516,5 +1534,14 @@ mod tests {
              net.example.old\tquarantined\tinstallation=inst-2\t\
              contents changed since install; reinstall\n"
         );
+    }
+
+    #[test]
+    fn plugin_list_escapes_control_characters() {
+        assert_eq!(
+            printable("tcp://a\u{1b}[2Jb.lan:1"),
+            "tcp://a\\u{1b}[2Jb.lan:1"
+        );
+        assert_eq!(printable("plain"), "plain");
     }
 }

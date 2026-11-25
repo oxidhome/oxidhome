@@ -2204,8 +2204,10 @@ pub struct OfflinePlugin {
 /// rules, read-only: unlike [`InstalledPluginRegistry::scan`] this
 /// mints, backfills and tombstones nothing, so it is safe for an
 /// operator listing. A row whose grant or digest is unusable, whose
-/// package is missing or unreadable, or whose contents changed since
-/// install is listed with the reason instead. Sorted by plugin id.
+/// package is missing or unreadable, whose id more than one package
+/// directory claims, or whose contents changed since install is listed
+/// with the reason instead (scan would quarantine it). Sorted by
+/// plugin id.
 ///
 /// # Errors
 ///
@@ -2218,38 +2220,44 @@ pub fn list_installations_offline(
         live,
         quarantined_uuids,
     } = load_live_installations(db)?;
-    // Manifest id → (digest, manifest) for every readable package; the
-    // directory name needn't match the id (scan keys on the manifest).
-    let mut packages: HashMap<String, Result<(String, PluginManifest), String>> = HashMap::new();
+    // Manifest id → package directories declaring it, in the order scan
+    // sees them: only `.staging-*` is skipped, and ids are collected from
+    // the manifest alone, before any wasm or UI asset is read, so a
+    // duplicate is caught even when one copy is otherwise broken.
+    let mut dirs_by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
     if plugins_root.exists() {
         for entry in std::fs::read_dir(plugins_root)? {
             let entry = entry?;
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with('.') || !entry.file_type()?.is_dir() {
+            if !entry.file_type()?.is_dir()
+                || entry.file_name().to_string_lossy().starts_with(".staging-")
+            {
                 continue;
             }
-            if let Ok((digest, manifest)) = recompute_digest_and_manifest(&entry.path()) {
-                let id = manifest.plugin.id.clone();
-                // Two packages claiming one id: scan quarantines both.
-                let value = if packages.contains_key(&id) {
-                    Err("more than one package directory claims this plugin id".to_owned())
-                } else {
-                    Ok((digest, manifest))
-                };
-                packages.insert(id, value);
+            if let Ok((manifest, _)) = read_manifest_sync_capturing_bytes(&entry.path()) {
+                dirs_by_id
+                    .entry(manifest.plugin.id.clone())
+                    .or_default()
+                    .push(entry.path());
             }
         }
     }
+    let mut package = |plugin_id: &str| -> Result<(String, PluginManifest), String> {
+        match dirs_by_id.remove(plugin_id).as_deref() {
+            None | Some([]) => Err("no readable package on disk".to_owned()),
+            Some([dir]) => recompute_digest_and_manifest(dir)
+                .map_err(|err| format!("package unreadable: {err:#}")),
+            Some(_) => Err("more than one package directory claims this plugin id".to_owned()),
+        }
+    };
     let mut out: Vec<OfflinePlugin> = live
         .into_iter()
         .map(|(plugin_id, row)| {
-            let status = match packages.remove(&plugin_id) {
-                None => Err("no readable package on disk".to_owned()),
-                Some(Err(why)) => Err(why),
-                Some(Ok((digest, _))) if digest != *row.content_digest => {
+            let status = match package(&plugin_id) {
+                Err(why) => Err(why),
+                Ok((digest, _)) if digest != *row.content_digest => {
                     Err("contents changed since install; reinstall".to_owned())
                 }
-                Some(Ok((_, manifest))) => Ok((
+                Ok((_, manifest)) => Ok((
                     manifest.plugin.version.to_string(),
                     NetworkGrants::new(
                         &manifest.capabilities.network,
