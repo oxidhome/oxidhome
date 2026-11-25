@@ -99,9 +99,8 @@ message Token {
   // `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
   repeated string sensitive = 7;
   // Deny entries as `actions@categories[devices]`, or `actions{services}`
-  // for one narrowed to services: comma-separated patterns, each one
-  // holding a comma, whitespace, brace or quote written as a JSON
-  // string.
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string deny = 8;
   // Unix ms.
   int64 created_ms = 9;
@@ -126,15 +125,13 @@ message Role {
   string role_id = 1;
   string name = 2;
   // Grants as `actions@categories[devices]`, or `actions{services}`
-  // for one narrowed to services: comma-separated patterns, each one
-  // holding a comma, whitespace, brace or quote written as a JSON
-  // string.
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string grants = 3;
   repeated string sensitive = 4;
   // Denies as `actions@categories[devices]`, or `actions{services}`
-  // for one narrowed to services: comma-separated patterns, each one
-  // holding a comma, whitespace, brace or quote written as a JSON
-  // string.
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string deny = 5;
   // Ids of the live tokens holding the role.
   repeated string tokens = 6;

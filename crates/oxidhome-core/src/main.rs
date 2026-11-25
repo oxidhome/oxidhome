@@ -833,41 +833,6 @@ fn run_token_create(args: &[String], usage: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `<service,...>` of a `--deny <actions>{<service,...>}`, as
-/// listings print it: comma-separated, a pattern holding a comma,
-/// whitespace, brace or quote in double quotes (escaped as JSON).
-fn service_list(list: &str) -> anyhow::Result<Vec<String>> {
-    let mut out = Vec::new();
-    let mut rest = list;
-    loop {
-        let (pattern, after) = if let Some(quoted) = rest.strip_prefix('"') {
-            // The closing quote: the first `"` not escaped by `\`.
-            let mut escaped = false;
-            let end = quoted
-                .char_indices()
-                .find(|&(_, c)| {
-                    let close = c == '"' && !escaped;
-                    escaped = c == '\\' && !escaped;
-                    close
-                })
-                .map(|(i, _)| i + 2)
-                .ok_or_else(|| anyhow::anyhow!("unterminated quote in `{list}`"))?;
-            let pattern: String = serde_json::from_str(&rest[..end])
-                .map_err(|e| anyhow::anyhow!("bad quoted pattern in `{list}`: {e}"))?;
-            (pattern, &rest[end..])
-        } else {
-            let end = rest.find(',').unwrap_or(rest.len());
-            (rest[..end].to_owned(), &rest[end..])
-        };
-        out.push(pattern);
-        match after.strip_prefix(',') {
-            Some(next) => rest = next,
-            None if after.is_empty() => return Ok(out),
-            None => anyhow::bail!("expected `,` after a quoted pattern in `{list}`"),
-        }
-    }
-}
-
 /// H6 slice 3: the arguments of `oxidhome token create`.
 fn parse_token_create(
     args: &[String],
@@ -893,7 +858,7 @@ fn parse_token_create(
                 // `<actions>[@<categories>]`.
                 let (actions, category, services) =
                     match v.strip_suffix('}').and_then(|v| v.split_once('{')) {
-                        Some((a, svc)) => (a, None, Some(service_list(svc)?)),
+                        Some((a, svc)) => (a, None, list(svc)),
                         None => match v.split_once('@') {
                             Some((a, c)) => (a, list(c), None),
                             None => (v.as_str(), None, None),
@@ -1566,12 +1531,7 @@ mod tests {
             ]),
             categories: None,
             devices: None,
-            services: Some(vec![
-                "acme.notify/send".into(),
-                "acme.notify/send, \"urgent\" {x}".into(),
-                "acme.notify/send\u{a0}now".into(),
-                "acme.alarm".into(),
-            ]),
+            services: Some(vec!["acme.notify/send".into(), "acme.alarm*".into()]),
         }
         .describe();
         let args: Vec<String> = ["kiosk", "--deny", listed.as_str()]
@@ -1582,15 +1542,9 @@ mod tests {
             req.deny[0].services,
             Some(vec![
                 "acme.notify/send".to_owned(),
-                "acme.notify/send, \"urgent\" {x}".to_owned(),
-                "acme.notify/send\u{a0}now".to_owned(),
-                "acme.alarm".to_owned(),
+                "acme.alarm*".to_owned()
             ])
         );
-        for bad in [r#"service.call{"acme.x/a}"#, r#"service.call{"acme.x/a"b}"#] {
-            let args: Vec<String> = ["kiosk", "--deny", bad].map(str::to_owned).to_vec();
-            assert!(parse_token_create(&args).is_err(), "{bad}");
-        }
     }
 
     #[test]

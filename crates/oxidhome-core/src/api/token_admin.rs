@@ -340,8 +340,9 @@ fn selector(spec: &SelectorSpec, what: &str) -> Result<Selector, AdminError> {
             if let Some(bad) = list.iter().find(|p| !is_service_pattern(p)) {
                 return Err(invalid(format!(
                     "service pattern `{bad}` must be `<plugin>` or `<plugin>/<local-id>`, each \
-                     half literal or ending in a single `*`, the plugin half in plugin-id \
-                     characters (`a-z`, `0-9`, `.`, `-`)"
+                     half literal or ending in a single `*`: the plugin half a reverse-DNS \
+                     plugin id (`a-z`, `0-9`, `-` labels joined by `.`), the local-id half 1-64 \
+                     of `a-z`, `0-9`, `.`, `_`, `-` starting with a letter or digit"
                 )));
             }
             Some(list.clone())

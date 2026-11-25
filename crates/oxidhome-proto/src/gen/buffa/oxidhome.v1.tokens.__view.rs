@@ -1604,9 +1604,8 @@ pub struct TokenView<'a> {
     /// Field 7: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
     /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2055,9 +2054,8 @@ impl TokenOwnedView {
         &self.0.reborrow().sensitive
     }
     /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     #[must_use]
@@ -2485,18 +2483,16 @@ pub struct RoleView<'a> {
     /// Field 2: `name`
     pub name: &'a str,
     /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     pub grants: ::buffa::RepeatedView<'a, &'a str>,
     /// Field 4: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
     /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2884,9 +2880,8 @@ impl RoleOwnedView {
         self.0.reborrow().name
     }
     /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     #[must_use]
@@ -2899,9 +2894,8 @@ impl RoleOwnedView {
         &self.0.reborrow().sensitive
     }
     /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     #[must_use]

@@ -512,8 +512,15 @@ pub(crate) fn deny_actions(
     Some(actions.without(unmatchable))
 }
 
-/// Longest service pattern a selector accepts.
-pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
+/// Longest plugin half of a service pattern.
+pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = 256;
+
+/// Longest service pattern a selector accepts: a plugin half of up to
+/// [`MAX_SERVICE_PATTERN_PLUGIN_BYTES`], `/`, and a local-id half of up
+/// to the longest local-id plus a trailing `*`, so every service with
+/// such a plugin id can be named exactly.
+pub const MAX_SERVICE_PATTERN_BYTES: usize =
+    MAX_SERVICE_PATTERN_PLUGIN_BYTES + 1 + oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES + 1;
 
 /// `true` for a service pattern: `<plugin>` or `<plugin>/<local-id>`,
 /// at most [`MAX_SERVICE_PATTERN_BYTES`]. Each half is literal or
@@ -528,6 +535,7 @@ pub fn is_service_pattern(pattern: &str) -> bool {
         None => (pattern, None),
     };
     pattern.len() <= MAX_SERVICE_PATTERN_BYTES
+        && plugin.len() <= MAX_SERVICE_PATTERN_PLUGIN_BYTES
         && could_name_plugin(plugin)
         && service.is_none_or(could_name_local_id)
 }
@@ -538,8 +546,8 @@ fn could_name_local_id(half: &str) -> bool {
     match half.strip_suffix('*') {
         Some("") => true,
         Some(prefix) => {
-            prefix.len() < oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES
-                && oxidhome_manifest::is_service_local_id(prefix)
+            // The local-id itself (empty suffix) or a longer one.
+            oxidhome_manifest::is_service_local_id(prefix)
         }
         None => oxidhome_manifest::is_service_local_id(half),
     }
@@ -650,23 +658,10 @@ fn describe(
         s.push(']');
     }
     if let Some(svc) = services {
-        // Comma-separated, as `token create --deny` reads them back. A
-        // local id may hold commas, spaces or braces: quote such a
-        // pattern (a JSON string) so it can't read as several.
-        let shown: Vec<String> = svc
-            .iter()
-            .map(|p| {
-                if p.chars()
-                    .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"'))
-                {
-                    serde_json::to_string(p).unwrap_or_default()
-                } else {
-                    p.clone()
-                }
-            })
-            .collect();
+        // Comma-separated, as `token create --deny` reads them back;
+        // the pattern grammar admits no comma, space or brace.
         s.push('{');
-        s.push_str(&shown.join(","));
+        s.push_str(&svc.join(","));
         s.push('}');
     }
     s
@@ -859,6 +854,13 @@ mod tests {
         ] {
             assert!(is_service_pattern(good), "{good}");
         }
+        // The longest names, exactly or as a prefix.
+        let plugin = format!("{}.b", "a".repeat(MAX_SERVICE_PATTERN_PLUGIN_BYTES - 2));
+        let local = "s".repeat(oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES);
+        assert!(is_service_pattern(&format!("{plugin}/{local}")));
+        assert!(is_service_pattern(&format!("{plugin}/{local}*")));
+        assert!(!is_service_pattern(&format!("{plugin}/{local}s")));
+        assert!(!is_service_pattern(&format!("a{plugin}/x")));
         let long = "a".repeat(MAX_SERVICE_PATTERN_BYTES + 1);
         for bad in [
             "",
@@ -891,11 +893,11 @@ mod tests {
             Some(vec!["acme.notify/send".to_string()])
         );
         assert_eq!(def.grants[0].describe(), "service.call{acme.notify/send}");
-        let spaced = RoleGrant {
-            services: Some(vec!["acme.notify/send *".into()]),
+        let two = RoleGrant {
+            services: Some(vec!["acme.notify/send".into(), "zwave.*".into()]),
             ..def.grants[0].clone()
         };
-        assert_eq!(spaced.describe(), r#"service.call{"acme.notify/send *"}"#);
+        assert_eq!(two.describe(), "service.call{acme.notify/send,zwave.*}");
         assert_eq!(def.deny[0].services, Some(vec!["zwave.*".to_string()]));
         assert_eq!(
             RoleDef::parse(&def.id, &def.name, &def.definition_json()).as_ref(),

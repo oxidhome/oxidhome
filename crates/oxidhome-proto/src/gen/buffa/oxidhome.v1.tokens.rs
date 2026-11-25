@@ -945,9 +945,8 @@ pub struct Token {
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     #[serde(
@@ -1510,9 +1509,8 @@ pub struct Role {
     )]
     pub name: ::buffa::alloc::string::String,
     /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     #[serde(
@@ -1529,9 +1527,8 @@ pub struct Role {
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services: comma-separated patterns, each one
-    /// holding a comma, whitespace, brace or quote written as a JSON
-    /// string.
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     #[serde(
