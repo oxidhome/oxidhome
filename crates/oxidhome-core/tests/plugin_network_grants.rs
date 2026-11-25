@@ -181,6 +181,13 @@ fn grant_audit_paths(engine: &Engine) -> Vec<String> {
         .filter(|r| r.path.contains(".plugin.network_grant."))
         .map(|r| {
             assert_eq!(r.decision, "allow", "{r:?}");
+            // The row names the caller's kind, whatever the surface.
+            let kind = match r.path.split('.').next() {
+                Some("cli") => "cli",
+                Some("mcp") => "mcp",
+                _ => "api",
+            };
+            assert_eq!(r.actor_kind, kind, "{r:?}");
             r.path
         })
         .collect()
@@ -632,11 +639,11 @@ async fn the_owner_narrows_and_resets_the_grant_over_rest() {
         grant_audit_paths(&g.engine),
         [
             format!(
-                "api.plugin.network_grant.set:{PLUGIN_ID}:{}",
+                "api.plugin.network_grant.set/{PLUGIN_ID}/{}",
                 g.detail(&REQUESTED, &CAMERA)
             ),
             format!(
-                "api.plugin.network_grant.reset:{PLUGIN_ID}:{}",
+                "api.plugin.network_grant.reset/{PLUGIN_ID}/{}",
                 g.detail(&CAMERA, &REQUESTED)
             ),
         ]
@@ -653,6 +660,19 @@ async fn the_owner_narrows_and_resets_the_grant_over_rest() {
     } = g;
     drop(router);
     drop(engine);
+    // Only `network` changed in the stored grant.
+    let grant: String =
+        rusqlite::Connection::open(state.path().join(oxidhome_core::state::db::DB_FILE_NAME))
+            .unwrap()
+            .query_row(
+                "SELECT granted_capabilities_json FROM plugin_installation WHERE plugin_id = ?1",
+                [PLUGIN_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+    let grant: Value = serde_json::from_str(&grant).unwrap();
+    assert_eq!(grant["storage_quota_kb"], 4, "{grant}");
+    assert_eq!(grant["network"], json!(API), "{grant}");
     let engine = Engine::with_state_dir(state.path()).expect("reopen engine");
     assert_eq!(
         serde_json::to_value(
@@ -732,11 +752,11 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
         grant_audit_paths(&g.engine),
         [
             format!(
-                "connect.plugin.network_grant.set:{PLUGIN_ID}:{}",
+                "connect.plugin.network_grant.set/{PLUGIN_ID}/{}",
                 g.detail(&REQUESTED, &API)
             ),
             format!(
-                "connect.plugin.network_grant.reset:{PLUGIN_ID}:{}",
+                "connect.plugin.network_grant.reset/{PLUGIN_ID}/{}",
                 g.detail(&API, &REQUESTED)
             ),
         ]
@@ -823,11 +843,11 @@ async fn the_owner_narrows_and_resets_the_grant_over_mcp() {
         grant_audit_paths(&g.engine),
         [
             format!(
-                "mcp.plugin.network_grant.set:{PLUGIN_ID}:{}",
+                "mcp.plugin.network_grant.set/{PLUGIN_ID}/{}",
                 g.detail(&REQUESTED, &[])
             ),
             format!(
-                "mcp.plugin.network_grant.reset:{PLUGIN_ID}:{}",
+                "mcp.plugin.network_grant.reset/{PLUGIN_ID}/{}",
                 g.detail(&[], &REQUESTED)
             ),
         ]
@@ -962,7 +982,8 @@ default = ""
         .find(|h| h.instance_id() == "probe")
         .expect("restarted instance registered");
     assert!(!handle.state().is_terminal(), "{:?}", handle.state());
-    // The same grant again changes nothing instances get: no restart.
+    // The same grant again, or the same rules in another order,
+    // changes nothing instances get: no restart.
     let (status, body) =
         api_status(&router, &owner, "PUT", &uri, json!({"rules": [elsewhere]})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -973,6 +994,16 @@ default = ""
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["restarted"], json!(["probe"]), "{body}");
     wait_until("the connect after the reset", || server.accepted() == 2).await;
+    let (status, body) = api_status(
+        &router,
+        &owner,
+        "PUT",
+        &uri,
+        json!({"rules": [elsewhere, allowed]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restarted"], json!([]), "reordered: {body}");
 
     let _ = oxidhome_core::runtime::stop_and_wait_reaped(
         engine.instances().list(),
@@ -1072,7 +1103,7 @@ fn the_cli_sets_and_resets_the_grant_offline() {
         network(&["https://api.example.com"])
     );
     let paths = grant_audit_paths(&engine);
-    let verbs: Vec<&str> = paths.iter().map(|p| p.split(':').next().unwrap()).collect();
+    let verbs: Vec<&str> = paths.iter().map(|p| p.split('/').next().unwrap()).collect();
     assert_eq!(
         verbs,
         [

@@ -97,7 +97,9 @@ pub fn reset_tls_pins(
 // ── Plugin network grants (Phase 8.5) ───────────────────────────────
 
 /// Audit `path` of a network grant change:
-/// `<surface>.plugin.network_grant.<set|reset>:<plugin_id>:<detail>`,
+/// `<surface>.plugin.network_grant.<set|reset>/<plugin_id>/<detail>`,
+/// `/`-separated so the audit scrubber never reads the plugin id as a
+/// `key: value` key (`com.example.secret:{…}` would mask the detail),
 /// the detail being [`NetworkGrantChange::audit_detail`] (installation,
 /// old and new granted rules).
 pub const AUDIT_PATH_NETWORK_GRANT: &str = "plugin.network_grant";
@@ -122,7 +124,7 @@ impl GrantActor {
     pub fn of(surface: &'static str, ctx: &crate::auth::InvocationContext) -> Self {
         Self {
             surface,
-            actor_kind: "api",
+            actor_kind: ctx.root().kind().as_str(),
             token_id: ctx.root().audit_token_id().to_owned(),
             call_id: Some(ctx.call_id().to_owned()),
         }
@@ -172,7 +174,7 @@ pub fn parse_grant_rules(rules: &[String]) -> Result<Vec<NetworkRule>, String> {
 fn audit_path(by: &GrantActor, plugin_id: &str, reset: bool, detail: &str) -> String {
     let verb = if reset { "reset" } else { "set" };
     format!(
-        "{}.{AUDIT_PATH_NETWORK_GRANT}.{verb}:{plugin_id}:{detail}",
+        "{}.{AUDIT_PATH_NETWORK_GRANT}.{verb}/{plugin_id}/{detail}",
         by.surface
     )
 }
@@ -230,11 +232,15 @@ pub async fn change_network_grant(
                 &path,
                 by.call_id.as_deref(),
                 || {
-                    registry.set_network_grant(&id, Some(&new)).map_err(|e| {
-                        let msg = e.to_string();
-                        refused = Some(e);
-                        anyhow::anyhow!(msg)
-                    })
+                    // The same inputs as the check above, so the row,
+                    // the store and the answer agree.
+                    registry
+                        .set_network_grant(&id, rules.as_deref())
+                        .map_err(|e| {
+                            let msg = e.to_string();
+                            refused = Some(e);
+                            anyhow::anyhow!(msg)
+                        })
                 },
             );
             match (out, refused) {
@@ -254,7 +260,10 @@ pub async fn change_network_grant(
         );
         // Only a change to what instances get needs a restart.
         let before = NetworkGrants::new(&row.requested_network, &row.granted_capabilities.network);
-        let (restarted, not_restarted) = if before.effective == change.network.effective {
+        let same = |a: &[NetworkRule], b: &[NetworkRule]| {
+            a.iter().all(|r| b.contains(r)) && b.iter().all(|r| a.contains(r))
+        };
+        let (restarted, not_restarted) = if same(&before.effective, &change.network.effective) {
             (Vec::new(), Vec::new())
         } else {
             restart_instances(&engine, &plugin_id, &row).await
@@ -272,9 +281,28 @@ pub async fn change_network_grant(
     })?
 }
 
+/// What a grant change found an instance doing before it stopped it.
+enum Before {
+    /// Running (or loading): restart it with these config overrides.
+    Running(Option<toml::Value>),
+    /// Already asked to stop (an operator's stop in flight): leave it.
+    Stopping,
+    /// Already ended; waited for only so its sandboxes are gone.
+    Ended,
+}
+
+/// How long a grant change waits for its restarted instances to run.
+pub const RESTART_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Stop the running top-level instances of `row`'s installation (their
 /// script sandboxes stop with them) and start each again with the
-/// config it had. Called under the plugin's lifecycle lock.
+/// config it had, waiting (at most [`RESTART_WAIT_LIMIT`], all
+/// together) until they run. Called under the plugin's lifecycle lock.
+///
+/// An instance already asked to stop (an operator's stop in flight) is
+/// left stopped. A parent that already ended is waited for too, so its
+/// sandboxes, which its reaper stops, are gone before this returns, but
+/// isn't started again.
 async fn restart_instances(
     engine: &crate::Engine,
     plugin_id: &str,
@@ -287,27 +315,45 @@ async fn restart_instances(
         .filter(|h| {
             h.plugin_id() == plugin_id
                 && h.parent_instance_id().is_none()
-                && !h.state().is_terminal()
                 && h.installation_uuid()
                     .is_none_or(|uuid| *uuid == *row.installation_uuid)
         })
         .collect();
-    let overrides: std::collections::HashMap<String, Option<toml::Value>> = handles
+    // Decided before this asks them to stop.
+    let mut plan: std::collections::HashMap<String, Before> = handles
         .iter()
-        .map(|h| (h.instance_id().to_owned(), h.start_overrides()))
+        .map(|h| {
+            let before = if h.state().is_terminal() {
+                Before::Ended
+            } else if h.stop_requested() {
+                Before::Stopping
+            } else {
+                Before::Running(h.start_overrides())
+            };
+            (h.instance_id().to_owned(), before)
+        })
         .collect();
     let report = crate::runtime::stop_and_wait_reaped(handles, crate::STOP_WAIT_LIMIT).await;
     let mut not_restarted: Vec<NotRestarted> = report
         .still_stopping
         .into_iter()
         .map(|instance_id| NotRestarted {
+            reason: match plan.remove(&instance_id) {
+                Some(Before::Running(_)) => "still stopping; start it again once stopped",
+                Some(Before::Stopping) => "was already stopping, and still is",
+                Some(Before::Ended) | None => "had ended; its sandboxes are still stopping",
+            }
+            .to_owned(),
             instance_id,
-            reason: "still stopping; start it again once stopped".to_owned(),
         })
         .collect();
-    let mut restarted = Vec::new();
+    // Start them all, then wait for them together under one deadline,
+    // so one slow `init` doesn't hold the others down.
+    let mut starting = Vec::new();
     for instance_id in report.stopped {
-        let config = overrides.get(&instance_id).cloned().flatten();
+        let Some(Before::Running(config)) = plan.remove(&instance_id) else {
+            continue;
+        };
         match engine
             .start_installed_instance(
                 row.path.clone(),
@@ -317,18 +363,62 @@ async fn restart_instances(
             )
             .await
         {
-            Ok(_) => restarted.push(instance_id),
-            Err(err) => {
+            Ok(handle) => starting.push(handle),
+            Err(err) => not_restarted.push(NotRestarted {
+                instance_id,
+                reason: format!("restart failed: {err:#}"),
+            }),
+        }
+    }
+    let (mut restarted, failed) = wait_running(starting).await;
+    not_restarted.extend(failed);
+    restarted.sort();
+    not_restarted.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    (restarted, not_restarted)
+}
+
+/// Wait for `starting` to run, together, until [`RESTART_WAIT_LIMIT`]:
+/// the ones that did, and the ones that failed or are still starting.
+async fn wait_running(
+    starting: Vec<crate::runtime::InstanceHandle>,
+) -> (Vec<String>, Vec<NotRestarted>) {
+    let mut not_restarted = Vec::new();
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT_LIMIT;
+    let mut waits = tokio::task::JoinSet::new();
+    for handle in starting {
+        waits.spawn(async move {
+            let id = handle.instance_id().to_owned();
+            match tokio::time::timeout_at(deadline, handle.wait_for_running()).await {
+                Ok(Ok(())) => (id, Ok(())),
+                Ok(Err(err)) => (id, Err(format!("restart failed: {err:#}"))),
+                Err(_) => (
+                    id,
+                    Err(format!(
+                        "not running {} s after the restart; still starting",
+                        RESTART_WAIT_LIMIT.as_secs()
+                    )),
+                ),
+            }
+        });
+    }
+    let mut restarted = Vec::new();
+    while let Some(joined) = waits.join_next().await {
+        match joined {
+            Ok((instance_id, Ok(()))) => restarted.push(instance_id),
+            Ok((instance_id, Err(reason))) => {
                 tracing::error!(
                     target: "host.network",
                     instance_id = %instance_id,
-                    error = %format!("{err:#}"),
-                    "restart after a network grant change failed",
+                    reason = %reason,
+                    "restart after a network grant change didn't reach running",
                 );
                 not_restarted.push(NotRestarted {
                     instance_id,
-                    reason: format!("restart failed: {err:#}"),
+                    reason,
                 });
+            }
+            Err(err) => {
+                tracing::error!(target: "host.network", error = %err, "restart wait task failed");
             }
         }
     }
@@ -364,4 +454,31 @@ pub fn set_network_grant_offline(
     let path = audit_path(&by, plugin_id, rules.is_none(), &plan.change.audit_detail());
     audited(audit, "cli", "-", &path, || Ok(plan.commit(db)?))?;
     Ok(plan.change)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The audit scrubber masks `key: value` pairs under sensitive-looking
+    /// keys; a plugin id that looks like one must not hide the grant.
+    #[test]
+    fn a_sensitive_looking_plugin_id_keeps_the_audit_detail() {
+        let by = GrantActor {
+            surface: "api",
+            actor_kind: "api",
+            token_id: "t".to_owned(),
+            call_id: None,
+        };
+        let detail = serde_json::json!({
+            "installation": "inst-0123",
+            "old": ["tcp://192.168.0.0/16:554", "https://api.example.com"],
+            "new": ["tcp://192.168.1.20:554"],
+        })
+        .to_string();
+        for id in ["com.example.secret", "acme.api_token", "x.password"] {
+            let path = audit_path(&by, id, false, &detail);
+            assert_eq!(crate::redact::scrub_text(&path), path, "{id}");
+        }
+    }
 }

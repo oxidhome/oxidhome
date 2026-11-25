@@ -2290,12 +2290,24 @@ fn persist_network_grant(
 ) -> Result<(), NetworkGrantError> {
     let json = serde_json::to_string(granted)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    let updated = db.write(|conn| {
-        conn.execute(
+    // `synchronous = FULL`: an acknowledged narrowing must survive power
+    // loss, or the next start would load the wider grant again (like
+    // the TLS pin and device-category writes).
+    let updated = db.write(|conn| -> Result<usize, rusqlite::Error> {
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = conn.execute(
             "UPDATE plugin_installation SET granted_capabilities_json = ?1
              WHERE installation_uuid = ?2 AND uninstalled_ms IS NULL",
             (json, installation_uuid),
-        )
+        );
+        if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!(
+                target: "host.network",
+                error = %err,
+                "failed to restore synchronous = NORMAL; connection stays at FULL",
+            );
+        }
+        result
     })?;
     if updated == 1 {
         Ok(())
@@ -3194,6 +3206,32 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grant_narrows_the_request_and_never_widens_it() {
+        let rule = |r: &str| r.parse::<NetworkRule>().unwrap();
+        let requested = [
+            rule("tcp://192.168.0.0/16:554"),
+            rule("tcp://192.168.0.0/16:554"),
+        ];
+        // Reset keeps the request as it is.
+        assert_eq!(narrowed_network_grant(&requested, None).unwrap(), requested);
+        let camera = rule("tcp://192.168.1.20:554");
+        assert_eq!(
+            narrowed_network_grant(&requested, Some(&[camera.clone(), camera.clone()])).unwrap(),
+            std::slice::from_ref(&camera),
+            "duplicates dropped"
+        );
+        assert!(matches!(
+            narrowed_network_grant(&requested, Some(&[rule("udp://192.168.1.20:554")])),
+            Err(NetworkGrantError::Widens(_))
+        ));
+        let max = oxidhome_manifest::validate::MAX_NETWORK_RULES;
+        assert!(matches!(
+            narrowed_network_grant(&requested, Some(&vec![camera; max + 1])),
+            Err(NetworkGrantError::TooMany { got, .. }) if got == max + 1
+        ));
+    }
 
     fn fresh_db() -> Arc<Db> {
         Arc::new(Db::open_in_memory().expect("in-memory db"))

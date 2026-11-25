@@ -2690,11 +2690,15 @@ fn plugins_reset_network_grant_schema() -> serde_json::Map<String, JsonValue> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NetworkGrantArgs {
+struct SetNetworkGrantArgs {
     plugin_id: String,
-    /// Absent on reset; required (by the schema and below) on set.
-    #[serde(default)]
-    rules: Option<Vec<String>>,
+    rules: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResetNetworkGrantArgs {
+    plugin_id: String,
 }
 
 /// `plugins.set_network_grant` (`reset = false`) and
@@ -2713,52 +2717,47 @@ async fn network_grant_call(
         "plugins.set_network_grant"
     };
     let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
-    let args: NetworkGrantArgs = match serde_json::from_value(args_value) {
-        Ok(a) => a,
-        Err(err) => {
-            return ToolOutcome::InvalidParams(format!(
-                "{tool} arguments do not match the input schema: {err}",
-            ));
+    let schema_err =
+        |err: serde_json::Error| format!("{tool} arguments do not match the input schema: {err}");
+    let (plugin_id, rules) = if reset {
+        match serde_json::from_value::<ResetNetworkGrantArgs>(args_value) {
+            Ok(a) => (a.plugin_id, None),
+            Err(err) => return ToolOutcome::InvalidParams(schema_err(err)),
+        }
+    } else {
+        match serde_json::from_value::<SetNetworkGrantArgs>(args_value) {
+            Ok(a) => match crate::api::network_admin::parse_grant_rules(&a.rules) {
+                Ok(rules) => (a.plugin_id, Some(rules)),
+                Err(reason) => return ToolOutcome::InvalidParams(reason),
+            },
+            Err(err) => return ToolOutcome::InvalidParams(schema_err(err)),
         }
     };
-    if args.plugin_id.is_empty() {
+    if plugin_id.is_empty() {
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
     }
-    let rules = match (reset, args.rules) {
-        (true, None) => None,
-        (true, Some(_)) => {
-            return ToolOutcome::InvalidParams(format!("{tool} takes no `rules`"));
-        }
-        (false, None) => {
-            return ToolOutcome::InvalidParams(format!("{tool} requires a `rules` argument"));
-        }
-        (false, Some(rules)) => match crate::api::network_admin::parse_grant_rules(&rules) {
-            Ok(rules) => Some(rules),
-            Err(reason) => return ToolOutcome::InvalidParams(reason),
-        },
-    };
     if let Err(denied) = authorize_target(
         invocation,
         Action::PolicyManage,
-        &Resource::plugin(args.plugin_id.as_str()),
+        &Resource::plugin(plugin_id.as_str()),
     ) {
         return denied;
     }
-    let plugin_id = args.plugin_id.clone();
     match crate::api::network_admin::change_network_grant(
         engine,
         crate::api::network_admin::GrantActor::of("mcp", invocation),
-        args.plugin_id,
+        plugin_id.clone(),
         rules,
     )
     .await
     {
-        Ok(view) => match serde_json::to_value(&view) {
-            Ok(value) => ToolOutcome::Ok {
+        Ok(view) => match super::resources::encode_body_capped(&view, tool, MAX_TOOL_BODY_BYTES) {
+            EncodedBody::Value(value) => ToolOutcome::Ok {
                 value,
                 plugin_reached: false,
             },
-            Err(err) => ToolOutcome::Internal(format!("encoding the grant failed: {err}")),
+            EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+            EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
         },
         Err(e @ E::NotInstalled(_)) => ToolOutcome::ExecErr {
             message: e.to_string(),
