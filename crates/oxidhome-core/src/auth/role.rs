@@ -655,13 +655,14 @@ fn describe(
         s.push(']');
     }
     if let Some(svc) = services {
-        // A local id may hold spaces or braces: quote such a pattern so
-        // `{a.b/x *}` (one pattern) reads apart from `{a.b/x *}` (two).
+        // Comma-separated, as `token create --deny` reads them back. A
+        // local id may hold commas, spaces or braces: quote such a
+        // pattern so it can't read as several.
         let shown: Vec<String> = svc
             .iter()
             .map(|p| {
                 if p.chars()
-                    .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '"'))
+                    .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"'))
                 {
                     format!("{p:?}")
                 } else {
@@ -670,7 +671,7 @@ fn describe(
             })
             .collect();
         s.push('{');
-        s.push_str(&shown.join(" "));
+        s.push_str(&shown.join(","));
         s.push('}');
     }
     s

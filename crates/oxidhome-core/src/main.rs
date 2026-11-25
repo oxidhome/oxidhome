@@ -1524,6 +1524,24 @@ mod tests {
             (req.deny[2].category.as_ref(), req.deny[2].services.as_ref()),
             (None, None)
         );
+        // A listed deny reads back as itself.
+        let listed = oxidhome_core::auth::DenyRule {
+            actions: oxidhome_core::auth::ActionSet::of(&[
+                oxidhome_core::auth::Action::ServiceCall,
+            ]),
+            categories: None,
+            devices: None,
+            services: Some(vec!["acme.notify/send".into(), "acme.alarm".into()]),
+        }
+        .describe();
+        let args: Vec<String> = ["kiosk", "--deny", listed.as_str()]
+            .map(str::to_owned)
+            .to_vec();
+        let req = parse_token_create(&args).expect("parse");
+        assert_eq!(
+            req.deny[0].services,
+            Some(vec!["acme.notify/send".to_owned(), "acme.alarm".to_owned()])
+        );
     }
 
     #[test]
