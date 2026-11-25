@@ -74,6 +74,10 @@ impl DiscoverySocket {
 #[wasmtime_wasi::async_trait]
 impl wasmtime_wasi::p2::Pollable for DiscoverySocket {
     async fn ready(&mut self) {
+        // An error already taken stays ready until `receive` reports it.
+        if self.pending_error.is_some() {
+            return;
+        }
         let mut discarded = 0usize;
         loop {
             if self.readiness.readable().await.is_err() {
@@ -414,13 +418,17 @@ impl host_network::HostDiscoverySocket for PluginState {
             Err(denial) => return Err(self.refuse("send", &addr.to_string(), &denial)),
         };
         let socket = &self.discovery_socket(&this)?.socket;
-        if broadcast {
-            socket.set_broadcast(true).map_err(|e| error_code(&e))?;
+        if !ipv6 {
+            // Set for every send, so a reset that failed after an
+            // earlier broadcast never leaves it on for this one.
+            socket
+                .set_broadcast(broadcast)
+                .map_err(|e| error_code(&e))?;
         }
         let sent = socket.send_to(&data, addr);
         if broadcast {
-            // Off again, or the socket stays unusable for this check.
-            socket.set_broadcast(false).map_err(|e| error_code(&e))?;
+            // Off again; the next send sets it anyway.
+            let _ = socket.set_broadcast(false);
         }
         match sent {
             Ok(_) => Ok(()),
@@ -461,7 +469,11 @@ impl host_network::HostDiscoverySocket for PluginState {
                 Ok(_) => discarded += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if out.is_empty() => return Err(error_code(&e)),
-                Err(_) => break,
+                // Reported by the next call.
+                Err(e) => {
+                    socket.pending_error = Some(e);
+                    break;
+                }
             }
         }
         Ok(out)

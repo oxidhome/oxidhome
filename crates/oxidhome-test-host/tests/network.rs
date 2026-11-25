@@ -767,8 +767,10 @@ async fn local_networks_are_listed_when_the_grant_covers_them_whole() {
         &ops,
     )
     .await;
-    // A rule narrower than the network lists nothing.
-    assert_eq!(narrowed, vec!["ok:".to_owned()]);
+    // A rule narrower than the network doesn't list it (a loopback
+    // alias inside the rule may be listed).
+    assert!(narrowed[0].starts_with("ok:"), "{narrowed:?}");
+    assert!(!narrowed[0].contains("127.0.0.0/8"), "{narrowed:?}");
     let none = probe(&host, "nets-none", &[], &ops).await;
     assert_eq!(none, vec!["ok:".to_owned()]);
 }

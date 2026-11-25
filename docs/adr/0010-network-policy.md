@@ -62,12 +62,12 @@ broadcast or multicast address. On a discovery socket:
   rule naming the address. Joining a group needs a `udp` rule naming it. Multicast is sent with a TTL (hop limit) of 1,
   and on Linux a socket hears only the groups it joined itself (`IP_MULTICAST_ALL` off).
 - A subnet-directed broadcast (the last address of one of the host's IPv4 networks, `192.168.1.255` on
-  `192.168.1.0/24`) reaches every host of that network, so it needs a `udp` (or `any`) IP rule covering the whole
+  `192.168.1.0/24`, or its first, which BSD kernels also treat as one) reaches every host of that network, so it needs a `udp` (or `any`) IP rule covering the whole
   network, and every interface network it is the broadcast address of; a rule for part of the network, or a literal
   naming the address (which a partial range covers in grant narrowing), doesn't do. When the host can't list its
   networks, every IPv4 destination but a named group is refused. `SO_BROADCAST` is set only for the duration of a send
-  the policy approved as a broadcast, so a destination the kernel treats as one and the policy didn't (a network's
-  first address on BSD, an interface that changed in between) fails, and is audited, instead of reaching the link. The
+  the policy approved as a broadcast, so a destination the kernel treats as one and the policy didn't (an interface
+  that changed in between) fails, and is audited, instead of reaching the link. The
   interfaces are listed for each send, with the broadcast address each is configured with counting as its network's
   (and needing a rule for itself); a non-contiguous netmask counts as a listing failure. An interface reconfigured
   between the check and the send itself is a race the host doesn't close.

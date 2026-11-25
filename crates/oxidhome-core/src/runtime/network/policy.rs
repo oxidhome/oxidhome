@@ -347,6 +347,13 @@ fn directed_broadcast(net: &IpNet) -> Option<IpAddr> {
     }
 }
 
+/// An IPv4 network's first address, which BSD kernels (macOS) also
+/// treat as a broadcast address; none where [`directed_broadcast`] has
+/// none.
+fn old_style_broadcast(net: &IpNet) -> Option<IpAddr> {
+    directed_broadcast(net).map(|_| net.network())
+}
+
 /// A CIDR inside the IPv4-mapped IPv6 range (`::ffff:0:0/96`) as the
 /// IPv4 range it maps, since addresses are matched in canonical form.
 fn canonical_net(net: IpNet) -> IpNet {
@@ -767,6 +774,7 @@ impl NetworkPolicy {
             .iter()
             .filter(|iface| {
                 directed_broadcast(&iface.net) == Some(ip)
+                    || old_style_broadcast(&iface.net) == Some(ip)
                     || iface.broadcast.map(|b| b.to_canonical()) == Some(ip)
             })
             .map(|iface| &iface.net)
@@ -1727,6 +1735,16 @@ mod tests {
         assert!(
             half.check_discovery_send(sa("192.168.1.255:9999"), Some(&overlapping))
                 .is_err()
+        );
+        // The first address counts too (BSD treats it as a broadcast).
+        assert!(
+            half.check_discovery_send(sa("192.168.1.0:9999"), Some(&local))
+                .is_err()
+        );
+        assert_eq!(
+            policy(&["udp://192.168.1.0/24:9999"])
+                .check_discovery_send(sa("192.168.1.0:9999"), Some(&local)),
+            Ok(true)
         );
         // A /31 has no broadcast address.
         let p2p = policy(&["udp://10.0.0.3:9999"]);
