@@ -357,9 +357,18 @@ pub struct OfflineStores {
     pub devices: crate::state::DeviceMetaStore,
     /// The `network_tls_pin` table (Phase 8.2).
     pub tls_pins: crate::state::TlsPinStore,
+    /// The database itself, for tables without a store. Private, so
+    /// no handle outlives the state-dir lock: see [`Self::db`].
+    db: std::sync::Arc<crate::state::Db>,
+}
+
+impl OfflineStores {
     /// The database itself, for tables without a store
-    /// (`plugin_installation`).
-    pub db: std::sync::Arc<crate::state::Db>,
+    /// (`plugin_installation`), borrowed for the callback.
+    #[must_use]
+    pub fn db(&self) -> &crate::state::Db {
+        &self.db
+    }
 }
 
 /// Run `op` against the stores of the database under `state_dir`,

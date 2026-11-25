@@ -1085,7 +1085,7 @@ fn run_plugin() -> anyhow::Result<()> {
                 oxidhome_core::api::network_admin::set_network_grant_offline(
                     &plugins_root,
                     &stores.audit,
-                    &stores.db,
+                    stores.db(),
                     &plugin_id,
                     rules.as_deref(),
                 )

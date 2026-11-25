@@ -281,13 +281,18 @@ pub async fn change_network_grant(
     })?
 }
 
-/// Whether two effective rule lists grant the same, ignoring order and
-/// case (the policy compares names case-insensitively).
+/// Whether two effective rule lists grant the same, ignoring order,
+/// duplicates, case and a name's root dot (the policy compares names
+/// that way).
 fn same_rules(a: &[NetworkRule], b: &[NetworkRule]) -> bool {
     let canonical = |rules: &[NetworkRule]| {
         let mut out: Vec<String> = rules
             .iter()
-            .map(|r| r.to_string().to_ascii_lowercase())
+            .map(|r| {
+                // The policy drops a name's root dot too.
+                let r = r.to_string().to_ascii_lowercase().replace(".:", ":");
+                r.strip_suffix('.').map_or_else(|| r.clone(), str::to_owned)
+            })
             .collect();
         out.sort();
         out.dedup();
@@ -299,7 +304,7 @@ fn same_rules(a: &[NetworkRule], b: &[NetworkRule]) -> bool {
 /// Top-level instances of `plugin_id` asked to stop that haven't been
 /// reaped yet.
 fn still_stopping(engine: &crate::Engine, plugin_id: &str) -> Vec<NotRestarted> {
-    engine
+    let mut out: Vec<NotRestarted> = engine
         .instances()
         .list()
         .into_iter()
@@ -310,7 +315,9 @@ fn still_stopping(engine: &crate::Engine, plugin_id: &str) -> Vec<NotRestarted> 
             instance_id: h.instance_id().to_owned(),
             reason: "still stopping; start it again once stopped".to_owned(),
         })
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    out
 }
 
 /// What a grant change found an instance doing before it stopped it.
@@ -379,69 +386,60 @@ async fn restart_instances(
             instance_id,
         })
         .collect();
-    // Start them all, then wait for them together, under one deadline
-    // that covers the starts too, so one slow instance doesn't hold the
+    // Start and wait for them all at once, under one deadline that
+    // covers the starts too, so one slow instance doesn't hold the
     // others down.
     let deadline = tokio::time::Instant::now() + RESTART_WAIT_LIMIT;
     let mut starting = Vec::new();
     for instance_id in report.stopped {
-        let Some(Before::Running(config)) = plan.remove(&instance_id) else {
-            continue;
-        };
-        let start = engine.start_installed_instance(
-            row.path.clone(),
-            instance_id.clone(),
-            config,
-            std::sync::Arc::clone(&row.installation_uuid),
-        );
-        match tokio::time::timeout_at(deadline, start).await {
-            Ok(Ok(handle)) => starting.push(handle),
-            Ok(Err(err)) => not_restarted.push(NotRestarted {
-                instance_id,
-                reason: format!("restart failed: {err:#}"),
-            }),
-            Err(_) => not_restarted.push(NotRestarted {
-                instance_id,
-                reason: format!(
-                    "not started {} s after the stop; start it again",
-                    RESTART_WAIT_LIMIT.as_secs()
-                ),
-            }),
+        if let Some(Before::Running(config)) = plan.remove(&instance_id) {
+            starting.push((instance_id, config));
         }
     }
-    let (mut restarted, failed) = wait_running(starting, deadline).await;
+    let (mut restarted, failed) = start_and_wait(engine, row, starting, deadline).await;
     not_restarted.extend(failed);
     restarted.sort();
     not_restarted.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
     (restarted, not_restarted)
 }
 
-/// Wait for `starting` to run, together, until `deadline`:
-/// the ones that did, and the ones that failed or are still starting.
-async fn wait_running(
-    starting: Vec<crate::runtime::InstanceHandle>,
+/// Start each of `starting` (instance id, config) as `row`'s
+/// installation and wait until it runs, all at once, until `deadline`:
+/// the ones that run, and the ones that failed or are still starting.
+async fn start_and_wait(
+    engine: &crate::Engine,
+    row: &crate::state::InstalledPlugin,
+    starting: Vec<(String, Option<toml::Value>)>,
     deadline: tokio::time::Instant,
 ) -> (Vec<String>, Vec<NotRestarted>) {
-    let mut not_restarted = Vec::new();
-    let mut waits = tokio::task::JoinSet::new();
-    for handle in starting {
-        waits.spawn(async move {
-            let id = handle.instance_id().to_owned();
-            match tokio::time::timeout_at(deadline, handle.wait_for_running()).await {
-                Ok(Ok(())) => (id, Ok(())),
-                Ok(Err(err)) => (id, Err(format!("restart failed: {err:#}"))),
-                Err(_) => (
-                    id,
-                    Err(format!(
-                        "not running {} s after the restart; still starting",
-                        RESTART_WAIT_LIMIT.as_secs()
-                    )),
-                ),
-            }
+    let mut tasks = tokio::task::JoinSet::new();
+    for (instance_id, config) in starting {
+        let engine = engine.clone();
+        let (path, uuid) = (
+            row.path.clone(),
+            std::sync::Arc::clone(&row.installation_uuid),
+        );
+        tasks.spawn(async move {
+            let run = async {
+                let handle = engine
+                    .start_installed_instance(path, instance_id.clone(), config, uuid)
+                    .await?;
+                handle.wait_for_running().await
+            };
+            let outcome = match tokio::time::timeout_at(deadline, run).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(err)) => Err(format!("restart failed: {err:#}")),
+                Err(_) => Err(format!(
+                    "not running {} s after the stop; still starting, or start it again",
+                    RESTART_WAIT_LIMIT.as_secs()
+                )),
+            };
+            (instance_id, outcome)
         });
     }
     let mut restarted = Vec::new();
-    while let Some(joined) = waits.join_next().await {
+    let mut not_restarted = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((instance_id, Ok(()))) => restarted.push(instance_id),
             Ok((instance_id, Err(reason))) => {
@@ -457,7 +455,7 @@ async fn wait_running(
                 });
             }
             Err(err) => {
-                tracing::error!(target: "host.network", error = %err, "restart wait task failed");
+                tracing::error!(target: "host.network", error = %err, "restart task failed");
             }
         }
     }
@@ -541,5 +539,32 @@ mod tests {
                 "new": ["tcp://secrets.lan:1883"],
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod same_rules_tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_rules_are_the_same() {
+        let rules =
+            |rs: &[&str]| -> Vec<NetworkRule> { rs.iter().map(|r| r.parse().unwrap()).collect() };
+        assert!(same_rules(
+            &rules(&["https://API.example.com", "tcp://10.0.0.1:554"]),
+            &rules(&[
+                "tcp://10.0.0.1:554",
+                "https://api.example.com.",
+                "https://api.example.com"
+            ]),
+        ));
+        assert!(same_rules(
+            &rules(&["tcp://mqtt.lan.:1883"]),
+            &rules(&["tcp://mqtt.lan:1883"])
+        ));
+        assert!(!same_rules(
+            &rules(&["tcp://10.0.0.1:554"]),
+            &rules(&["tcp://10.0.0.1:555"])
+        ));
     }
 }
