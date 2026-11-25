@@ -1427,9 +1427,6 @@ impl InstalledPluginRegistry {
                 // the operator: the row shows up as
                 // quarantined instead of appearing healthy and
                 // then failing on the first start attempt.
-                // Same fix covers pre-v3 (v2-tagged) digests
-                // whose UI bytes never contributed to the
-                // hash — they mismatch as soon as v3 lands.
                 // Round-13 F1: hash the validated UI
                 // snapshot from above (not a fresh re-read)
                 // so a schema flip between validation and
@@ -3322,8 +3319,8 @@ wasm = "plugin.wasm"
     /// direct-start / argv loader path refuses to shadow the
     /// quarantine with dev-load semantics.
     #[test]
-    fn scan_quarantines_pre_c5_row_with_null_grant() {
-        let root = tempdir("pre-c5-null-grant");
+    fn scan_quarantines_row_with_null_grant() {
+        let root = tempdir("null-grant");
         let plugins_root = root.join("plugins");
         let db = fresh_db();
 

@@ -38,9 +38,7 @@ use crate::network::NetworkRule;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
-    /// Version of the *manifest format itself*. Only `1` exists today;
-    /// see the format-evolution note in the per-crate plan for the
-    /// migration policy.
+    /// Version of the *manifest format itself*. Only `1` exists.
     pub manifest_version: u32,
     pub plugin: PluginSection,
     pub runtime: RuntimeSection,

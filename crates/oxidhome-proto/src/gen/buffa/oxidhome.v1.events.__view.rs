@@ -10,8 +10,8 @@ pub struct TailEventsRequestView<'a> {
     /// the oldest retained row. Requires the `events:read` scope in
     /// addition to `events:tail`. An accepted cursor is acknowledged by
     /// the `oxidhome-resume-after-id` response header (the resolved
-    /// cursor). Without the header the stream is not resumed: the cursor
-    /// expired (the first message is `CursorExpired`).
+    /// cursor). When `after_id` is set and the header is missing, the
+    /// cursor expired (the first message is `CursorExpired`).
     ///
     /// Field 1: `after_id`
     pub after_id: ::core::option::Option<u64>,
@@ -229,8 +229,8 @@ impl TailEventsRequestOwnedView {
     /// the oldest retained row. Requires the `events:read` scope in
     /// addition to `events:tail`. An accepted cursor is acknowledged by
     /// the `oxidhome-resume-after-id` response header (the resolved
-    /// cursor). Without the header the stream is not resumed: the cursor
-    /// expired (the first message is `CursorExpired`).
+    /// cursor). When `after_id` is set and the header is missing, the
+    /// cursor expired (the first message is `CursorExpired`).
     ///
     /// Field 1: `after_id`
     #[must_use]

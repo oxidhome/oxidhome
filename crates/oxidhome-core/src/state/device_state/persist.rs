@@ -1112,7 +1112,7 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
                     revision: to_u64(revision),
                     evicted_through: to_u64(evicted),
                     holes,
-                    consistent: true,
+                    consistent: false,
                 }
             });
         let mut stmt = conn.prepare(
@@ -1676,6 +1676,78 @@ mod tests {
         }
     }
 
+    /// Replace the persisted hole list with `holes`, resealing the
+    /// consistency marker over the meta row as stored, so only the
+    /// ranges themselves can be wrong.
+    fn reseal_holes(db: &Db, holes: &[(u64, u64)]) {
+        let (epoch, revision, evicted, writer, rows): (String, i64, i64, String, i64) = db
+            .read(|c| {
+                c.query_row(
+                    "SELECT epoch, revision, evicted_through, writer, \
+                     (SELECT COUNT(*) FROM device_state) FROM device_state_meta",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+            })
+            .expect("meta");
+        let sealed = encode_ranges(
+            &epoch,
+            to_u64(revision),
+            to_u64(evicted),
+            holes,
+            &writer,
+            to_u64(rows),
+        )
+        .expect("encode");
+        db.write(|c| c.execute("UPDATE device_state_meta SET holes_json = ?1", [sealed]))
+            .expect("reseal holes");
+    }
+
+    /// A meta row whose hole list carries no consistency marker (a
+    /// bare list) is damage: a new history, every earlier cursor
+    /// reset.
+    #[test]
+    fn a_meta_row_without_a_marker_is_damage() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        let epoch = store.epoch();
+        let cursor = store.current_revision();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        db.write(|c| {
+            c.execute(
+                "UPDATE device_state_meta SET holes_json = json_extract(holes_json, '$.holes')",
+                [],
+            )
+        })
+        .expect("strip the marker");
+        drop(db);
+        let store = open(&dir);
+        assert_ne!(store.epoch(), epoch);
+        assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
+        assert!(store.snapshot_capability("dev-a", "switch").is_some());
+        assert!(store.close_persistence());
+    }
+
+    /// A sealed hole whose width isn't the per-boot gap is damage.
+    #[test]
+    fn a_marked_range_of_the_wrong_width_is_damage() {
+        let dir = tempdir();
+        let store = open(&dir);
+        put(&store, "dev-a", true);
+        let epoch = store.epoch();
+        assert!(store.close_persistence());
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        drop(store);
+        reseal_holes(&db, &[(1, 2)]);
+        drop(db);
+        let store = open(&dir);
+        assert_ne!(store.epoch(), epoch);
+        assert!(store.close_persistence());
+    }
+
     /// Follow-up to H2: a failing flush reports the store degraded with
     /// its error, keeps the changes queued, and a later success clears
     /// it.
@@ -1951,28 +2023,7 @@ mod tests {
         // Shift the range up so it ends on the surviving row, and
         // reseal the marker so only the range shape is wrong.
         let shift = row_rev - hi;
-        let shifted = (to_u64(lo + shift), to_u64(hi + shift));
-        let (m_epoch, revision, evicted, writer, rows): (String, i64, i64, String, i64) = db
-            .read(|c| {
-                c.query_row(
-                    "SELECT epoch, revision, evicted_through, writer, \
-                     (SELECT COUNT(*) FROM device_state) FROM device_state_meta",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
-            })
-            .expect("meta");
-        let sealed = encode_ranges(
-            &m_epoch,
-            to_u64(revision),
-            to_u64(evicted),
-            &[shifted],
-            &writer,
-            to_u64(rows),
-        )
-        .expect("encode");
-        db.write(|c| c.execute("UPDATE device_state_meta SET holes_json = ?1", [sealed]))
-            .expect("shift range");
+        reseal_holes(&db, &[(to_u64(lo + shift), to_u64(hi + shift))]);
         drop(db);
         let store = open(&dir);
         assert_ne!(store.epoch(), epoch, "shifted range must be damage");

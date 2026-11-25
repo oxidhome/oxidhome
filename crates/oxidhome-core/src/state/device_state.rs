@@ -1240,7 +1240,7 @@ impl DeviceStateStore {
 
     /// H9 round-14 finding 3: sign an all-devices-snapshot
     /// pagination cursor. Returns
-    /// `"<epoch>.<pinned_revision>.<after_device_id>.<hmac>"`
+    /// `"<epoch>.<boot>.<pinned_revision>.<after_device_id>.<hmac>"`
     /// where `hmac` is a 128-bit prefix of HMAC-SHA256 keyed
     /// on this store's per-process
     /// `StoreInner::cursor_secret`. Because the secret is

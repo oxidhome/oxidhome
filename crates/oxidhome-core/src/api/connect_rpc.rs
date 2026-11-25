@@ -1515,7 +1515,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
             }
         });
         // H4: acknowledge an accepted cursor, so a client can tell a
-        // resumed stream from a server that ignored `after_id`.
+        // resumed stream from an expired cursor.
         let response = Response::stream(response_stream);
         Ok(match resume_after_id {
             Some(id) => response.with_header(super::server::RESUME_AFTER_ID_HEADER, id),

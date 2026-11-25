@@ -192,8 +192,8 @@ impl EventTail {
     /// move as the stream advances. `None` for live-only streams and
     /// expired cursors. The
     /// transports echo it as the `oxidhome-resume-after-id` response
-    /// header, so a client can tell a resumed stream from a server
-    /// that ignored `after_id`.
+    /// header, so a client can tell a resumed stream from an expired
+    /// cursor.
     #[must_use]
     pub fn resume_after_id(&self) -> Option<u64> {
         self.accepted_cursor
