@@ -5,6 +5,7 @@ include!("oxidhome.v1.events.rs");
 include!("oxidhome.v1.health.rs");
 include!("oxidhome.v1.instances.rs");
 include!("oxidhome.v1.logs.rs");
+include!("oxidhome.v1.network.rs");
 include!("oxidhome.v1.plugins.rs");
 include!("oxidhome.v1.tokens.rs");
 #[allow(
@@ -29,6 +30,7 @@ pub mod __buffa {
         include!("oxidhome.v1.health.__view.rs");
         include!("oxidhome.v1.instances.__view.rs");
         include!("oxidhome.v1.logs.__view.rs");
+        include!("oxidhome.v1.network.__view.rs");
         include!("oxidhome.v1.plugins.__view.rs");
         include!("oxidhome.v1.tokens.__view.rs");
         pub mod oneof {
@@ -90,6 +92,11 @@ pub mod __buffa {
         reg.register_json_any(super::__LOG_EVENT_JSON_ANY);
         reg.register_json_any(super::__LOG_FIELD_JSON_ANY);
         reg.register_json_any(super::__LOG_VALUE_JSON_ANY);
+        reg.register_json_any(super::__LIST_TLS_PINS_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__LIST_TLS_PINS_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__RESET_TLS_PINS_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__RESET_TLS_PINS_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__TLS_PIN_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__PLUGIN_JSON_ANY);
@@ -259,6 +266,26 @@ pub use self::__buffa::view::LogFieldOwnedView;
 pub use self::__buffa::view::LogValueView;
 #[doc(inline)]
 pub use self::__buffa::view::LogValueOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTlsPinsRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTlsPinsRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTlsPinsResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTlsPinsResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetTlsPinsRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetTlsPinsRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetTlsPinsResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetTlsPinsResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::TlsPinView;
+#[doc(inline)]
+pub use self::__buffa::view::TlsPinOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::ListPluginsRequestView;
 #[doc(inline)]

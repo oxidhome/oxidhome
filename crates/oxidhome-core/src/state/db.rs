@@ -959,6 +959,21 @@ const MIGRATIONS: &[&str] = &[
         updated_ms  INTEGER NOT NULL
     ) WITHOUT ROWID;
     ",
+    // 24 — Phase 8.2: certificates streaming instances trusted on first
+    // use for LAN devices, keyed by the request's host and port. The
+    // operator resets them (`oxidhome tls-pin reset`, REST, Connect);
+    // uninstalling the plugin whose instance made a pin deletes it.
+    "
+    CREATE TABLE network_tls_pin (
+        instance_id TEXT NOT NULL,
+        host        TEXT NOT NULL,
+        port        INTEGER NOT NULL,
+        sha256      TEXT NOT NULL,
+        pinned_ms   INTEGER NOT NULL,
+        installation_uuid TEXT NOT NULL,
+        PRIMARY KEY (instance_id, host, port, installation_uuid)
+    ) WITHOUT ROWID;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -2061,6 +2076,7 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    DROP TABLE network_tls_pin;
                     DROP TABLE auth_role;
                     DROP TABLE sandbox_removal;
                     DROP TABLE device_meta;
@@ -2154,6 +2170,8 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 24: TLS certificate pins.
+                    DROP TABLE network_tls_pin;
                     -- 23: owner-defined roles.
                     DROP TABLE auth_role;
                     -- 22: sandbox removal markers.

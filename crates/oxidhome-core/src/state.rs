@@ -32,6 +32,7 @@ pub mod kv;
 pub mod log_store;
 pub mod retention;
 pub mod services;
+pub mod tls_pins;
 
 pub use audit_log::{AuditEntry, AuditLog, AuditLogError, AuditQuery, credential_fingerprint};
 pub use auth_role::{RoleError, RoleRecord};
@@ -65,6 +66,10 @@ pub use installed_plugins::{
     InstallError, InstalledPlugin, InstalledPluginRegistry, UninstallError, any_grant_matches,
     content_digest, effective_capabilities, effective_network_rules, network_rule_covers,
     read_installed_bytes, recompute_digest_and_manifest, recompute_installed_digest,
+};
+pub use tls_pins::{
+    Fingerprint, MAX_PINS_PER_INSTANCE, MAX_PINS_TOTAL, PinCheck, PinFilter, PinKey, TlsPin,
+    TlsPinStore,
 };
 // Crate-private wrapper for the gated-install flow; see the
 // type doc for why this stays out of the public re-export.

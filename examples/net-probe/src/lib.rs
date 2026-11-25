@@ -156,6 +156,22 @@ fn run(op: &str) -> Result<String, String> {
         "udp" => udp(arg),
         "dns" => dns(arg),
         "http" => http(arg),
+        "get" => oxidhome_sdk::streaming::http::Request::get(arg)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map(|r| format!("{}:{}", r.status(), String::from_utf8_lossy(r.body())))
+            .map_err(|e| format!("{e:?}")),
+        // `post <bytes> <url>`: upload that many bytes.
+        "post" => {
+            let (len, url) = arg.split_once(' ').ok_or("post <bytes> <url>")?;
+            let len: usize = len.parse().map_err(|_| "bad length")?;
+            oxidhome_sdk::streaming::http::Request::post(url)
+                .body(vec![b'x'; len])
+                .timeout(Duration::from_secs(5))
+                .send()
+                .map(|r| format!("{}:{}", r.status(), String::from_utf8_lossy(r.body())))
+                .map_err(|e| format!("{e:?}"))
+        }
         "hdr" => header(arg),
         "httppoll" => http_get(arg, false)
             .map(|(status, _, body)| format!("{status}:{}", String::from_utf8_lossy(&body))),

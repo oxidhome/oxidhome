@@ -108,6 +108,10 @@ name = "token_roles"
 path = "tests/token_roles.rs"
 
 [[test]]
+name = "network_tls_pins"
+path = "tests/network_tls_pins.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 
@@ -156,6 +160,11 @@ wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
 http.workspace = true
 hyper.workspace = true
+# Phase 8.2: TLS for `https://` requests, verified against the system
+# roots, with trust-on-first-use pins for LAN devices.
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
 # Phase 8: CIDR containment for network rules (`runtime::network`).
 ipnet.workspace = true
 # Decodes each plugin component's embedded WIT types for the load-time
@@ -248,6 +257,8 @@ wit-component = { workspace = true, features = ["dummy-module"] }
 # `axum`'s `ws` feature, pinned to the same version so the lockfile
 # stays single-copy.
 tokio-tungstenite.workspace = true
+# Phase 8.2: certificates for the TLS verifier's unit tests.
+rcgen.workspace = true
 # `http-body-util` is now a regular dep (see above); the 15-e
 # Connect server-streaming test and the 14.1 MCP handshake test
 # both use `BodyExt::frame()` off it.

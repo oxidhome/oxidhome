@@ -344,7 +344,7 @@ fn store(tokens: &TokenStore, token_id: &str, policy: &TokenPolicy) -> anyhow::R
     }
 }
 
-/// The stores the offline `token` / `device` commands touch, opened
+/// The stores the offline `token` / `device` / `tls-pin` commands touch, opened
 /// straight on the database: no engine, so listing tokens or raising
 /// a category doesn't run engine startup (device-state revision bump,
 /// pending-command resolution) while the daemon is stopped.
@@ -355,6 +355,8 @@ pub struct OfflineStores {
     pub audit: crate::state::AuditLog,
     /// The `device_meta` table.
     pub devices: crate::state::DeviceMetaStore,
+    /// The `network_tls_pin` table (Phase 8.2).
+    pub tls_pins: crate::state::TlsPinStore,
 }
 
 /// Run `op` against the stores of the database under `state_dir`,
@@ -398,7 +400,9 @@ pub fn with_offline_stores<T>(
     let stores = OfflineStores {
         tokens: TokenStore::new(std::sync::Arc::clone(&db)),
         audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
-        devices: crate::state::DeviceMetaStore::open(db).context("reading device_meta")?,
+        devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
+            .context("reading device_meta")?,
+        tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
     };
     op(&stores)
 }

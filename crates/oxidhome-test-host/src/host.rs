@@ -199,6 +199,15 @@ impl TestHost {
         })
     }
 
+    /// Trust the DER certificates `roots` for streaming plugins'
+    /// `https://` requests, on top of the system roots. Call before
+    /// loading plugins. The pins stay in [`Engine::tls_pins`].
+    #[must_use]
+    pub fn with_tls_for_tests(mut self, roots: Vec<Vec<u8>>) -> Self {
+        self.engine = self.engine.clone().with_tls_for_tests(roots);
+        self
+    }
+
     /// The underlying production engine, for assertions the harness
     /// doesn't wrap (device-state projection, event bus subscriptions,
     /// blob store, …).

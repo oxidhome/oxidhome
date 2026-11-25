@@ -2694,9 +2694,13 @@ async fn plugins_uninstall_call(
 
     let engine_for_blocking = engine.clone();
     let plugin_id_for_blocking = args.plugin_id.clone();
+    // The caller, for the audit rows the uninstall writes.
+    let caller = invocation.clone();
     let join = tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        engine_for_blocking.uninstall_plugin(&plugin_id_for_blocking)
+        crate::auth::invocation::CURRENT.sync_scope(caller, || {
+            engine_for_blocking.uninstall_plugin(&plugin_id_for_blocking)
+        })
     })
     .await;
     match join {

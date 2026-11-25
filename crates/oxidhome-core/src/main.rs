@@ -39,6 +39,10 @@
 //!   <name> [--force]` (H6 slice 3)** — offline: the owner's roles.
 //! - **`device set-category <dev-id> <category>|--clear` (H6 slice
 //!   2)** — offline: the operator's category raise (raise only).
+//! - **`tls-pin list [<instance>]` / `tls-pin reset <instance> [<host>
+//!   [<port>]]` / `tls-pin reset --all` (Phase 8.2)** — offline: list or
+//!   forget the certificates streaming instances trusted on first use for
+//!   LAN devices; the next request to a reset device pins again.
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
 //!   of the database, the blob files it indexes and the installed
 //!   plugin packages to a new directory with a checksummed
@@ -84,6 +88,7 @@ use oxidhome_core::api::mcp::{
     DaemonConfig, DaemonMode, ENV_BIND, ENV_STATE_DIR, StdioOptions, install_daemon_config,
     serve_stdio_with,
 };
+use oxidhome_core::api::network_admin::reset_tls_pins;
 use oxidhome_core::api::sensitive_admin::{
     grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
     with_offline_stores,
@@ -94,7 +99,7 @@ use oxidhome_core::api::{
 };
 use oxidhome_core::auth::{DeviceCategory, SensitiveCategory};
 use oxidhome_core::exclusive_lock::acquire_state_dir_lock;
-use oxidhome_core::state::{RetentionConfig, RetentionTasks};
+use oxidhome_core::state::{PinFilter, RetentionConfig, RetentionTasks};
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -384,6 +389,7 @@ async fn run_subcommand() -> Option<anyhow::Result<()>> {
             Some("token") => run_token(),
             Some("role") => run_role(),
             Some("device") => run_device(),
+            Some("tls-pin") => run_tls_pin(),
             _ => return None,
         },
     )
@@ -901,6 +907,87 @@ fn run_device() -> anyhow::Result<()> {
     }
 }
 
+const TLS_PIN_USAGE: &str = "usage: oxidhome tls-pin list [<instance>]\n       \
+     oxidhome tls-pin reset [--instance] <instance> [<host> [<port>]]\n       \
+     oxidhome tls-pin reset --all\n\
+     (scripts: use --instance, which takes any instance id literally)";
+
+/// `oxidhome tls-pin` arguments: whether to reset, and what. `None`
+/// asks for the usage.
+fn parse_tls_pin_args(args: &[&str]) -> anyhow::Result<Option<(bool, PinFilter)>> {
+    const USAGE: &str = TLS_PIN_USAGE;
+    let filter = |instance: Option<&str>, host: Option<&str>, port: Option<&str>| {
+        let port = port
+            .map(|p| {
+                p.parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("bad port `{p}`\n{USAGE}"))
+            })
+            .transpose()?;
+        PinFilter {
+            instance_id: instance.map(str::to_owned),
+            host: host.map(str::to_owned),
+            port,
+        }
+        .validated()
+        .map_err(|e| anyhow::anyhow!("{e}\n{USAGE}"))
+    };
+    let parsed = match args {
+        ["list"] => (false, filter(None, None, None)?),
+        ["list", instance] => (false, filter(Some(instance), None, None)?),
+        ["reset", "--all"] => (true, filter(None, None, None)?),
+        ["reset", "--instance", instance, rest @ ..] if rest.len() <= 2 => (
+            true,
+            filter(Some(instance), rest.first().copied(), rest.get(1).copied())?,
+        ),
+        // A leading `-` is an option, never an instance (`--instance`
+        // takes those literally).
+        ["reset", instance, rest @ ..] if !instance.starts_with('-') && rest.len() <= 2 => (
+            true,
+            filter(Some(instance), rest.first().copied(), rest.get(1).copied())?,
+        ),
+        [] | ["-h" | "--help"] => return Ok(None),
+        _ => anyhow::bail!("{USAGE}"),
+    };
+    Ok(Some(parsed))
+}
+
+/// Phase 8: `oxidhome tls-pin list [<instance>]` /
+/// `oxidhome tls-pin reset <instance> [<host> [<port>]]` /
+/// `oxidhome tls-pin reset --instance <instance> [<host> [<port>]]` /
+/// `oxidhome tls-pin reset --all`. Offline.
+fn run_tls_pin() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some((reset, filter)) = parse_tls_pin_args(&args)? else {
+        println!("{TLS_PIN_USAGE}");
+        return Ok(());
+    };
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let pins = with_offline_stores(&state_dir, |stores| {
+        if reset {
+            reset_tls_pins(&stores.audit, &stores.tls_pins, &filter)
+        } else {
+            Ok(stores.tls_pins.list(&filter))
+        }
+    })?;
+    if reset {
+        println!("removed {} pin(s)", pins.len());
+    }
+    for pin in pins {
+        println!(
+            "{}\t{}:{}\tsha256:{}\tpinned_ms={}\tinstallation={}",
+            pin.key.instance_id,
+            pin.key.host,
+            pin.key.port,
+            pin.fingerprint.to_hex(),
+            pin.pinned_ms,
+            pin.installation_uuid
+        );
+    }
+    Ok(())
+}
+
 /// Stderr-only tracing for the offline / one-shot subcommands.
 fn init_cli_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -1298,4 +1385,35 @@ fn init_tracing(engine: &Engine) {
         .with(fmt::layer().with_filter(filter))
         .with(engine.log_store().layer())
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_pin_reset_takes_no_option_as_an_instance() {
+        for args in [
+            &["reset", "--all", "cam"][..],
+            &["reset", "--inst", "cam"],
+            &["reset", "--inst", "cam", "443"],
+            &["reset", "-x"],
+            &["reset", "cam", "camera.lan", "443", "extra"],
+        ] {
+            assert!(parse_tls_pin_args(args).is_err(), "{args:?}");
+        }
+        let (reset, filter) = parse_tls_pin_args(&["reset", "cam", "camera.lan", "443"])
+            .unwrap()
+            .unwrap();
+        assert!(reset);
+        assert_eq!(filter.scope(), "cam/camera.lan:443");
+        let (_, filter) = parse_tls_pin_args(&["reset", "--instance", "-odd", "camera.lan"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.scope(), "-odd/camera.lan");
+        let (reset, filter) = parse_tls_pin_args(&["reset", "--all"]).unwrap().unwrap();
+        assert!(reset);
+        assert_eq!(filter.scope(), "*");
+        assert!(parse_tls_pin_args(&[]).unwrap().is_none());
+    }
 }

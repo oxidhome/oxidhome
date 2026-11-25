@@ -33,10 +33,24 @@
 //!
 //! # HTTP
 //!
-//! Outgoing HTTP goes through `wasi:http/outgoing-handler`; the raw
-//! bindings are in [`wasi::http`]. Only `http://` is served today. The
-//! host never follows redirects: a 3xx response comes back to the plugin,
-//! and following it is a new request that the host checks again.
+//! [`http::Request`] is a blocking client over
+//! `wasi:http/outgoing-handler` with body limits, timeouts and redirect
+//! handling; the raw bindings are in [`wasi::http`]. `http://` and
+//! `https://` are served. The host itself never follows redirects: a 3xx
+//! response comes back to the plugin, and following it (as
+//! [`http::Request::send`] does) is a new request that the host checks
+//! again.
+//!
+//! For `https://` the host runs TLS (1.3 or 1.2) and verifies the server
+//! against the operating system's root certificates, for the name in the
+//! URL. A server at a private, link-local or loopback address with a
+//! self-signed certificate (a LAN device) that is otherwise valid (for
+//! the name too, unless the URL names an IP address) is trusted on first
+//! use: the host pins the certificate it sees first for that instance,
+//! host and port, and refuses any other (`TLS-certificate-error`,
+//! audited) until the operator resets the pin with `oxidhome tls-pin
+//! reset`. Public servers get no trust on first use, and any other
+//! certificate fault (expired, issued for another host name) is refused.
 //!
 //! # What the host allows
 //!
@@ -76,6 +90,8 @@ pub mod media {
 pub mod wasi {
     pub use crate::bindings::wasi::{clocks, http, io, sockets};
 }
+
+pub mod http;
 
 /// What a `streaming-plugin` world plugin implements on top of
 /// [`Plugin`](crate::Plugin).

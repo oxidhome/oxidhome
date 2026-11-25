@@ -211,6 +211,17 @@ http-body-util = "0.1.3"
 # via `axum` / `wasmtime-wasi-http`; same versions.
 http = "1.5.0"
 hyper = { version = "1.10.1", default-features = false, features = ["client", "http1"] }
+# Phase 8.2: TLS for streaming plugins' outgoing `https://` requests
+# (`runtime::network::tls`). rustls on the `ring` provider (no
+# `aws-lc-rs`: no C++/cmake build, smaller binary), TLS 1.3 and 1.2 for
+# LAN devices, no `log` facade. Roots come from the operating system
+# (`rustls-native-certs`); no bundled `webpki-roots`.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8.5"
+# Test-only: certificates for the local TLS servers in the test-host
+# HTTPS tests. `ring` like rustls above, no PEM.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 # 14.2c round-4 F1: the MCP admission gate wraps every
 # response body in a `PermitBody` that keeps the pending
 # permit alive for the transmission phase. That impl targets

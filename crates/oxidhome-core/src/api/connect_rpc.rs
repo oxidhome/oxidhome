@@ -52,7 +52,7 @@ use connectrpc::{
 };
 use oxidhome_proto::connect::oxidhome::v1::{
     DevicesServiceExt, EventsServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt,
-    PluginsServiceExt, RolesServiceExt, TokensServiceExt,
+    NetworkServiceExt, PluginsServiceExt, RolesServiceExt, TokensServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
@@ -348,6 +348,99 @@ impl oxidhome_proto::connect::oxidhome::v1::InstancesService for OxidHomeInstanc
             .collect();
         Response::ok(ListInstancesResponse {
             instances,
+            ..Default::default()
+        })
+    }
+}
+
+/// Phase 8.2: TLS certificate pins (`NetworkService`).
+struct OxidHomeNetwork {
+    engine: Engine,
+}
+
+fn proto_tls_pin(pin: crate::state::TlsPin) -> oxidhome_proto::proto::oxidhome::v1::TlsPin {
+    oxidhome_proto::proto::oxidhome::v1::TlsPin {
+        instance_id: pin.key.instance_id,
+        host: pin.key.host,
+        port: u32::from(pin.key.port),
+        sha256: pin.fingerprint.to_hex(),
+        pinned_ms: pin.pinned_ms,
+        installation_uuid: pin.installation_uuid,
+        ..Default::default()
+    }
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::NetworkService for OxidHomeNetwork {
+    async fn list_tls_pins<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, oxidhome_proto::proto::oxidhome::v1::ListTlsPinsRequest>,
+    ) -> ServiceResult<
+        impl Encodable<oxidhome_proto::proto::oxidhome::v1::ListTlsPinsResponse> + Send + use<'a>,
+    > {
+        require_connect(&ctx, Action::InstanceRead, &Resource::instances())?;
+        let req = request.to_owned_message();
+        let filter = crate::state::PinFilter {
+            instance_id: req.instance_id,
+            ..Default::default()
+        };
+        Response::ok(oxidhome_proto::proto::oxidhome::v1::ListTlsPinsResponse {
+            pins: self
+                .engine
+                .tls_pins()
+                .list(&filter)
+                .into_iter()
+                .map(proto_tls_pin)
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn reset_tls_pins<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, oxidhome_proto::proto::oxidhome::v1::ResetTlsPinsRequest>,
+    ) -> ServiceResult<
+        impl Encodable<oxidhome_proto::proto::oxidhome::v1::ResetTlsPinsResponse> + Send + use<'a>,
+    > {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let port = req
+            .port
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|_| rpc_err(&ctx, ConnectError::invalid_argument("port out of range")))?;
+        let filter = crate::api::network_admin::reset_filter(
+            crate::state::PinFilter {
+                instance_id: req.instance_id,
+                host: req.host,
+                port,
+            },
+            req.all,
+        )
+        .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e)))?;
+        let scope = filter.scope();
+        let pins = self.engine.tls_pins();
+        let removed = tokio::task::spawn_blocking(move || {
+            let removed = pins.reset(&filter)?;
+            // Logged here, not after the await: a cancelled request's
+            // reset still commits, and still says what it selected.
+            tracing::warn!(
+                target: "host.network",
+                scope = %scope,
+                removed = removed.len(),
+                "TLS certificate pins reset",
+            );
+            Ok::<_, rusqlite::Error>(removed)
+        })
+        .await
+        .map_err(|_| rpc_err(&ctx, ConnectError::internal("removing TLS pins failed")))?
+        .map_err(|err| {
+            tracing::error!(target: "api.network", error = %err, "removing TLS pins failed");
+            rpc_err(&ctx, ConnectError::internal("removing TLS pins failed"))
+        })?;
+        Response::ok(oxidhome_proto::proto::oxidhome::v1::ResetTlsPinsResponse {
+            removed: removed.into_iter().map(proto_tls_pin).collect(),
             ..Default::default()
         })
     }
@@ -1102,9 +1195,15 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         // state.
         let engine = self.engine.clone();
         let id_for_blocking = req.plugin_id.clone();
+        // The caller, for the audit rows the uninstall writes.
+        let caller = ctx.extensions().get::<InvocationContext>().cloned();
         let result = tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            engine.uninstall_plugin(&id_for_blocking)
+            let uninstall = || engine.uninstall_plugin(&id_for_blocking);
+            match caller {
+                Some(caller) => crate::auth::invocation::CURRENT.sync_scope(caller, uninstall),
+                None => uninstall(),
+            }
         })
         .await
         .map_err(|err| {
@@ -1794,6 +1893,10 @@ pub fn router(engine: Engine) -> ConnectRouter {
     })
     .register(router);
     let router = Arc::new(OxidHomeLogs {
+        engine: engine.clone(),
+    })
+    .register(router);
+    let router = Arc::new(OxidHomeNetwork {
         engine: engine.clone(),
     })
     .register(router);

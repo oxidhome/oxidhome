@@ -444,7 +444,7 @@ async fn http_requests_are_checked_on_every_hop() {
             // request, refused like any other.
             format!("http http://127.0.0.1:{}/redirect", allowed.port()),
             format!("http http://127.0.0.1:{}/", forbidden.port()),
-            // HTTPS needs an `https` rule (and isn't sent yet anyway).
+            // HTTPS needs an `https` rule.
             format!("http https://127.0.0.1:{}/", allowed.port()),
             // Userinfo never reaches the wire.
             format!("http http://user:pw@127.0.0.1:{}/ok", allowed.port()),
@@ -589,4 +589,466 @@ async fn network_discovery_example_publishes_replies() {
         .collect();
     assert_eq!(replies, vec![format!("{allowed} pong")]);
     wait_for_deny(&host, "send", "discovery", &denied.to_string()).await;
+}
+
+// ── HTTPS (Phase 8.2) ────────────────────────────────────────────
+
+/// A certificate (DER chain head) and its key, made by `rcgen`.
+struct Cert {
+    der: Vec<u8>,
+    key: Vec<u8>,
+}
+
+/// A CA and a leaf it signed for `127.0.0.1`.
+fn ca_and_leaf() -> (Vec<u8>, Cert) {
+    let (ca, issuer) = test_ca();
+    (ca, leaf(&issuer, "127.0.0.1"))
+}
+
+/// A CA certificate (DER) and the issuer that signs with it.
+fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, rcgen::KeyPair>) {
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "OxidHome test CA");
+    let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+    (ca.der().to_vec(), rcgen::Issuer::new(ca_params, ca_key))
+}
+
+/// A leaf for `name` signed by `issuer`.
+fn leaf(issuer: &rcgen::Issuer<'static, rcgen::KeyPair>, name: &str) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("leaf key");
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
+        .expect("leaf params")
+        .signed_by(&key, issuer)
+        .expect("leaf cert");
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
+}
+
+/// A self-signed certificate for `names`.
+fn self_signed(names: &[&str]) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert =
+        rcgen::CertificateParams::new(names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>())
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
+}
+
+/// A self-signed certificate for `name` that expired a year ago.
+fn expired_self_signed(name: &str) -> Cert {
+    let key = rcgen::KeyPair::generate().expect("key");
+    let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+    let cert = params.self_signed(&key).expect("cert");
+    Cert {
+        der: cert.der().to_vec(),
+        key: key.serialize_der(),
+    }
+}
+
+/// The certificate a [`TlsServer`] presents; swappable.
+#[derive(Debug)]
+struct CurrentCert(std::sync::Mutex<Arc<rustls::sign::CertifiedKey>>);
+
+impl rustls::server::ResolvesServerCert for CurrentCert {
+    fn resolve(
+        &self,
+        _hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0.lock().unwrap()))
+    }
+}
+
+fn certified(cert: &Cert) -> Arc<rustls::sign::CertifiedKey> {
+    let provider = rustls::crypto::ring::default_provider();
+    let key = provider
+        .key_provider
+        .load_private_key(rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.key.clone().into(),
+        ))
+        .expect("signing key");
+    Arc::new(rustls::sign::CertifiedKey::new(
+        vec![rustls::pki_types::CertificateDer::from(cert.der.clone())],
+        key,
+    ))
+}
+
+/// An HTTPS server on loopback answering `respond(path)`, counting the
+/// handshakes that completed.
+struct TlsServer {
+    addr: SocketAddr,
+    cert: Arc<CurrentCert>,
+    served: Arc<AtomicUsize>,
+}
+
+impl TlsServer {
+    fn start(cert: &Cert, respond: impl Fn(&str) -> String + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind tls server");
+        let addr = listener.local_addr().expect("local addr");
+        let current = Arc::new(CurrentCert(std::sync::Mutex::new(certified(cert))));
+        let config =
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_cert_resolver(
+                    Arc::clone(&current) as Arc<dyn rustls::server::ResolvesServerCert>
+                ),
+            );
+        let served = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&served);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&config)) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, stream);
+                let mut reader = BufReader::new(&mut tls);
+                let mut first = String::new();
+                if reader.read_line(&mut first).is_err() || first.is_empty() {
+                    continue;
+                }
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                drop(reader);
+                count.fetch_add(1, Ordering::SeqCst);
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let _ = tls.write_all(respond(&path).as_bytes());
+                let _ = tls.flush();
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            }
+        });
+        Self {
+            addr,
+            cert: current,
+            served,
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    fn served(&self) -> usize {
+        self.served.load(Ordering::SeqCst)
+    }
+
+    fn swap(&self, cert: &Cert) {
+        *self.cert.0.lock().unwrap() = certified(cert);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_reaches_servers_the_roots_vouch_for() {
+    let (ca, issuer) = test_ca();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
+    let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
+    // Signed by the trusted CA, for another name: only the name check
+    // fails, and that is refused even where trust on first use applies.
+    let wrong_name = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
+    // Self-signed but expired: refused, not pinned (a missing issuer
+    // must be the certificate's only fault).
+    let expired = TlsServer::start(&expired_self_signed("127.0.0.1"), |_| http_ok("no"));
+    let results = probe(
+        &host,
+        "https",
+        &[
+            format!("https://127.0.0.1:{}", server.port()),
+            format!("https://127.0.0.1:{}", wrong_name.port()),
+            format!("https://127.0.0.1:{}", expired.port()),
+        ],
+        &[
+            format!("get https://127.0.0.1:{}/ok", server.port()),
+            format!("get https://127.0.0.1:{}/ok", wrong_name.port()),
+            format!("get https://127.0.0.1:{}/ok", expired.port()),
+        ],
+    )
+    .await;
+    assert_eq!(results[0], "ok:200:secure");
+    for refused in &results[1..] {
+        assert_eq!(refused, "err:Http(ErrorCode::TlsCertificateError)");
+    }
+    assert_eq!(server.served(), 1);
+    assert_eq!(wrong_name.served(), 0);
+    assert_eq!(expired.served(), 0);
+    assert_eq!(
+        host.engine()
+            .tls_pins()
+            .list(&oxidhome_core::state::PinFilter::default()),
+        Vec::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ip_literal_request_pins_a_certificate_for_another_name() {
+    // A device reached by IP whose self-signed certificate names
+    // something else: only the name goes unchecked, and the pin binds
+    // the leaf to that address and port.
+    let host = TestHost::new().unwrap().with_tls_for_tests(Vec::new());
+    let cert = self_signed(&["camera.lan"]);
+    let server = TlsServer::start(&cert, |_| http_ok("frame"));
+    let rule = format!("https://127.0.0.1:{}", server.port());
+    let get = format!("get https://127.0.0.1:{}/snap", server.port());
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        &[get.clone(), get],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["ok:200:frame".to_owned(), "ok:200:frame".to_owned()]
+    );
+    let pins = host
+        .engine()
+        .tls_pins()
+        .list(&oxidhome_core::state::PinFilter::default());
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].key.host, "127.0.0.1");
+    assert_eq!(pins[0].key.port, server.port());
+    assert_eq!(
+        pins[0].fingerprint.to_hex(),
+        oxidhome_core::state::Fingerprint::of_der(&cert.der).to_hex()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lan_certificates_are_pinned_on_first_use() {
+    // Loopback is trusted on first use like a LAN address.
+    let host = TestHost::new().unwrap().with_tls_for_tests(Vec::new());
+    let first = self_signed(&["127.0.0.1"]);
+    let server = TlsServer::start(&first, |_| http_ok("frame"));
+    let rule = format!("https://127.0.0.1:{}", server.port());
+    let get = format!("get https://127.0.0.1:{}/snap", server.port());
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        &[get.clone(), get.clone()],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["ok:200:frame".to_owned(), "ok:200:frame".to_owned()]
+    );
+    let pins = host
+        .engine()
+        .tls_pins()
+        .list(&oxidhome_core::state::PinFilter::default());
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].key.instance_id, "cam");
+    assert_eq!(pins[0].key.host, "127.0.0.1");
+    assert_eq!(pins[0].key.port, server.port());
+
+    // Another certificate at the same place is refused, before any
+    // request bytes are sent, and audited.
+    server.swap(&self_signed(&["127.0.0.1"]));
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        std::slice::from_ref(&get),
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["err:Http(ErrorCode::TlsCertificateError)".to_owned()]
+    );
+    assert_eq!(server.served(), 2);
+    let row = wait_for_deny(&host, "tls", "cam", &format!("127.0.0.1:{}", server.port())).await;
+    assert!(
+        row.domain_error.is_some_and(|e| e.contains("pinned")),
+        "domain_error"
+    );
+
+    // The operator resets the pin; the next request pins the new one.
+    let removed = host
+        .engine()
+        .tls_pins()
+        .reset(&oxidhome_core::state::PinFilter {
+            instance_id: Some("cam".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+    let results = probe(&host, "cam", &[rule], &[get]).await;
+    assert_eq!(results, vec!["ok:200:frame".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sdk_client_follows_redirects_without_downgrading() {
+    let (ca, leaf) = ca_and_leaf();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
+    let plain = TcpServer::http(|_| http_ok("plain"));
+    let plain_url = format!("http://127.0.0.1:{}/x", plain.port());
+    let secure = TlsServer::start(&leaf, move |path| match path {
+        "/down" => http_redirect(&plain_url),
+        "/hop" => http_redirect("/ok"),
+        _ => http_ok("secure"),
+    });
+    let hop = TcpServer::http(|path| match path {
+        "/loop" => http_redirect("/loop"),
+        _ => http_ok("hopped"),
+    });
+    let results = probe(
+        &host,
+        "redirects",
+        &[
+            format!("https://127.0.0.1:{}", secure.port()),
+            format!("tcp://127.0.0.1:{}", plain.port()),
+            format!("tcp://127.0.0.1:{}", hop.port()),
+        ],
+        &[
+            format!("get https://127.0.0.1:{}/hop", secure.port()),
+            format!("get https://127.0.0.1:{}/down", secure.port()),
+            format!("get http://127.0.0.1:{}/loop", hop.port()),
+        ],
+    )
+    .await;
+    assert_eq!(results[0], "ok:200:secure");
+    assert!(
+        results[1].starts_with("err:InsecureRedirect"),
+        "{results:?}"
+    );
+    assert_eq!(results[2], "err:TooManyRedirects { limit: 5 }");
+    assert_eq!(plain.accepted(), 0, "https must not be downgraded");
+    assert_eq!(hop.accepted(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pin_holds_against_a_root_vouched_replacement() {
+    let (ca, issuer) = test_ca();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
+    let server = TlsServer::start(&leaf(&issuer, "127.0.0.1"), |_| http_ok("secure"));
+    let key = oxidhome_core::state::PinKey {
+        instance_id: "held".into(),
+        host: "127.0.0.1".into(),
+        port: server.port(),
+    };
+    host.engine()
+        .tls_pins()
+        .check_or_pin(
+            &key,
+            // A dev load's installation is its plugin id.
+            "example.net-probe",
+            oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
+        )
+        .unwrap();
+    let results = probe(
+        &host,
+        "held",
+        &[format!("https://127.0.0.1:{}", server.port())],
+        &[format!("get https://127.0.0.1:{}/", server.port())],
+    )
+    .await;
+    assert_eq!(results, ["err:Http(ErrorCode::TlsCertificateError)"]);
+    assert_eq!(server.served(), 0);
+    wait_for_deny(
+        &host,
+        "tls",
+        "held",
+        &format!("127.0.0.1:{}", server.port()),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_untrusted_certificate_is_audited_as_a_pin_mismatch() {
+    // A certificate for another name fails verification whatever the
+    // pin says, but against a pin that is the event the operator needs
+    // to see.
+    let (ca, issuer) = test_ca();
+    let host = TestHost::new().unwrap().with_tls_for_tests(vec![ca]);
+    let server = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
+    host.engine()
+        .tls_pins()
+        .check_or_pin(
+            &oxidhome_core::state::PinKey {
+                instance_id: "moved".into(),
+                host: "127.0.0.1".into(),
+                port: server.port(),
+            },
+            // A dev load's installation is its plugin id.
+            "example.net-probe",
+            oxidhome_core::state::Fingerprint::of_der(b"the device's old certificate"),
+        )
+        .unwrap();
+    let results = probe(
+        &host,
+        "moved",
+        &[format!("https://127.0.0.1:{}", server.port())],
+        &[format!("get https://127.0.0.1:{}/", server.port())],
+    )
+    .await;
+    assert_eq!(results, ["err:Http(ErrorCode::TlsCertificateError)"]);
+    let row = wait_for_deny(
+        &host,
+        "tls",
+        "moved",
+        &format!("127.0.0.1:{}", server.port()),
+    )
+    .await;
+    assert!(
+        row.domain_error.is_some_and(|e| e.contains("pinned")),
+        "domain_error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_refused_mid_way_returns_the_refusal() {
+    // The server answers `413` after the request head and never reads the
+    // body: the SDK must stop uploading and return the answer, not block.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    // When the refusal went out: the bound is measured from there, not
+    // from staging the plugin (which may build it).
+    let refused_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let refused = Arc::clone(&refused_at);
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ =
+            stream.write_all(b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 4\r\n\r\nbig!");
+        *refused.lock().unwrap() = Some(Instant::now());
+        // Hold the connection open, reading nothing.
+        std::thread::sleep(Duration::from_secs(20));
+        drop(stream);
+    });
+    let host = TestHost::new().unwrap();
+    let results = probe(
+        &host,
+        "uploader",
+        &[format!("tcp://127.0.0.1:{port}")],
+        &[format!("post 16777216 http://127.0.0.1:{port}/upload")],
+    )
+    .await;
+    assert_eq!(results, ["ok:413:big!"]);
+    let since = refused_at.lock().unwrap().expect("refused").elapsed();
+    assert!(since < Duration::from_secs(10), "{since:?}");
 }

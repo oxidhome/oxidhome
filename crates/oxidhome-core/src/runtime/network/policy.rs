@@ -126,12 +126,18 @@ pub(crate) enum Denial {
     Bind(SocketAddr),
     #[error("listening for incoming connections is not allowed")]
     Listen,
+    /// A TLS server refused by its certificate pin.
+    #[error("{0}")]
+    Tls(String),
 }
 
 /// The per-instance policy object. Shared (`Arc`) between the socket
 /// address check, the name-lookup implementation and the HTTP client.
 pub(crate) struct NetworkPolicy {
     instance_id: Arc<str>,
+    /// The plugin installation the instance runs: TLS pins are recorded
+    /// against it, so uninstalling deletes them.
+    installation_uuid: Arc<str>,
     rules: Vec<CompiledRule>,
     resolved: Mutex<Resolved>,
     audit: Mutex<AuditBucket>,
@@ -496,6 +502,7 @@ impl NetworkPolicy {
     ) -> Self {
         Self {
             instance_id: Arc::from(instance_id),
+            installation_uuid: Arc::from(""),
             rules: rules.iter().map(CompiledRule::compile).collect(),
             resolved: Mutex::default(),
             audit: Mutex::new(AuditBucket::new(clock.std_instant())),
@@ -656,6 +663,38 @@ impl NetworkPolicy {
         rules
             .iter()
             .any(|idx| self.rules.get(*idx).is_some_and(|r| r.name_grants(class)))
+    }
+
+    /// The instance this policy belongs to.
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// This policy for an instance of the plugin installation
+    /// `installation_uuid`.
+    #[must_use]
+    pub(crate) fn for_installation(mut self, installation_uuid: Arc<str>) -> Self {
+        self.installation_uuid = installation_uuid;
+        self
+    }
+
+    /// The plugin installation the instance runs.
+    pub(crate) fn installation_uuid(&self) -> &str {
+        &self.installation_uuid
+    }
+
+    /// Record that a request to `target` pinned a LAN device's
+    /// certificate on first use: an audit `allow` row (`net.tls_pin`).
+    /// Not rate-limited: pins are capped per instance.
+    pub(crate) fn audit_pinned(&self, target: &str, fingerprint: crate::state::Fingerprint) {
+        crate::runtime::state_read::queue_deny_audit(
+            self.audit_log.clone(),
+            &self.instance_id,
+            crate::runtime::state_read::DeniedRead::TlsPinned {
+                target: crate::auth::invocation::audit_cap(target).to_owned(),
+                sha256: fingerprint.to_hex(),
+            },
+        );
     }
 
     /// Record a refusal: a `tracing` warning and an audit `deny` row,

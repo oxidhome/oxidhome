@@ -113,6 +113,9 @@ allow = [
   "BSD-3-Clause",
   "Zlib",
   "Unicode-3.0",
+  # `ISC` (MIT-equivalent): `ring`, `rustls-webpki` and `untrusted`, the
+  # TLS stack behind streaming plugins' `https://` requests (Phase 8.2).
+  "ISC",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
