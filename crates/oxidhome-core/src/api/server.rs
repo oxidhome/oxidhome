@@ -1199,7 +1199,7 @@ struct AllDevicesStateParams {
 // H9 round-14 finding 3: cursor issue/verify moved into
 // `DeviceStateStore` — [`DeviceStateStore::issue_cursor`] and
 // [`DeviceStateStore::verify_cursor`]. Format is
-// `<epoch>.<pinned_revision>.<after_device_id>.<hmac>`
+// `<epoch>.<boot>.<pinned_revision>.<after_device_id>.<hmac>`
 // where `hmac` is HMAC-SHA256-128 keyed on a per-process
 // secret. The round-13 in-handler `DecodedCursor` was
 // forgeable — a client could construct any cursor from
