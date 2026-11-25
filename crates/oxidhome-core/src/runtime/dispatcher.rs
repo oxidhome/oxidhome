@@ -122,7 +122,7 @@ use std::time::Duration;
 
 use oxidhome_manifest::ServiceGrant;
 
-use crate::auth::invocation::{self, DelegationHop, InvocationContext};
+use crate::auth::invocation::{self, DelegationHop, InvocationContext, audit_cap};
 use crate::auth::{Action, CONSUMES_SERVICES_GRANT, Resource, authorize_hop};
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
@@ -399,11 +399,13 @@ pub(crate) async fn call_service(
     let decision = authorize_hop(
         &callee_ctx,
         Action::ServiceCall,
+        // The command is caller-supplied and unchecked until after
+        // authorization: bound it before it's copied or echoed.
         &Resource::service(
             target_plugin_id.as_str(),
             target_instance.as_str(),
             target_local_id.as_str(),
-            command.as_str(),
+            audit_cap(&command),
         ),
         CONSUMES_SERVICES_GRANT,
         matches_requested && matches_granted,
@@ -427,9 +429,10 @@ pub(crate) async fn call_service(
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: invocation `{}` was not granted \
              `service.call` on target `{target_plugin_id}` service `{target_local_id}` \
-             command `{command}` by its root principal (a token needs `services:call` or a \
+             command `{}` by its root principal (a token needs `services:call` or a \
              role grant naming the service for every hop it causes)",
             callee_ctx.call_id(),
+            audit_cap(&command),
         )));
     } else {
         // Wording notes: this error also flows through
@@ -458,11 +461,12 @@ pub(crate) async fn call_service(
             "caller `{caller_instance}` refused: {failed_clause} a matching \
              `consumes_services` selector for target \
              `{target_plugin_id}` instance `{target_instance}` service \
-             `{target_local_id}` command `{command}` (caller_instance \
+             `{target_local_id}` command `{}` (caller_instance \
              `{caller_instance}` must match too). For plugin callers, add \
              a matching `[[capabilities.consumes_services]]` entry to the \
              caller's manifest and ensure the operator's granted copy \
-             authorizes the same selector"
+             authorizes the same selector",
+            audit_cap(&command),
         )));
     }
 
@@ -1582,6 +1586,40 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].required_scope.as_deref(), Some("no-permit"));
         assert_eq!(rows[0].token_id, "tok-scene");
+
+        // A wildcard command grant lets an unchecked, oversized command
+        // name reach the root check: the refusal doesn't echo it whole.
+        let any = [grant_any("com.example.beta", "ring", "*")];
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+                .delegate(DelegationHop {
+                    caller_instance: "driver".into(),
+                    target_plugin: "com.example.alpha".into(),
+                    target_instance: "alpha".into(),
+                    target_service: "ring".into(),
+                });
+        let err = invocation::CURRENT
+            .scope(
+                ctx,
+                call_service(
+                    &services,
+                    &instances,
+                    Some(&audit),
+                    None,
+                    "alpha".into(),
+                    &any,
+                    &any,
+                    target.clone(),
+                    "x".repeat(100_000),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("still refused");
+        let WitError::PermissionDenied(msg) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(msg.len() < 1_000, "{} bytes", msg.len());
     }
 
     /// H6 slice 4: a reaction to an attributed event is host-rooted —

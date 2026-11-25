@@ -283,6 +283,22 @@ mod tests {
         assert_eq!(approx_size(&attributed), approx_size(&plain) + 37);
     }
 
+    /// H6 slice 4: a plugin's history page returns each event's call
+    /// id as recorded.
+    #[test]
+    fn history_pages_carry_the_call_id() {
+        let log = log();
+        let attributed = Event {
+            call_id: Some(format!("call-{:032x}", 7)),
+            ..custom("t.a", "1")
+        };
+        record(&log, &[attributed, custom("t.b", "2")]);
+        let p = page(&log, 0, 10, &[all()], true);
+        let calls: Vec<Option<&str>> = p.events.iter().map(|e| e.call_id.as_deref()).collect();
+        let expected = format!("call-{:032x}", 7);
+        assert_eq!(calls, vec![Some(expected.as_str()), None]);
+    }
+
     fn camera(device: &str, frame: Vec<u8>) -> Event {
         Event {
             device: Some(device.into()),
