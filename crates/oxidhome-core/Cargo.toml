@@ -257,6 +257,8 @@ wit-component = { workspace = true, features = ["dummy-module"] }
 # `axum`'s `ws` feature, pinned to the same version so the lockfile
 # stays single-copy.
 tokio-tungstenite.workspace = true
+# Phase 8.2: certificates for the TLS verifier's unit tests.
+rcgen.workspace = true
 # `http-body-util` is now a regular dep (see above); the 15-e
 # Connect server-streaming test and the 14.1 MCP handshake test
 # both use `BodyExt::frame()` off it.

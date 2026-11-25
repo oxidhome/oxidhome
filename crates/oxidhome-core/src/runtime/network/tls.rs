@@ -10,7 +10,8 @@
 //! - **Trust on first use.** When the connected address is *private*,
 //!   *link-local* or *loopback* and the certificate is self-signed with
 //!   no other fault (an expired one, one for another name, or one from a
-//!   CA the roots don't know is refused), the handshake still proves the
+//!   CA the roots don't know is refused; for an IP-literal request the
+//!   name alone isn't checked), the handshake still proves the
 //!   server holds the leaf certificate's key, and the leaf's SHA-256 is
 //!   checked against the instance's pin for `(host, port)` in the
 //!   [`TlsPinStore`]: no pin pins it, the same certificate passes, any
@@ -212,7 +213,9 @@ impl Verifier {
     /// but the issuer is checked (the name, validity dates, extended key
     /// usage, the self-signature). A leaf from a CA the roots don't know
     /// is refused even when the server sends that CA, since an anchor's
-    /// own CA constraints are never checked.
+    /// own CA constraints are never checked. For an IP-literal request
+    /// the name alone is not checked: devices addressed by IP rarely
+    /// carry it, and the pin binds the leaf to that address and port.
     fn verify_self_signed(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -237,6 +240,17 @@ impl Verifier {
             .map_err(|err| rustls::Error::General(err.to_string()))?
             .verify_server_cert(end_entity, &[], server_name, ocsp_response, now)
             .map(|_| ())
+            .or_else(|err| match (&err, server_name) {
+                // The name is checked last: everything else passed.
+                (
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidForName
+                        | rustls::CertificateError::NotValidForNameContext { .. },
+                    ),
+                    ServerName::IpAddress(_),
+                ) => Ok(()),
+                _ => Err(err),
+            })
     }
 }
 
@@ -539,5 +553,48 @@ mod tests {
                 "{remote}"
             );
         }
+    }
+
+    /// A first-use verifier with no system roots, as a LAN host has.
+    fn first_use_verifier() -> Verifier {
+        Verifier {
+            roots: None,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            tofu: true,
+            trust: Mutex::new(None),
+            seen: Mutex::new(None),
+        }
+    }
+
+    fn self_signed(name: &str, expired: bool) -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).expect("params");
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        }
+        params.self_signed(&key).expect("cert").der().clone()
+    }
+
+    fn verify(cert: &CertificateDer<'_>, host: &str) -> Result<(), rustls::Error> {
+        let name = ServerName::try_from(host).expect("name");
+        first_use_verifier()
+            .verify_server_cert(cert, &[], &name, &[], UnixTime::now())
+            .map(drop)
+    }
+
+    #[test]
+    fn first_use_checks_the_name_only_for_host_name_requests() {
+        let camera = self_signed("camera.lan", false);
+        // By host name: the certificate must name it.
+        verify(&camera, "camera.lan").expect("matching name");
+        assert!(verify(&camera, "other.lan").is_err());
+        // By IP literal (v4 or v6): the name alone isn't checked.
+        verify(&camera, "192.168.1.20").expect("IPv4 literal");
+        verify(&camera, "fd00::1").expect("IPv6 literal");
+        // Every other check stays: an expired one is refused either way.
+        let expired = self_signed("camera.lan", true);
+        assert!(verify(&expired, "192.168.1.20").is_err());
+        assert!(verify(&expired, "camera.lan").is_err());
     }
 }

@@ -1642,6 +1642,7 @@ dependencies = [
  "oxidhome-manifest",
  "oxidhome-proto",
  "rand 0.10.4",
+ "rcgen",
  "rmcp",
  "rusqlite",
  "rustls",

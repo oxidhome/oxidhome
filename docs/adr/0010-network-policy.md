@@ -59,7 +59,10 @@ host the request named. The network rule check runs before the connection is mad
 (a leaf from a CA the roots don't know is refused even when the server sends that CA), the handshake must still prove the server holds the leaf certificate's key, and the leaf's SHA-256
 is checked against the host-held pin for `(instance, host, port)`: no pin pins it (logged and audited), the same
 certificate passes, a different one is refused and audited, even one the roots vouch for. Any other certificate
-fault (expired, issued for another name, not for server use) is refused, never pinned. Public addresses, and NAT64
+fault (expired, issued for another name, not for server use, a key a system root has) is refused, never pinned.
+When the request names an IP literal (v4 or v6), the certificate's name alone is not checked: devices addressed by
+IP rarely carry that address in their certificate, and the pin binds the leaf to that address and port; every other
+check stays. A request by hostname keeps the name check. Public addresses, and NAT64
 addresses (`64:ff9b::/96`, `64:ff9b:1::/48`, which may translate to public servers), never get this. Pins are bounded
 (256 per instance, 4096 in all), survive restarts, and belong to the plugin installation whose instance made them
 (an instance id another plugin reuses inherits nothing): uninstalling the plugin deletes them, each audited, like its
@@ -98,5 +101,11 @@ and outgoing-body writes of at most 16 KiB with at most two buffered.
 - Hosts with no usable system roots reach only pinned LAN devices over `https://`.
 - A device whose certificate changes is refused until the operator resets its pin.
 - Old devices offering only CBC suites or TLS ≤ 1.1 are unreachable over `https://`.
+- Trust on first use covers self-signed leaves only, deliberately: a device whose leaf comes from its own CA (sent
+  with the chain or not) is refused. Anchoring a presented CA would need our own CA-constraint checks, which
+  `WebPKI` skips for anchors; revisit if a real device needs it.
+- Known gap, to fix later: the X.509 Key Usage extension is not checked (`WebPKI` ignores it on every path), so a
+  self-signed leaf whose Key Usage lacks `digitalSignature` can still be pinned; the handshake still proves the
+  server holds its key.
 - Broadcast and multicast discovery need a small host import (Phase 8.3); until then they are forbidden.
 - Plugins that declared `network` rules on the `plugin` world must move to `streaming-plugin`.

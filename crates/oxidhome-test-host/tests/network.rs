@@ -765,10 +765,9 @@ async fn https_reaches_servers_the_roots_vouch_for() {
     // Signed by the trusted CA, for another name: only the name check
     // fails, and that is refused even where trust on first use applies.
     let wrong_name = TlsServer::start(&leaf(&issuer, "camera.example"), |_| http_ok("no"));
-    // Self-signed but expired, or for another name: refused, not pinned
-    // (an unknown issuer must be the certificate's only fault).
+    // Self-signed but expired: refused, not pinned (a missing issuer
+    // must be the certificate's only fault).
     let expired = TlsServer::start(&expired_self_signed("127.0.0.1"), |_| http_ok("no"));
-    let other_name = TlsServer::start(&self_signed(&["camera.lan"]), |_| http_ok("no"));
     let results = probe(
         &host,
         "https",
@@ -776,13 +775,11 @@ async fn https_reaches_servers_the_roots_vouch_for() {
             format!("https://127.0.0.1:{}", server.port()),
             format!("https://127.0.0.1:{}", wrong_name.port()),
             format!("https://127.0.0.1:{}", expired.port()),
-            format!("https://127.0.0.1:{}", other_name.port()),
         ],
         &[
             format!("get https://127.0.0.1:{}/ok", server.port()),
             format!("get https://127.0.0.1:{}/ok", wrong_name.port()),
             format!("get https://127.0.0.1:{}/ok", expired.port()),
-            format!("get https://127.0.0.1:{}/ok", other_name.port()),
         ],
     )
     .await;
@@ -790,7 +787,6 @@ async fn https_reaches_servers_the_roots_vouch_for() {
     for refused in &results[1..] {
         assert_eq!(refused, "err:Http(ErrorCode::TlsCertificateError)");
     }
-    assert_eq!(other_name.served(), 0);
     assert_eq!(server.served(), 1);
     assert_eq!(wrong_name.served(), 0);
     assert_eq!(expired.served(), 0);
@@ -799,6 +795,40 @@ async fn https_reaches_servers_the_roots_vouch_for() {
             .tls_pins()
             .list(&oxidhome_core::state::PinFilter::default()),
         Vec::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ip_literal_request_pins_a_certificate_for_another_name() {
+    // A device reached by IP whose self-signed certificate names
+    // something else: only the name goes unchecked, and the pin binds
+    // the leaf to that address and port.
+    let host = TestHost::new().unwrap().with_tls_for_tests(Vec::new());
+    let cert = self_signed(&["camera.lan"]);
+    let server = TlsServer::start(&cert, |_| http_ok("frame"));
+    let rule = format!("https://127.0.0.1:{}", server.port());
+    let get = format!("get https://127.0.0.1:{}/snap", server.port());
+    let results = probe(
+        &host,
+        "cam",
+        std::slice::from_ref(&rule),
+        &[get.clone(), get],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec!["ok:200:frame".to_owned(), "ok:200:frame".to_owned()]
+    );
+    let pins = host
+        .engine()
+        .tls_pins()
+        .list(&oxidhome_core::state::PinFilter::default());
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].key.host, "127.0.0.1");
+    assert_eq!(pins[0].key.port, server.port());
+    assert_eq!(
+        pins[0].fingerprint.to_hex(),
+        oxidhome_core::state::Fingerprint::of_der(&cert.der).to_hex()
     );
 }
 
