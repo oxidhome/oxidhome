@@ -2329,7 +2329,10 @@ fn is_plain_host(host: &oxidhome_manifest::HostMatch) -> bool {
     match host {
         HostMatch::Cidr(_) => true,
         HostMatch::Exact(h) => h.parse::<std::net::IpAddr>().is_ok() || name(h),
-        HostMatch::SuffixWildcard(suffix) => name(suffix.strip_prefix('.').unwrap_or(suffix)),
+        // The shortest name it matches must be a legal one too.
+        HostMatch::SuffixWildcard(suffix) => {
+            name(&format!("a.{}", suffix.strip_prefix('.').unwrap_or(suffix)))
+        }
     }
 }
 
@@ -3259,6 +3262,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn wide_any() -> [NetworkRule; 1] {
+        ["https://*.com".parse().unwrap()]
+    }
+
     #[test]
     fn a_grant_narrows_the_request_and_never_widens_it() {
         let rule = |r: &str| r.parse::<NetworkRule>().unwrap();
@@ -3288,6 +3295,25 @@ mod tests {
             Err(NetworkGrantError::BadHost(_))
         ));
         assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com")])).is_ok());
+        // A suffix leaves room for one label under the 253-byte limit.
+        // `len` bytes of 50-byte labels, then whatever is left, then `com`.
+        let suffix = |len: usize| {
+            let mut out = String::new();
+            while len - out.len() > 4 + 51 {
+                out.push_str(&"a".repeat(50));
+                out.push('.');
+            }
+            out.push_str(&"b".repeat(len - out.len() - 4));
+            out.push_str(".com");
+            out
+        };
+        let fits = rule(&format!("https://*.{}", suffix(251)));
+        assert!(narrowed_network_grant(&wide_any(), Some(&[fits])).is_ok());
+        let too_long = rule(&format!("https://*.{}", suffix(252)));
+        assert!(matches!(
+            narrowed_network_grant(&wide_any(), Some(&[too_long])),
+            Err(NetworkGrantError::BadHost(_))
+        ));
         let lan = [
             rule("tcp://192.168.1.20.:554"),
             rule("tcp://*.192.168.1.20:554"),

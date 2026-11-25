@@ -345,8 +345,11 @@ async fn restart_instances(
         .filter(|h| {
             h.plugin_id() == plugin_id
                 && h.parent_instance_id().is_none()
-                && h.installation_uuid()
-                    .is_none_or(|uuid| *uuid == *row.installation_uuid)
+                // Loaded as this installation. One still loading has
+                // no uuid yet and may be another package's dev load;
+                // an API start holds the lifecycle lock until it runs,
+                // and any later load reads the new grant.
+                && h.installation_uuid() == Some(&*row.installation_uuid)
         })
         .collect();
     // Decided before this asks them to stop.
