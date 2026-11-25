@@ -281,24 +281,15 @@ pub async fn change_network_grant(
     })?
 }
 
-/// Whether two effective rule lists grant the same, ignoring order,
-/// duplicates, case and a name's root dot (the policy compares names
-/// that way).
+/// Whether two effective rule lists grant the same: each rule of one is
+/// covered by a rule of the other (the containment check narrowing
+/// uses), so order, duplicates and equivalent spellings don't count.
 fn same_rules(a: &[NetworkRule], b: &[NetworkRule]) -> bool {
-    let canonical = |rules: &[NetworkRule]| {
-        let mut out: Vec<String> = rules
-            .iter()
-            .map(|r| {
-                // The policy drops a name's root dot too.
-                let r = r.to_string().to_ascii_lowercase().replace(".:", ":");
-                r.strip_suffix('.').map_or_else(|| r.clone(), str::to_owned)
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+    let within = |xs: &[NetworkRule], ys: &[NetworkRule]| {
+        xs.iter()
+            .all(|x| ys.iter().any(|y| crate::state::network_rule_covers(y, x)))
     };
-    canonical(a) == canonical(b)
+    within(a, b) && within(b, a)
 }
 
 /// Top-level instances of `plugin_id` asked to stop that haven't been
@@ -413,13 +404,15 @@ async fn start_and_wait(
     deadline: tokio::time::Instant,
 ) -> (Vec<String>, Vec<NotRestarted>) {
     let mut tasks = tokio::task::JoinSet::new();
+    let mut ids = std::collections::HashMap::new();
     for (instance_id, config) in starting {
         let engine = engine.clone();
+        let id = instance_id.clone();
         let (path, uuid) = (
             row.path.clone(),
             std::sync::Arc::clone(&row.installation_uuid),
         );
-        tasks.spawn(async move {
+        let task = tasks.spawn(async move {
             let run = async {
                 let handle = engine
                     .start_installed_instance(path, instance_id.clone(), config, uuid)
@@ -436,6 +429,7 @@ async fn start_and_wait(
             };
             (instance_id, outcome)
         });
+        ids.insert(task.id(), id);
     }
     let mut restarted = Vec::new();
     let mut not_restarted = Vec::new();
@@ -456,6 +450,12 @@ async fn start_and_wait(
             }
             Err(err) => {
                 tracing::error!(target: "host.network", error = %err, "restart task failed");
+                if let Some(instance_id) = ids.remove(&err.id()) {
+                    not_restarted.push(NotRestarted {
+                        instance_id,
+                        reason: format!("restart task failed: {err}"),
+                    });
+                }
             }
         }
     }
@@ -528,6 +528,15 @@ mod tests {
             ),
         };
         let path = audit_path(&by, "x.y", false, &change.audit_detail());
+        let odd = NetworkGrantChange {
+            old: vec![
+                rule("https://secret=1.example.com"),
+                rule("tcp://10.0.0.1:554"),
+            ],
+            ..change.clone()
+        };
+        let odd_path = audit_path(&by, "x.y", false, &odd.audit_detail());
+        assert_eq!(crate::redact::scrub_text(&odd_path), odd_path);
         assert_eq!(crate::redact::scrub_text(&path), path);
         let detail: serde_json::Value =
             serde_json::from_str(path.splitn(3, '/').nth(2).unwrap()).unwrap();
