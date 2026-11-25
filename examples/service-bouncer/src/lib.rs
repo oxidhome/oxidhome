@@ -55,8 +55,11 @@ impl Plugin for Bouncer {
         )
         .map_err(|e| format!("register-service failed: {e:?}"))?;
         oxidhome_sdk::tracing::info!(service_id = %id, "service-bouncer registered");
-        host::subscribe_topic(RELAY_TOPIC.to_owned())
-            .map_err(|e| format!("subscribe failed: {e:?}"))?;
+        // The relay is optional: without `subscribes_events` the
+        // bouncer still serves `kick`.
+        if let Err(e) = host::subscribe_topic(RELAY_TOPIC.to_owned()) {
+            oxidhome_sdk::tracing::warn!("relay disabled: subscribe failed: {e:?}");
+        }
         Ok(())
     }
 

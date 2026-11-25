@@ -645,18 +645,28 @@ pub fn build_role(spec: &RoleSpec) -> Result<Vec<u8>, AdminError> {
     for g in &spec.grants {
         let (actions, categories, devices, services) = selector(g, "grant")?;
         let wildcard = g.actions.iter().any(|a| a == "*");
+        // Actions named beside `*` must fit the selector too.
+        let explicit = ActionSet::parse(g.actions.iter().map(String::as_str).filter(|a| *a != "*"))
+            .map_err(|e| invalid(format!("{e}")))?;
         let narrowed = categories.is_some() || devices.is_some();
-        if narrowed && !wildcard && !NARROWABLE.contains_all(actions) {
-            let names = actions.without(NARROWABLE).names().join(", ");
+        if narrowed && !NARROWABLE.contains_all(explicit) {
+            let names = explicit.without(NARROWABLE).names().join(", ");
             return Err(invalid(format!(
                 "a grant narrowed to devices can only name device.list, device.read and \
                  device.command, not {names}"
             )));
         }
-        if services.is_some() && !wildcard && !SERVICE_NARROWABLE.contains_all(actions) {
-            let names = actions.without(SERVICE_NARROWABLE).names().join(", ");
+        if services.is_some() && !SERVICE_NARROWABLE.contains_all(explicit) {
+            let names = explicit.without(SERVICE_NARROWABLE).names().join(", ");
             return Err(invalid(format!(
                 "a grant narrowed to services can only name service.call, not {names}"
+            )));
+        }
+        if !SCOPED.contains_all(explicit) {
+            let names = explicit.without(SCOPED).names().join(", ");
+            return Err(invalid(format!(
+                "a role can't grant {names}: no scope grants it (the owner holds \
+                 token.manage and policy.manage; plugins' manifests govern state.read)"
             )));
         }
         let actions = if wildcard {
@@ -667,14 +677,8 @@ pub fn build_role(spec: &RoleSpec) -> Result<Vec<u8>, AdminError> {
             } else {
                 SCOPED
             })
-        } else if SCOPED.contains_all(actions) {
-            actions
         } else {
-            let names = actions.without(SCOPED).names().join(", ");
-            return Err(invalid(format!(
-                "a role can't grant {names}: no scope grants it (the owner holds \
-                 token.manage and policy.manage; plugins' manifests govern state.read)"
-            )));
+            actions
         };
         grants.push(RoleGrant {
             actions,
@@ -1196,6 +1200,16 @@ mod tests {
                 "x",
                 r#"{"grants":[{"actions":["service.call"],"services":[]}]}"#,
                 "must not be empty",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["*","device.command"],"services":["acme.notify"]}]}"#,
+                "can only name service.call",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["*","token.manage"]}]}"#,
+                "can't grant token.manage",
             ),
             ("x", r#"{"sensitive":["door"]}"#, "unknown"),
             (

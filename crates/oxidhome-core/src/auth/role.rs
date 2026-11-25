@@ -363,6 +363,9 @@ impl RoleDef {
         let mut grants = Vec::with_capacity(wire.grants.len());
         for g in wire.grants {
             let wildcard = g.actions.iter().any(|a| a == "*");
+            let explicit =
+                ActionSet::parse(g.actions.iter().map(String::as_str).filter(|a| *a != "*"))
+                    .ok()?;
             let (actions, categories, devices, services) = g.into_parts()?;
             // `*` is every action a scope grants; naming one no scope
             // grants refuses the definition.
@@ -373,12 +376,13 @@ impl RoleDef {
             } else {
                 SCOPED
             };
+            if !allowed.contains_all(explicit) {
+                return None;
+            }
             let actions = if wildcard {
                 actions.intersection(allowed)
-            } else if allowed.contains_all(actions) {
-                actions
             } else {
-                return None;
+                actions
             };
             grants.push(RoleGrant {
                 actions,
@@ -651,8 +655,22 @@ fn describe(
         s.push(']');
     }
     if let Some(svc) = services {
+        // A local id may hold spaces or braces: quote such a pattern so
+        // `{a.b/x *}` (one pattern) reads apart from `{a.b/x *}` (two).
+        let shown: Vec<String> = svc
+            .iter()
+            .map(|p| {
+                if p.chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '"'))
+                {
+                    format!("{p:?}")
+                } else {
+                    p.clone()
+                }
+            })
+            .collect();
         s.push('{');
-        s.push_str(&svc.join(" "));
+        s.push_str(&shown.join(" "));
         s.push('}');
     }
     s
@@ -883,6 +901,11 @@ mod tests {
             Some(vec!["acme.notify/send".to_string()])
         );
         assert_eq!(def.grants[0].describe(), "service.call{acme.notify/send}");
+        let spaced = RoleGrant {
+            services: Some(vec!["acme.notify/send *".into()]),
+            ..def.grants[0].clone()
+        };
+        assert_eq!(spaced.describe(), r#"service.call{"acme.notify/send *"}"#);
         assert_eq!(def.deny[0].services, Some(vec!["zwave.*".to_string()]));
         assert_eq!(
             RoleDef::parse(&def.id, &def.name, &def.definition_json()).as_ref(),
@@ -966,6 +989,8 @@ mod tests {
             r#"{"sensitive":["door"]}"#,
             r#"{"deny":[{"actions":["nope"]}]}"#,
             r#"{"deny":[{"actions":["device.command"],"services":["acme.notify"]}]}"#,
+            r#"{"grants":[{"actions":["*","device.command"],"services":["acme.notify"]}]}"#,
+            r#"{"grants":[{"actions":["*","token.manage"]}]}"#,
             r#"{"scopes":["*"]}"#,
         ] {
             assert!(role(bad).is_none(), "{bad}");
