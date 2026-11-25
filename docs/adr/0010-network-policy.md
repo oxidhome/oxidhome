@@ -68,7 +68,9 @@ broadcast or multicast address. On a discovery socket:
   networks, every IPv4 destination but a named group is refused. `SO_BROADCAST` is set only for the duration of a send
   the policy approved as a broadcast, so a destination the kernel treats as one and the policy didn't (a network's
   first address on BSD, an interface that changed in between) fails, and is audited, instead of reaching the link. The
-  interfaces are listed for each send, with the broadcast address each is configured with counting as its network's.
+  interfaces are listed for each send, with the broadcast address each is configured with counting as its network's
+  (and needing a rule for itself); a non-contiguous netmask counts as a listing failure. An interface reconfigured
+  between the check and the send itself is a race the host doesn't close.
 - Every other destination is checked as a UDP send. Datagrams from senders a UDP send couldn't reach are dropped,
   by `receive` and while the socket waits for readiness, so a flood from a refused sender never wakes the plugin.
   Devices answer a broadcast from their own address, so a plugin needs a rule for them too.

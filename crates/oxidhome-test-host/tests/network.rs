@@ -750,7 +750,16 @@ async fn local_networks_are_listed_when_the_grant_covers_them_whole() {
     let host = TestHost::new().unwrap();
     let ops = ["nets -".to_owned()];
     let listed = probe(&host, "nets", &["tcp://127.0.0.0/8:*".to_owned()], &ops).await;
-    assert_eq!(listed, vec!["ok:127.0.0.0/8".to_owned()]);
+    // Loopback may carry more prefixes (aliases), each inside the /8.
+    let listed = listed[0].strip_prefix("ok:").expect("listed");
+    assert!(
+        listed.split(',').any(|net| net == "127.0.0.0/8"),
+        "{listed}"
+    );
+    assert!(
+        listed.split(',').all(|net| net.starts_with("127.")),
+        "{listed}"
+    );
     let narrowed = probe(
         &host,
         "nets-narrow",

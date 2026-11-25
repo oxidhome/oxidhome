@@ -56,6 +56,9 @@ pub struct DiscoverySocket {
     readiness: tokio::net::UdpSocket,
     /// Where `ready` peeks at a waiting datagram's sender.
     peek_buf: Box<[u8]>,
+    /// A socket error `ready` took from the system (a peek clears it),
+    /// kept for the next `receive` to report.
+    pending_error: Option<std::io::Error>,
     ipv6: bool,
     policy: Arc<NetworkPolicy>,
 }
@@ -96,7 +99,10 @@ impl wasmtime_wasi::p2::Pollable for DiscoverySocket {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 // A pending socket error: `receive` reports it.
-                Err(_) => return,
+                Err(e) => {
+                    self.pending_error = Some(e);
+                    return;
+                }
             }
         }
     }
@@ -110,21 +116,31 @@ pub(super) fn add_to_linker(linker: &mut Linker<PluginState>) -> anyhow::Result<
 /// The host's interfaces, listed now: what a send is checked against,
 /// so an interface change is seen at once.
 fn list_interfaces() -> std::io::Result<Vec<LocalInterface>> {
-    Ok(if_addrs::get_if_addrs()?
+    if_addrs::get_if_addrs()?
         .iter()
         .filter_map(|iface| {
             let (ip, prefix, broadcast) = match &iface.addr {
-                if_addrs::IfAddr::V4(v4) => (
-                    IpAddr::V4(v4.ip),
-                    v4.prefixlen,
-                    v4.broadcast.map(IpAddr::V4),
-                ),
+                if_addrs::IfAddr::V4(v4) => {
+                    // A non-contiguous mask has no CIDR: refuse to guess
+                    // which addresses its broadcast reaches.
+                    if u32::from(v4.netmask).leading_ones() != u32::from(v4.prefixlen) {
+                        return Some(Err(std::io::Error::other(format!(
+                            "{}: non-contiguous netmask {}",
+                            iface.name, v4.netmask
+                        ))));
+                    }
+                    (
+                        IpAddr::V4(v4.ip),
+                        v4.prefixlen,
+                        v4.broadcast.map(IpAddr::V4),
+                    )
+                }
                 if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen, None),
             };
             let net = IpNet::new(ip, prefix).ok()?.trunc();
-            Some(LocalInterface { net, broadcast })
+            Some(Ok(LocalInterface { net, broadcast }))
         })
-        .collect())
+        .collect()
 }
 
 /// The host's interface networks for `local-networks`, reused for
@@ -209,6 +225,11 @@ fn addr_to_wit(addr: SocketAddr) -> IpSocketAddress {
 /// The `error-code` for an OS socket error.
 fn error_code(err: &std::io::Error) -> ErrorCode {
     use std::io::ErrorKind;
+    // Larger than the path allows (no `ErrorKind` for it).
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::EMSGSIZE) {
+        return ErrorCode::DatagramTooLarge;
+    }
     match err.kind() {
         ErrorKind::WouldBlock => ErrorCode::WouldBlock,
         ErrorKind::PermissionDenied => ErrorCode::AccessDenied,
@@ -320,6 +341,7 @@ impl host_network::HostDiscoverySocket for PluginState {
             socket,
             readiness,
             peek_buf: vec![0u8; MAX_DATAGRAM].into_boxed_slice(),
+            pending_error: None,
             ipv6,
             policy: Arc::clone(&self.network),
         };
@@ -369,7 +391,9 @@ impl host_network::HostDiscoverySocket for PluginState {
     ) -> Result<(), ErrorCode> {
         let addr = addr_from_wit(remote_address);
         let ipv6 = self.discovery_socket(&this)?.ipv6;
-        if addr.is_ipv6() != ipv6 || addr.port() == 0 {
+        // IPv4-mapped addresses can't leave an IPv6-only socket.
+        let mapped = matches!(addr.ip(), IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+        if addr.is_ipv6() != ipv6 || addr.port() == 0 || mapped {
             return Err(ErrorCode::InvalidArgument);
         }
         if data.len() > MAX_SEND {
@@ -402,7 +426,11 @@ impl host_network::HostDiscoverySocket for PluginState {
             Ok(_) => Ok(()),
             // The kernel refused a broadcast the policy saw as unicast
             // (an address the interface list didn't show as one).
-            Err(e) if !broadcast && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(e)
+                if !broadcast
+                    && addr.is_ipv4()
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
                 Err(self.refuse("send", &addr.to_string(), &Denial::UnlistedBroadcast(addr)))
             }
             Err(e) => Err(error_code(&e)),
@@ -416,6 +444,9 @@ impl host_network::HostDiscoverySocket for PluginState {
     ) -> Result<Vec<Datagram>, ErrorCode> {
         let max = usize::try_from(max_results).map_or(MAX_RECEIVE, |n| n.min(MAX_RECEIVE));
         let socket = self.discovery_socket(&this)?;
+        if let Some(e) = socket.pending_error.take() {
+            return Err(error_code(&e));
+        }
         let mut out = Vec::new();
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut discarded = 0;

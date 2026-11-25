@@ -176,7 +176,10 @@ pub(crate) enum Denial {
     DiscoveryPort(u16),
     #[error("the host's networks couldn't be listed, so {0} may be a broadcast address")]
     InterfacesUnknown(SocketAddr),
-    #[error("the system treats {0} as a broadcast address the host's network list didn't show")]
+    #[error(
+        "the system refused {0}: a broadcast address the host's network list didn't show, or a \
+         prohibit route"
+    )]
     UnlistedBroadcast(SocketAddr),
 }
 
@@ -772,6 +775,9 @@ impl NetworkPolicy {
             if classify(ip) == AddressClass::Forbidden {
                 return Err(Denial::Forbidden(ip, AddressClass::Forbidden));
             }
+            // The address itself too: a configured broadcast address
+            // can lie outside its network.
+            self.check_addr(Use::Udp, addr, None)?;
             for net in nets {
                 if !self
                     .rules
@@ -1699,6 +1705,17 @@ mod tests {
             },
         ];
         let lan = policy(&["udp://192.168.1.0/24:9999"]);
+        // A configured broadcast outside its network needs a rule for
+        // the address as well as the network.
+        let outside = [LocalInterface {
+            net: "10.0.0.5/32".parse().unwrap(),
+            broadcast: Some("10.0.0.255".parse().unwrap()),
+        }];
+        assert!(
+            policy(&["udp://10.0.0.5:9999"])
+                .check_discovery_send(sa("10.0.0.255:9999"), Some(&outside))
+                .is_err()
+        );
         assert!(
             lan.check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
                 .is_ok()
