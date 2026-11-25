@@ -1603,7 +1603,10 @@ pub struct TokenView<'a> {
     ///
     /// Field 7: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 8: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2051,7 +2054,10 @@ impl TokenOwnedView {
     pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().sensitive
     }
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 8: `deny`
     #[must_use]
@@ -2478,13 +2484,19 @@ pub struct RoleView<'a> {
     pub role_id: &'a str,
     /// Field 2: `name`
     pub name: &'a str,
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 3: `grants`
     pub grants: ::buffa::RepeatedView<'a, &'a str>,
     /// Field 4: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 5: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2871,7 +2883,10 @@ impl RoleOwnedView {
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 3: `grants`
     #[must_use]
@@ -2883,7 +2898,10 @@ impl RoleOwnedView {
     pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().sensitive
     }
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 5: `deny`
     #[must_use]

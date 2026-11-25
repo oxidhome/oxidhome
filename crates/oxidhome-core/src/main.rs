@@ -1569,6 +1569,7 @@ mod tests {
             services: Some(vec![
                 "acme.notify/send".into(),
                 "acme.notify/send, \"urgent\" {x}".into(),
+                "acme.notify/send\u{a0}now".into(),
                 "acme.alarm".into(),
             ]),
         }
@@ -1582,6 +1583,7 @@ mod tests {
             Some(vec![
                 "acme.notify/send".to_owned(),
                 "acme.notify/send, \"urgent\" {x}".to_owned(),
+                "acme.notify/send\u{a0}now".to_owned(),
                 "acme.alarm".to_owned(),
             ])
         );

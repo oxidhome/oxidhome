@@ -657,14 +657,14 @@ fn describe(
     if let Some(svc) = services {
         // Comma-separated, as `token create --deny` reads them back. A
         // local id may hold commas, spaces or braces: quote such a
-        // pattern so it can't read as several.
+        // pattern (a JSON string) so it can't read as several.
         let shown: Vec<String> = svc
             .iter()
             .map(|p| {
                 if p.chars()
                     .any(|c| c.is_whitespace() || matches!(c, ',' | '{' | '}' | '"'))
                 {
-                    format!("{p:?}")
+                    serde_json::to_string(p).unwrap_or_default()
                 } else {
                     p.clone()
                 }

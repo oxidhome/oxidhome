@@ -944,7 +944,10 @@ pub struct Token {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 8: `deny`
     #[serde(
@@ -1506,7 +1509,10 @@ pub struct Role {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 3: `grants`
     #[serde(
@@ -1522,7 +1528,10 @@ pub struct Role {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services: comma-separated patterns, each one
+    /// holding a comma, whitespace, brace or quote written as a JSON
+    /// string.
     ///
     /// Field 5: `deny`
     #[serde(
