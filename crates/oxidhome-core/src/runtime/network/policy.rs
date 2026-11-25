@@ -148,8 +148,7 @@ pub(crate) enum Denial {
     #[error("no udp network rule names {0}")]
     GroupNotNamed(SocketAddr),
     #[error(
-        "{addr} is the broadcast address of {net}; no udp network rule names it or covers that \
-         whole network"
+        "{addr} is the broadcast address of {net}; no udp network rule covers that whole network"
     )]
     SubnetBroadcast { addr: SocketAddr, net: IpNet },
     #[error("joining {0} needs a udp network rule naming that group")]
@@ -287,7 +286,11 @@ impl CompiledRule {
     /// `net`, and grants every class `net` holds ([`net_class`]).
     fn covers_net(&self, net: &IpNet) -> bool {
         match &self.host {
-            RuleHost::Ip(ip) => net.prefix_len() == net.max_prefix_len() && *ip == net.network(),
+            RuleHost::Ip(ip) => {
+                net.prefix_len() == net.max_prefix_len()
+                    && *ip == net.network()
+                    && classify(*ip) != AddressClass::Forbidden
+            }
             RuleHost::Net(rule_net) => {
                 rule_net.contains(net)
                     && match net_class(net) {
@@ -473,15 +476,47 @@ fn net_class(net: &IpNet) -> Option<AddressClass> {
     {
         return Some(*class);
     }
-    let overlaps = NON_PUBLIC.iter().any(|class| {
-        class_blocks(*class).iter().any(|block| {
-            block
-                .parse::<IpNet>()
-                .is_ok_and(|block| block.contains(net) || net.contains(&block))
-        })
-    });
-    (!overlaps && classify(net.network()) == AddressClass::Public).then_some(AddressClass::Public)
+    let overlaps = |block: &str| {
+        block
+            .parse::<IpNet>()
+            .is_ok_and(|block| block.contains(net) || net.contains(&block))
+    };
+    let mixed = NON_PUBLIC
+        .iter()
+        .flat_map(|class| class_blocks(*class))
+        .chain(NOT_WHOLLY_PUBLIC.iter())
+        .any(|block| overlaps(block));
+    let public = match net {
+        IpNet::V4(_) => true,
+        // Global unicast is the only public IPv6 space.
+        IpNet::V6(_) => "2000::/3"
+            .parse::<IpNet>()
+            .is_ok_and(|global| global.contains(net)),
+    };
+    (public && !mixed && classify(net.network()) == AddressClass::Public)
+        .then_some(AddressClass::Public)
 }
+
+/// Blocks a public CIDR may not overlap to count as wholly public: the
+/// forbidden ones `classify` knows, and the IPv6 ranges it classifies by
+/// an embedded IPv4 address.
+const NOT_WHOLLY_PUBLIC: [&str; 15] = [
+    "0.0.0.0/8",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.88.99.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "2001::/23",
+    "2001:db8::/32",
+    "3fff::/20",
+    "2002::/16",
+    "64:ff9b::/96",
+    "::ffff:0:0/96",
+];
 
 fn net_within_class(net: &IpNet, class: AddressClass) -> bool {
     class_blocks(class).iter().any(|block| {
@@ -669,16 +704,18 @@ impl NetworkPolicy {
         }
     }
 
-    /// Check a discovery socket's send to `addr` (see the module docs).
-    /// `local` are the host's interface networks, which tell a
-    /// subnet-directed broadcast from a unicast address; `None` when the
-    /// host couldn't list them, which refuses every IPv4 destination but
-    /// a named group (any could be a broadcast address).
+    /// Check a discovery socket's send to `addr` (see the module docs):
+    /// whether it is a broadcast (`SO_BROADCAST` is set for that send
+    /// only), or why it is refused. `local` are the host's interface
+    /// networks, which tell a subnet-directed broadcast from a unicast
+    /// address; `None` when the host couldn't list them, which refuses
+    /// every IPv4 destination but a named group (any could be a broadcast
+    /// address).
     pub(crate) fn check_discovery_send(
         &self,
         addr: SocketAddr,
         local: Option<&[IpNet]>,
-    ) -> Result<(), Denial> {
+    ) -> Result<bool, Denial> {
         let ip = addr.ip().to_canonical();
         let port = addr.port();
         if is_group_address(ip) {
@@ -687,7 +724,7 @@ impl NetworkPolicy {
                 .iter()
                 .any(|r| r.names_group(ip) && r.allows(Use::Udp, port))
             {
-                Ok(())
+                Ok(!ip.is_multicast())
             } else {
                 Err(Denial::GroupNotNamed(SocketAddr::new(ip, port)))
             };
@@ -696,7 +733,7 @@ impl NetworkPolicy {
             return if ip.is_ipv4() {
                 Err(Denial::InterfacesUnknown(SocketAddr::new(ip, port)))
             } else {
-                self.check_addr(Use::Udp, addr, None)
+                self.check_addr(Use::Udp, addr, None).map(|()| false)
             };
         };
         // Every network it is the broadcast address of (overlapping
@@ -706,6 +743,9 @@ impl NetworkPolicy {
             .filter(|net| directed_broadcast(net) == Some(ip))
             .peekable();
         if nets.peek().is_some() {
+            if classify(ip) == AddressClass::Forbidden {
+                return Err(Denial::Forbidden(ip, AddressClass::Forbidden));
+            }
             for net in nets {
                 if !self
                     .rules
@@ -718,9 +758,9 @@ impl NetworkPolicy {
                     });
                 }
             }
-            return Ok(());
+            return Ok(true);
         }
-        self.check_addr(Use::Udp, addr, None)
+        self.check_addr(Use::Udp, addr, None).map(|()| false)
     }
 
     /// Joining the multicast `group`: a `udp` rule must name it.
@@ -1544,8 +1584,9 @@ mod tests {
             "udp://0.0.0.0/0:*",
         ]);
         let send = |a: &str| p.check_discovery_send(sa(a), Some(&[]));
-        assert!(send("255.255.255.255:9999").is_ok());
-        assert!(send("224.0.0.251:5353").is_ok());
+        // The limited broadcast needs `SO_BROADCAST`; multicast doesn't.
+        assert_eq!(send("255.255.255.255:9999"), Ok(true));
+        assert_eq!(send("224.0.0.251:5353"), Ok(false));
         assert!(send("[::ffff:224.0.0.251]:5353").is_ok());
         assert!(send("[ff02::fb]:5353").is_ok());
         // Wrong port, an `any` rule, a CIDR: none names the group.
@@ -1642,6 +1683,24 @@ mod tests {
                 .check_discovery_send(sa("198.18.0.255:9999"), Some(&local))
                 .is_err()
         );
+        // A public-looking network holding a forbidden block isn't
+        // covered by public space.
+        let mixed = nets(&["198.16.0.0/14"]);
+        assert!(
+            public
+                .check_discovery_send(sa("198.19.255.255:9999"), Some(&mixed))
+                .is_err()
+        );
+        // Broadcasts are flagged so the socket enables `SO_BROADCAST`
+        // for them only.
+        assert_eq!(
+            whole.check_discovery_send(sa("192.168.1.255:9999"), Some(&local)),
+            Ok(true)
+        );
+        assert_eq!(
+            whole.check_discovery_send(sa("192.168.1.7:9999"), Some(&local)),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -1705,6 +1764,8 @@ mod tests {
             "2001:4860::/64",
             "fd00:1::/64",
             "172.0.0.0/11",
+            "198.16.0.0/14",
+            "2002:8000::/17",
         ]);
         let p = policy(&[
             "udp://192.168.0.0/16:9999",

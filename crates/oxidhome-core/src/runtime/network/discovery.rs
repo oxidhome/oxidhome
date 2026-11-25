@@ -44,8 +44,16 @@ const INTERFACES_TTL: Duration = Duration::from_secs(2);
 const MULTICAST_HOPS: u32 = 1;
 
 /// A discovery socket in an instance's resource table.
+///
+/// Two descriptors of one socket: sends, receives and options go
+/// straight to the non-blocking `std` one, and the `tokio` one is only
+/// awaited for read readiness. tokio's `try_*` calls answer
+/// `would-block` without asking the OS until its reactor has seen the
+/// socket ready, which would lose a probe sent right after `open` and
+/// hide datagrams from a `receive` that didn't wait first.
 pub struct DiscoverySocket {
-    socket: tokio::net::UdpSocket,
+    socket: std::net::UdpSocket,
+    readiness: tokio::net::UdpSocket,
     ipv6: bool,
     policy: Arc<NetworkPolicy>,
 }
@@ -63,14 +71,20 @@ impl wasmtime_wasi::p2::Pollable for DiscoverySocket {
     async fn ready(&mut self) {
         let mut discarded = 0usize;
         loop {
-            if self.socket.readable().await.is_err() {
+            if self.readiness.readable().await.is_err() {
                 return;
             }
-            match self.socket.try_peek_sender() {
+            // Through `try_io`, so a `would-block` clears the readiness
+            // tokio cached.
+            let socket = &self.socket;
+            match self.readiness.try_io(tokio::io::Interest::READABLE, || {
+                socket.peek_from(&mut [0u8; 1]).map(|(_, from)| from)
+            }) {
                 Ok(from) if self.admits(from) => return,
                 Ok(_) => {
-                    // Dropped unread (a zero-length read truncates it).
-                    let _ = self.socket.try_recv_from(&mut [0u8; 0]);
+                    // Dropped unread (a one-byte read truncates it; some
+                    // systems refuse a zero-length one).
+                    let _ = self.socket.recv_from(&mut [0u8; 1]);
                     discarded += 1;
                     if discarded.is_multiple_of(DISCARDS_PER_YIELD) {
                         tokio::task::yield_now().await;
@@ -195,8 +209,9 @@ fn error_code(err: &std::io::Error) -> ErrorCode {
     }
 }
 
-/// Bind a discovery socket (see the WIT `open`).
-fn bind(ipv6: bool, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+/// Bind a discovery socket (see the WIT `open`): the socket, and a
+/// second descriptor of it registered with tokio for readiness.
+fn bind(ipv6: bool, port: u16) -> std::io::Result<(std::net::UdpSocket, tokio::net::UdpSocket)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if ipv6 { Domain::IPV6 } else { Domain::IPV4 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
@@ -205,7 +220,10 @@ fn bind(ipv6: bool, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
         socket.set_only_v6(true)?;
         socket.set_multicast_hops_v6(MULTICAST_HOPS)?;
     } else {
-        socket.set_broadcast(true)?;
+        // `SO_BROADCAST` stays off except around a send the policy
+        // approved as a broadcast, so a destination the kernel treats as
+        // a broadcast and the policy didn't (a network's first address,
+        // an interface change the cached list missed) is refused.
         socket.set_multicast_ttl_v4(MULTICAST_HOPS)?;
     }
     // Linux otherwise delivers every group joined on the host (by any
@@ -231,7 +249,9 @@ fn bind(ipv6: bool, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     };
     socket.bind(&SocketAddr::new(ip, port).into())?;
-    tokio::net::UdpSocket::from_std(socket.into())
+    let socket: std::net::UdpSocket = socket.into();
+    let readiness = tokio::net::UdpSocket::from_std(socket.try_clone()?)?;
+    Ok((socket, readiness))
 }
 
 impl PluginState {
@@ -280,9 +300,10 @@ impl host_network::HostDiscoverySocket for PluginState {
         if super::sockets::live_sockets(&mut self.table) >= MAX_SOCKETS {
             return Err(ErrorCode::NewSocketLimit);
         }
-        let socket = bind(ipv6, local_port).map_err(|e| error_code(&e))?;
+        let (socket, readiness) = bind(ipv6, local_port).map_err(|e| error_code(&e))?;
         let socket = DiscoverySocket {
             socket,
+            readiness,
             ipv6,
             policy: Arc::clone(&self.network),
         };
@@ -318,7 +339,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         }
         let socket = &self.discovery_socket(&this)?.socket;
         match group {
-            IpAddr::V4(v4) => socket.join_multicast_v4(v4, Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(v4) => socket.join_multicast_v4(&v4, &Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(v6) => socket.join_multicast_v6(&v6, 0),
         }
         .map_err(|e| error_code(&e))
@@ -338,21 +359,23 @@ impl host_network::HostDiscoverySocket for PluginState {
         if data.len() > MAX_SEND {
             return Err(ErrorCode::DatagramTooLarge);
         }
-        if let Err(denial) = self
+        let broadcast = match self
             .network
             .check_discovery_send(addr, interface_networks().as_deref())
         {
-            return Err(self.refuse("send", &addr.to_string(), &denial));
-        }
+            Ok(broadcast) => broadcast,
+            Err(denial) => return Err(self.refuse("send", &addr.to_string(), &denial)),
+        };
         let socket = &self.discovery_socket(&this)?.socket;
-        // Straight to the non-blocking socket: tokio's `try_send_to`
-        // answers `would-block` until the reactor has first seen the new
-        // socket writable, which would lose a probe sent right after
-        // `open`. Readiness is only ever awaited for reads.
-        match socket2::SockRef::from(socket).send_to(&data, &addr.into()) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(error_code(&e)),
+        if broadcast {
+            socket.set_broadcast(true).map_err(|e| error_code(&e))?;
         }
+        let sent = socket.send_to(&data, addr);
+        if broadcast {
+            // Off again, or the socket stays unusable for this check.
+            socket.set_broadcast(false).map_err(|e| error_code(&e))?;
+        }
+        sent.map(|_| ()).map_err(|e| error_code(&e))
     }
 
     async fn receive(
@@ -366,7 +389,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut discarded = 0;
         while out.len() < max && discarded < MAX_DISCARDS {
-            match socket.socket.try_recv_from(&mut buf) {
+            match socket.socket.recv_from(&mut buf) {
                 Ok((n, from)) if socket.admits(from) => out.push(Datagram {
                     data: buf[..n].to_vec(),
                     remote_address: addr_to_wit(from),
@@ -425,14 +448,14 @@ mod tests {
 
     #[tokio::test]
     async fn ephemeral_and_shared_ports_bind() {
-        let socket = bind(false, 0).unwrap();
+        let (socket, _) = bind(false, 0).unwrap();
         assert_ne!(socket.local_addr().unwrap().port(), 0);
         // Two sockets share a fixed port, as one does with the system's
         // mDNS responder.
         let port = socket.local_addr().unwrap().port();
         drop(socket);
-        let first = bind(false, port).unwrap();
-        let second = bind(false, port).unwrap();
+        let (first, _) = bind(false, port).unwrap();
+        let (second, _) = bind(false, port).unwrap();
         assert_eq!(first.local_addr().unwrap().port(), port);
         assert_eq!(second.local_addr().unwrap().port(), port);
     }
@@ -446,14 +469,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_send_right_after_bind_goes_out() {
+    async fn sends_and_receives_need_no_reactor_turn() {
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let socket = bind(false, 0).unwrap();
-        socket2::SockRef::from(&socket)
-            .send_to(b"hi", &peer.local_addr().unwrap().into())
-            .unwrap();
+        let (socket, _readiness) = bind(false, 0).unwrap();
+        socket.send_to(b"hi", peer.local_addr().unwrap()).unwrap();
         let mut buf = [0u8; 2];
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(peer.recv_from(&mut buf).unwrap().0, 2);
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(n, 2);
+        peer.send_to(b"ok", from).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, _)) => break assert_eq!(&buf[..n], b"ok"),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "no datagram");
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_is_off_unless_a_send_turns_it_on() {
+        let (socket, _readiness) = bind(false, 0).unwrap();
+        let err = socket.send_to(b"x", "255.255.255.255:9").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
     }
 }

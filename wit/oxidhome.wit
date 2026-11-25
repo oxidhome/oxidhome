@@ -1626,7 +1626,8 @@ interface host-network {
     /// 65535 bytes are truncated.
     receive: func(max-results: u32) -> result<list<datagram>, error-code>;
 
-    /// Ready when a datagram the rules allow is waiting.
+    /// Ready when a datagram the rules allow is waiting. The pollable is
+    /// a child of the socket: drop it first.
     subscribe: func() -> pollable;
   }
 }

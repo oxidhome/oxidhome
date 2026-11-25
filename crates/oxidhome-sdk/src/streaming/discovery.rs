@@ -233,7 +233,8 @@ impl DiscoverySocket {
     }
 
     /// A pollable that is ready when a datagram is waiting (for
-    /// `wasi:io/poll`).
+    /// `wasi:io/poll`). Drop it before the socket: as with any WASI
+    /// pollable, dropping a socket that still has one traps.
     #[must_use]
     pub fn subscribe(&self) -> Pollable {
         self.inner.subscribe()

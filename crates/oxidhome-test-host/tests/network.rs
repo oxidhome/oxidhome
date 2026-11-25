@@ -652,12 +652,18 @@ async fn network_discovery_example_publishes_replies() {
 
 // ── Discovery (Phase 8.3) ────────────────────────────────────────
 
-/// A free UDP port on loopback (bound and released).
+/// A free UDP port on loopback (bound and released), below 65535 so the
+/// next one up is a port too.
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("free port")
-        .port()
+    loop {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("free port")
+            .port();
+        if port < u16::MAX {
+            return port;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -672,7 +678,7 @@ async fn discovery_sockets_reach_broadcast_and_multicast_only_through_named_rule
     ];
     let ops = [
         format!("disc-send 255.255.255.255:{port}"),
-        format!("disc-send 255.255.255.255:{}", port.wrapping_add(1)),
+        format!("disc-send 255.255.255.255:{}", port + 1),
         "disc-send 239.255.255.250:1900".to_owned(),
         // `std::net` sockets never reach broadcast, whatever the rules.
         format!("udp 255.255.255.255:{port}"),
@@ -680,7 +686,7 @@ async fn discovery_sockets_reach_broadcast_and_multicast_only_through_named_rule
         "disc-join 239.255.255.250".to_owned(),
         "disc-join 192.168.1.1".to_owned(),
         format!("disc-bind {port}"),
-        format!("disc-bind {}", port.wrapping_add(1)),
+        format!("disc-bind {}", port + 1),
     ];
     let results = probe(&host, "disc", &rules, &ops).await;
     // Allowed by the policy; a machine without a route for broadcast
@@ -705,7 +711,7 @@ async fn discovery_sockets_reach_broadcast_and_multicast_only_through_named_rule
     assert_eq!(results[8], "err:PermissionDenied");
     wait_for_deny(&host, "send", "disc", "239.255.255.250:1900").await;
     wait_for_deny(&host, "join", "disc", "239.255.255.250").await;
-    wait_for_deny(&host, "bind", "disc", &format!(":{}", port.wrapping_add(1))).await;
+    wait_for_deny(&host, "bind", "disc", &format!(":{}", port + 1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
