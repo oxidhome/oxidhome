@@ -260,11 +260,11 @@ pub async fn change_network_grant(
         );
         // Only a change to what instances get needs a restart.
         let before = NetworkGrants::new(&row.requested_network, &row.granted_capabilities.network);
-        let same = |a: &[NetworkRule], b: &[NetworkRule]| {
-            a.iter().all(|r| b.contains(r)) && b.iter().all(|r| a.contains(r))
-        };
-        let (restarted, not_restarted) = if same(&before.effective, &change.network.effective) {
-            (Vec::new(), Vec::new())
+        let (restarted, not_restarted) = if same_rules(&before.effective, &change.network.effective)
+        {
+            // Nothing to restart, but an instance an earlier change
+            // still waits on is still running under the old rules.
+            (Vec::new(), still_stopping(&engine, &plugin_id))
         } else {
             restart_instances(&engine, &plugin_id, &row).await
         };
@@ -279,6 +279,38 @@ pub async fn change_network_grant(
     .map_err(|e| {
         NetworkGrantError::Unavailable(task_plugin_id, format!("grant task failed: {e}"))
     })?
+}
+
+/// Whether two effective rule lists grant the same, ignoring order and
+/// case (the policy compares names case-insensitively).
+fn same_rules(a: &[NetworkRule], b: &[NetworkRule]) -> bool {
+    let canonical = |rules: &[NetworkRule]| {
+        let mut out: Vec<String> = rules
+            .iter()
+            .map(|r| r.to_string().to_ascii_lowercase())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    };
+    canonical(a) == canonical(b)
+}
+
+/// Top-level instances of `plugin_id` asked to stop that haven't been
+/// reaped yet.
+fn still_stopping(engine: &crate::Engine, plugin_id: &str) -> Vec<NotRestarted> {
+    engine
+        .instances()
+        .list()
+        .into_iter()
+        .filter(|h| {
+            h.plugin_id() == plugin_id && h.parent_instance_id().is_none() && h.stop_requested()
+        })
+        .map(|h| NotRestarted {
+            instance_id: h.instance_id().to_owned(),
+            reason: "still stopping; start it again once stopped".to_owned(),
+        })
+        .collect()
 }
 
 /// What a grant change found an instance doing before it stopped it.
@@ -347,43 +379,50 @@ async fn restart_instances(
             instance_id,
         })
         .collect();
-    // Start them all, then wait for them together under one deadline,
-    // so one slow `init` doesn't hold the others down.
+    // Start them all, then wait for them together, under one deadline
+    // that covers the starts too, so one slow instance doesn't hold the
+    // others down.
+    let deadline = tokio::time::Instant::now() + RESTART_WAIT_LIMIT;
     let mut starting = Vec::new();
     for instance_id in report.stopped {
         let Some(Before::Running(config)) = plan.remove(&instance_id) else {
             continue;
         };
-        match engine
-            .start_installed_instance(
-                row.path.clone(),
-                instance_id.clone(),
-                config,
-                std::sync::Arc::clone(&row.installation_uuid),
-            )
-            .await
-        {
-            Ok(handle) => starting.push(handle),
-            Err(err) => not_restarted.push(NotRestarted {
+        let start = engine.start_installed_instance(
+            row.path.clone(),
+            instance_id.clone(),
+            config,
+            std::sync::Arc::clone(&row.installation_uuid),
+        );
+        match tokio::time::timeout_at(deadline, start).await {
+            Ok(Ok(handle)) => starting.push(handle),
+            Ok(Err(err)) => not_restarted.push(NotRestarted {
                 instance_id,
                 reason: format!("restart failed: {err:#}"),
             }),
+            Err(_) => not_restarted.push(NotRestarted {
+                instance_id,
+                reason: format!(
+                    "not started {} s after the stop; start it again",
+                    RESTART_WAIT_LIMIT.as_secs()
+                ),
+            }),
         }
     }
-    let (mut restarted, failed) = wait_running(starting).await;
+    let (mut restarted, failed) = wait_running(starting, deadline).await;
     not_restarted.extend(failed);
     restarted.sort();
     not_restarted.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
     (restarted, not_restarted)
 }
 
-/// Wait for `starting` to run, together, until [`RESTART_WAIT_LIMIT`]:
+/// Wait for `starting` to run, together, until `deadline`:
 /// the ones that did, and the ones that failed or are still starting.
 async fn wait_running(
     starting: Vec<crate::runtime::InstanceHandle>,
+    deadline: tokio::time::Instant,
 ) -> (Vec<String>, Vec<NotRestarted>) {
     let mut not_restarted = Vec::new();
-    let deadline = tokio::time::Instant::now() + RESTART_WAIT_LIMIT;
     let mut waits = tokio::task::JoinSet::new();
     for handle in starting {
         waits.spawn(async move {
@@ -472,13 +511,35 @@ mod tests {
         };
         let detail = serde_json::json!({
             "installation": "inst-0123",
-            "old": ["tcp://192.168.0.0/16:554", "https://api.example.com"],
-            "new": ["tcp://192.168.1.20:554"],
+            "old": ["https://api.example.com"],
+            "new": [],
         })
         .to_string();
         for id in ["com.example.secret", "acme.api_token", "x.password"] {
             let path = audit_path(&by, id, false, &detail);
             assert_eq!(crate::redact::scrub_text(&path), path, "{id}");
         }
+        // A rule naming a sensitive-looking host keeps its port.
+        let rule = |r: &str| r.parse::<NetworkRule>().unwrap();
+        let change = NetworkGrantChange {
+            installation_uuid: "inst-0123".into(),
+            old: vec![rule("tcp://secrets.lan:*")],
+            network: NetworkGrants::new(
+                &[rule("tcp://secrets.lan:*")],
+                &[rule("tcp://secrets.lan:1883")],
+            ),
+        };
+        let path = audit_path(&by, "x.y", false, &change.audit_detail());
+        assert_eq!(crate::redact::scrub_text(&path), path);
+        let detail: serde_json::Value =
+            serde_json::from_str(path.splitn(3, '/').nth(2).unwrap()).unwrap();
+        assert_eq!(
+            detail,
+            serde_json::json!({
+                "installation": "inst-0123",
+                "old": [rule("tcp://secrets.lan:*").to_string()],
+                "new": ["tcp://secrets.lan:1883"],
+            })
+        );
     }
 }

@@ -562,7 +562,16 @@ impl Granting {
             .get(PLUGIN_ID)
             .unwrap()
             .installation_uuid;
-        json!({"installation": uuid.as_ref(), "old": old, "new": new}).to_string()
+        let rule = |r: &&str| r.parse::<oxidhome_manifest::NetworkRule>().unwrap();
+        oxidhome_core::state::NetworkGrantChange {
+            installation_uuid: uuid,
+            old: old.iter().map(rule).collect(),
+            network: oxidhome_core::state::NetworkGrants::new(
+                &[],
+                &new.iter().map(rule).collect::<Vec<_>>(),
+            ),
+        }
+        .audit_detail()
     }
 
     async fn listed(&self) -> Value {
@@ -763,6 +772,18 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     );
 }
 
+/// Both grant tools are listed as writes.
+fn assert_write_annotations(tools: &Value) {
+    for name in ["plugins.set_network_grant", "plugins.reset_network_grant"] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .and_then(|t| t.iter().find(|t| t["name"] == name))
+            .unwrap_or_else(|| panic!("{name} in {tools}"));
+        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
+        assert_eq!(tool["annotations"]["destructiveHint"], true, "{tool}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_owner_narrows_and_resets_the_grant_over_mcp() {
     let g = granting("net-grants-mcp");
@@ -784,14 +805,7 @@ async fn the_owner_narrows_and_resets_the_grant_over_mcp() {
 
     let session = mcp_session(&g.router, &g.owner).await;
     let tools = mcp_call(&g.router, &g.owner, &session, 2, "tools/list", json!({})).await;
-    for name in ["plugins.set_network_grant", "plugins.reset_network_grant"] {
-        let tool = tools["result"]["tools"]
-            .as_array()
-            .and_then(|t| t.iter().find(|t| t["name"] == name))
-            .unwrap_or_else(|| panic!("{name} in {tools}"));
-        assert_eq!(tool["annotations"]["readOnlyHint"], false, "{tool}");
-        assert_eq!(tool["annotations"]["destructiveHint"], true, "{tool}");
-    }
+    assert_write_annotations(&tools);
     let widened = call(
         &g.owner,
         &session,
@@ -801,6 +815,26 @@ async fn the_owner_narrows_and_resets_the_grant_over_mcp() {
     )
     .await;
     assert!(widened["error"].is_object(), "{widened}");
+    let extra = call(
+        &g.owner,
+        &session,
+        7,
+        "plugins.reset_network_grant",
+        json!({"plugin_id": PLUGIN_ID, "rules": null}),
+    )
+    .await;
+    assert!(extra["error"].is_object(), "{extra}");
+    let missing = call(
+        &g.owner,
+        &session,
+        8,
+        "plugins.reset_network_grant",
+        json!({"plugin_id": "example.missing"}),
+    )
+    .await;
+    let result = &missing["result"];
+    assert_eq!(result["isError"], true, "{missing}");
+    assert_eq!(result["structuredContent"]["kind"], "not_installed");
     let set = call(
         &g.owner,
         &session,

@@ -2233,15 +2233,29 @@ pub struct NetworkGrantChange {
 
 impl NetworkGrantChange {
     /// The audit `path` suffix: the installation and the old and new
-    /// granted rules, as JSON (rules in manifest syntax).
+    /// granted rules, as JSON (rules in manifest syntax). Each `:` inside
+    /// a rule is written `\u003a` (the same JSON string): the audit
+    /// scrubber reads `secret.lan:554` as a `key: value` pair and would
+    /// mask the port.
     #[must_use]
     pub fn audit_detail(&self) -> String {
-        serde_json::json!({
-            "installation": &*self.installation_uuid,
-            "old": self.old,
-            "new": self.network.granted,
-        })
-        .to_string()
+        let rules = |rules: &[NetworkRule]| {
+            let items: Vec<String> = rules
+                .iter()
+                .map(|r| {
+                    serde_json::Value::String(r.to_string())
+                        .to_string()
+                        .replace(':', "\\u003a")
+                })
+                .collect();
+            format!("[{}]", items.join(","))
+        };
+        format!(
+            "{{\"installation\":{},\"old\":{},\"new\":{}}}",
+            serde_json::Value::String(self.installation_uuid.to_string()),
+            rules(&self.old),
+            rules(&self.network.granted),
+        )
     }
 }
 

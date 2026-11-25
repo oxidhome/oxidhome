@@ -1230,6 +1230,12 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         request: ServiceRequest<'_, pb_grant::SetPluginNetworkGrantRequest>,
     ) -> ServiceResult<impl Encodable<pb_grant::SetPluginNetworkGrantResponse> + Send + use<'a>>
     {
+        // Owner only: refuse others before copying the rule list.
+        require_connect(
+            &ctx,
+            Action::PolicyManage,
+            &Resource::pre_check(ResourceKind::Plugin),
+        )?;
         let req = request.to_owned_message();
         let change = self
             .change_network_grant(&ctx, req.plugin_id, Some(&req.rules))
