@@ -344,7 +344,7 @@ fn store(tokens: &TokenStore, token_id: &str, policy: &TokenPolicy) -> anyhow::R
     }
 }
 
-/// The stores the offline `token` / `device` / `tls-pin` / `plugin` commands touch, opened
+/// The stores the offline `token` / `device` / `tls-pin` commands touch, opened
 /// straight on the database: no engine, so listing tokens or raising
 /// a category doesn't run engine startup (device-state revision bump,
 /// pending-command resolution) while the daemon is stopped.
@@ -357,9 +357,6 @@ pub struct OfflineStores {
     pub devices: crate::state::DeviceMetaStore,
     /// The `network_tls_pin` table (Phase 8.2).
     pub tls_pins: crate::state::TlsPinStore,
-    /// The database itself, for read-only listings that have no store
-    /// of their own (`oxidhome plugin list`).
-    pub db: std::sync::Arc<crate::state::Db>,
 }
 
 /// Run `op` against the stores of the database under `state_dir`,
@@ -372,6 +369,32 @@ pub struct OfflineStores {
 pub fn with_offline_stores<T>(
     state_dir: &Path,
     op: impl FnOnce(&OfflineStores) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_offline_db(state_dir, |db| {
+        let db = std::sync::Arc::new(db);
+        let stores = OfflineStores {
+            tokens: TokenStore::new(std::sync::Arc::clone(&db)),
+            audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
+            devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
+                .context("reading device_meta")?,
+            tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
+        };
+        op(&stores)
+    })
+}
+
+/// Run `op` against the bare database under `state_dir`, with the same
+/// lock and schema check as [`with_offline_stores`] but no stores
+/// loaded: for read-only listings that have none (`oxidhome plugin
+/// list`).
+///
+/// # Errors
+///
+/// No database, the lock is held, the database won't open, or `op`
+/// failed.
+pub fn with_offline_db<T>(
+    state_dir: &Path,
+    op: impl FnOnce(crate::state::Db) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     if !state_dir.join(crate::state::db::DB_FILE_NAME).exists() {
         anyhow::bail!(
@@ -396,20 +419,9 @@ pub fn with_offline_stores<T>(
             crate::state::db::schema_version(),
         );
     }
-    let db = std::sync::Arc::new(
-        crate::state::Db::open_file(state_dir)
-            .with_context(|| format!("opening the database under {}", state_dir.display()))?,
-    );
-    let stores = OfflineStores {
-        tokens: TokenStore::new(std::sync::Arc::clone(&db)),
-        audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
-        devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
-            .context("reading device_meta")?,
-        tls_pins: crate::state::TlsPinStore::open(std::sync::Arc::clone(&db))
-            .context("reading TLS pins")?,
-        db,
-    };
-    op(&stores)
+    let db = crate::state::Db::open_file(state_dir)
+        .with_context(|| format!("opening the database under {}", state_dir.display()))?;
+    op(db)
 }
 
 /// Set (or with `None` clear) the operator's category raise for

@@ -94,7 +94,7 @@ use oxidhome_core::api::mcp::{
 use oxidhome_core::api::network_admin::reset_tls_pins;
 use oxidhome_core::api::sensitive_admin::{
     grant_sensitive, revoke_sensitive, sensitive_access_report, set_device_category,
-    with_offline_stores,
+    with_offline_db, with_offline_stores,
 };
 use oxidhome_core::api::{
     ApiConfig, RevokeScope, bind, ensure_admin_token, reconcile_admin_token_files,
@@ -878,11 +878,10 @@ fn parse_token_create(
 fn run_device() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome device set-category <dev-id> <category>|--clear\n\
          categories: alarm lock opener camera light climate media switch sensor other";
-    // `args_os`: a non-UTF-8 argument is a usage error, not a panic.
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
+    let args: Vec<String> = std::env::args().skip(2).collect();
     match args
         .iter()
-        .map(|a| a.to_str().unwrap_or("\u{fffd}"))
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .as_slice()
     {
@@ -999,15 +998,19 @@ const PLUGIN_USAGE: &str = "usage: oxidhome plugin list";
 
 /// Phase 8.5: `oxidhome plugin list`. Offline and read-only.
 fn run_plugin() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(2).collect();
+    // `args_os`: a non-UTF-8 argument is a usage error, not a panic.
+    let args: Vec<Option<String>> = std::env::args_os()
+        .skip(2)
+        .map(|a| a.into_string().ok())
+        .collect();
     match args
         .iter()
-        .map(String::as_str)
+        .map(Option::as_deref)
         .collect::<Vec<_>>()
         .as_slice()
     {
-        ["list"] => {}
-        ["-h" | "--help"] => {
+        [Some("list")] => {}
+        [Some("-h" | "--help")] => {
             println!("{PLUGIN_USAGE}");
             return Ok(());
         }
@@ -1015,8 +1018,8 @@ fn run_plugin() -> anyhow::Result<()> {
     }
     init_cli_tracing();
     let state_dir = resolve_state_dir()?;
-    let plugins = with_offline_stores(&state_dir, |stores| {
-        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), &stores.db)
+    let plugins = with_offline_db(&state_dir, |db| {
+        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), &db)
     })?;
     print!("{}", format_plugin_list(&plugins));
     Ok(())
@@ -1027,7 +1030,10 @@ fn run_plugin() -> anyhow::Result<()> {
 fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        // Bidirectional formatting characters aren't `is_control`, but
+        // reorder what a terminal shows.
+        let bidi = matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if c.is_control() || bidi {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -1546,5 +1552,6 @@ mod tests {
             "tcp://a\\u{1b}[2Jb.lan:1"
         );
         assert_eq!(printable("plain"), "plain");
+        assert_eq!(printable("a\u{202e}b"), "a\\u{202e}b");
     }
 }
