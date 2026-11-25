@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use wasmtime::component::{HasSelf, Linker, Resource};
 
-use super::policy::{Denial, MAX_SOCKETS, NetworkPolicy, Use};
+use super::policy::{Denial, LocalInterface, MAX_SOCKETS, NetworkPolicy, Use};
 use crate::host_impl::streaming_plugin::oxidhome::plugin::host_network::{
     self, Datagram, LocalNetwork,
 };
@@ -54,6 +54,8 @@ const MULTICAST_HOPS: u32 = 1;
 pub struct DiscoverySocket {
     socket: std::net::UdpSocket,
     readiness: tokio::net::UdpSocket,
+    /// Where `ready` peeks at a waiting datagram's sender.
+    peek_buf: Box<[u8]>,
     ipv6: bool,
     policy: Arc<NetworkPolicy>,
 }
@@ -76,15 +78,17 @@ impl wasmtime_wasi::p2::Pollable for DiscoverySocket {
             }
             // Through `try_io`, so a `would-block` clears the readiness
             // tokio cached.
+            // A whole-datagram buffer: some systems refuse a zero-length
+            // read, and Windows fails a peek that would truncate.
             let socket = &self.socket;
+            let buf = &mut self.peek_buf;
             match self.readiness.try_io(tokio::io::Interest::READABLE, || {
-                socket.peek_from(&mut [0u8; 1]).map(|(_, from)| from)
+                socket.peek_from(buf).map(|(_, from)| from)
             }) {
                 Ok(from) if self.admits(from) => return,
                 Ok(_) => {
-                    // Dropped unread (a one-byte read truncates it; some
-                    // systems refuse a zero-length one).
-                    let _ = self.socket.recv_from(&mut [0u8; 1]);
+                    // Dropped unread.
+                    let _ = self.socket.recv_from(&mut self.peek_buf);
                     discarded += 1;
                     if discarded.is_multiple_of(DISCARDS_PER_YIELD) {
                         tokio::task::yield_now().await;
@@ -103,35 +107,46 @@ pub(super) fn add_to_linker(linker: &mut Linker<PluginState>) -> anyhow::Result<
     Ok(())
 }
 
-/// The host's interface networks, reused for [`INTERFACES_TTL`]. `None`
-/// when they can't be listed (not cached, so the next call retries).
-fn interface_networks() -> Option<Arc<[IpNet]>> {
+/// The host's interfaces, listed now: what a send is checked against,
+/// so an interface change is seen at once.
+fn list_interfaces() -> std::io::Result<Vec<LocalInterface>> {
+    Ok(if_addrs::get_if_addrs()?
+        .iter()
+        .filter_map(|iface| {
+            let (ip, prefix, broadcast) = match &iface.addr {
+                if_addrs::IfAddr::V4(v4) => (
+                    IpAddr::V4(v4.ip),
+                    v4.prefixlen,
+                    v4.broadcast.map(IpAddr::V4),
+                ),
+                if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen, None),
+            };
+            let net = IpNet::new(ip, prefix).ok()?.trunc();
+            Some(LocalInterface { net, broadcast })
+        })
+        .collect())
+}
+
+/// The host's interface networks for `local-networks`, reused for
+/// [`INTERFACES_TTL`]. A failed listing is reused too (as no networks),
+/// so a plugin calling in a loop neither repeats it nor floods the log.
+fn interface_networks() -> Arc<[IpNet]> {
     static CACHE: Mutex<Option<(Instant, Arc<[IpNet]>)>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((at, nets)) = cache.as_ref()
         && at.elapsed() < INTERFACES_TTL
     {
-        return Some(Arc::clone(nets));
+        return Arc::clone(nets);
     }
-    let interfaces = match if_addrs::get_if_addrs() {
-        Ok(interfaces) => interfaces,
+    let nets: Arc<[IpNet]> = match list_interfaces() {
+        Ok(interfaces) => interfaces.iter().map(|iface| iface.net).collect(),
         Err(e) => {
             tracing::warn!(target: "host.network", error = %e, "listing network interfaces failed");
-            return None;
+            Arc::from([])
         }
     };
-    let nets: Arc<[IpNet]> = interfaces
-        .iter()
-        .filter_map(|iface| {
-            let (ip, prefix) = match &iface.addr {
-                if_addrs::IfAddr::V4(v4) => (IpAddr::V4(v4.ip), v4.prefixlen),
-                if_addrs::IfAddr::V6(v6) => (IpAddr::V6(v6.ip), v6.prefixlen),
-            };
-            IpNet::new(ip, prefix).ok().map(|net| net.trunc())
-        })
-        .collect();
     *cache = Some((Instant::now(), Arc::clone(&nets)));
-    Some(nets)
+    nets
 }
 
 fn ip_from_wit(ip: IpAddress) -> IpAddr {
@@ -274,7 +289,7 @@ impl PluginState {
 
 impl host_network::Host for PluginState {
     async fn local_networks(&mut self) -> Vec<LocalNetwork> {
-        let interfaces = interface_networks().unwrap_or_else(|| Arc::from([]));
+        let interfaces = interface_networks();
         self.network
             .local_networks(&interfaces)
             .into_iter()
@@ -304,6 +319,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         let socket = DiscoverySocket {
             socket,
             readiness,
+            peek_buf: vec![0u8; MAX_DATAGRAM].into_boxed_slice(),
             ipv6,
             policy: Arc::clone(&self.network),
         };
@@ -359,9 +375,16 @@ impl host_network::HostDiscoverySocket for PluginState {
         if data.len() > MAX_SEND {
             return Err(ErrorCode::DatagramTooLarge);
         }
+        // Listed per send (IPv4 only: IPv6 has no broadcast), so the
+        // check sees the interfaces as they are now.
+        let interfaces = if addr.is_ipv4() {
+            list_interfaces().ok()
+        } else {
+            Some(Vec::new())
+        };
         let broadcast = match self
             .network
-            .check_discovery_send(addr, interface_networks().as_deref())
+            .check_discovery_send(addr, interfaces.as_deref())
         {
             Ok(broadcast) => broadcast,
             Err(denial) => return Err(self.refuse("send", &addr.to_string(), &denial)),
@@ -375,7 +398,15 @@ impl host_network::HostDiscoverySocket for PluginState {
             // Off again, or the socket stays unusable for this check.
             socket.set_broadcast(false).map_err(|e| error_code(&e))?;
         }
-        sent.map(|_| ()).map_err(|e| error_code(&e))
+        match sent {
+            Ok(_) => Ok(()),
+            // The kernel refused a broadcast the policy saw as unicast
+            // (an address the interface list didn't show as one).
+            Err(e) if !broadcast && e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(self.refuse("send", &addr.to_string(), &Denial::UnlistedBroadcast(addr)))
+            }
+            Err(e) => Err(error_code(&e)),
+        }
     }
 
     async fn receive(
@@ -462,9 +493,10 @@ mod tests {
 
     #[test]
     fn interfaces_are_listed_and_cached() {
-        let first = interface_networks().expect("interfaces");
-        let second = interface_networks().expect("interfaces");
+        let first = interface_networks();
+        let second = interface_networks();
         assert!(Arc::ptr_eq(&first, &second));
+        assert!(!list_interfaces().expect("interfaces").is_empty());
         assert!(first.iter().all(|net| *net == net.trunc()));
     }
 

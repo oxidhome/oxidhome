@@ -74,6 +74,25 @@ pub(crate) const MAX_RESOLVED: usize = 1024;
 pub(crate) const MAX_LOOKUP_RESULTS: usize = 32;
 /// Most networks `local-networks` lists.
 pub(crate) const MAX_LOCAL_NETWORKS: usize = 64;
+
+/// One of the host's interface networks, as a discovery send sees it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalInterface {
+    /// The network (truncated to its prefix).
+    pub(crate) net: IpNet,
+    /// The broadcast address the interface is configured with, when the
+    /// system reports one: the kernel treats it as a broadcast too.
+    pub(crate) broadcast: Option<IpAddr>,
+}
+
+impl From<IpNet> for LocalInterface {
+    fn from(net: IpNet) -> Self {
+        Self {
+            net,
+            broadcast: None,
+        }
+    }
+}
 /// Longest DNS name, without the root dot.
 const MAX_NAME_LEN: usize = 253;
 /// Audited denials allowed in a burst, per instance.
@@ -157,6 +176,8 @@ pub(crate) enum Denial {
     DiscoveryPort(u16),
     #[error("the host's networks couldn't be listed, so {0} may be a broadcast address")]
     InterfacesUnknown(SocketAddr),
+    #[error("the system treats {0} as a broadcast address the host's network list didn't show")]
+    UnlistedBroadcast(SocketAddr),
 }
 
 /// The per-instance policy object. Shared (`Arc`) between the socket
@@ -714,7 +735,7 @@ impl NetworkPolicy {
     pub(crate) fn check_discovery_send(
         &self,
         addr: SocketAddr,
-        local: Option<&[IpNet]>,
+        local: Option<&[LocalInterface]>,
     ) -> Result<bool, Denial> {
         let ip = addr.ip().to_canonical();
         let port = addr.port();
@@ -736,11 +757,16 @@ impl NetworkPolicy {
                 self.check_addr(Use::Udp, addr, None).map(|()| false)
             };
         };
-        // Every network it is the broadcast address of (overlapping
-        // interface networks can share one) must be covered whole.
+        // Every network it is a broadcast address of (computed or
+        // configured; overlapping interface networks can share one) must
+        // be covered whole.
         let mut nets = local
             .iter()
-            .filter(|net| directed_broadcast(net) == Some(ip))
+            .filter(|iface| {
+                directed_broadcast(&iface.net) == Some(ip)
+                    || iface.broadcast.map(|b| b.to_canonical()) == Some(ip)
+            })
+            .map(|iface| &iface.net)
             .peekable();
         if nets.peek().is_some() {
             if classify(ip) == AddressClass::Forbidden {
@@ -766,7 +792,7 @@ impl NetworkPolicy {
     /// Joining the multicast `group`: a `udp` rule must name it.
     pub(crate) fn check_join(&self, group: IpAddr) -> Result<(), Denial> {
         let group = group.to_canonical();
-        if is_group_address(group) && self.rules.iter().any(|r| r.names_group(group)) {
+        if group.is_multicast() && self.rules.iter().any(|r| r.names_group(group)) {
             Ok(())
         } else {
             Err(Denial::Join(group))
@@ -1573,6 +1599,10 @@ mod tests {
         list.iter().map(|n| n.parse().expect("net")).collect()
     }
 
+    fn ifaces(list: &[&str]) -> Vec<LocalInterface> {
+        nets(list).into_iter().map(LocalInterface::from).collect()
+    }
+
     #[test]
     fn groups_need_a_udp_rule_naming_them() {
         let p = policy(&[
@@ -1634,7 +1664,7 @@ mod tests {
 
     #[test]
     fn subnet_broadcasts_need_the_whole_network() {
-        let local = nets(&["192.168.1.0/24", "10.0.0.2/31", "198.18.0.0/24"]);
+        let local = ifaces(&["192.168.1.0/24", "10.0.0.2/31", "198.18.0.0/24"]);
         let whole = policy(&["udp://192.168.0.0/16:9999"]);
         assert!(
             whole
@@ -1659,7 +1689,24 @@ mod tests {
         );
         // Overlapping networks sharing a broadcast address must all be
         // covered, whatever the order they are listed in.
-        let overlapping = nets(&["192.168.1.128/25", "192.168.1.0/24"]);
+        let overlapping = ifaces(&["192.168.1.128/25", "192.168.1.0/24"]);
+        // A configured broadcast address counts as the network's too.
+        let configured = [
+            LocalInterface::from("192.168.1.0/24".parse::<IpNet>().unwrap()),
+            LocalInterface {
+                net: "10.9.0.0/16".parse().unwrap(),
+                broadcast: Some("192.168.1.255".parse().unwrap()),
+            },
+        ];
+        let lan = policy(&["udp://192.168.1.0/24:9999"]);
+        assert!(
+            lan.check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
+                .is_ok()
+        );
+        assert!(
+            lan.check_discovery_send(sa("192.168.1.255:9999"), Some(&configured))
+                .is_err()
+        );
         assert!(
             half.check_discovery_send(sa("192.168.1.255:9999"), Some(&overlapping))
                 .is_err()
@@ -1685,7 +1732,7 @@ mod tests {
         );
         // A public-looking network holding a forbidden block isn't
         // covered by public space.
-        let mixed = nets(&["198.16.0.0/14"]);
+        let mixed = ifaces(&["198.16.0.0/14"]);
         assert!(
             public
                 .check_discovery_send(sa("198.19.255.255:9999"), Some(&mixed))

@@ -67,7 +67,8 @@ broadcast or multicast address. On a discovery socket:
   naming the address (which a partial range covers in grant narrowing), doesn't do. When the host can't list its
   networks, every IPv4 destination but a named group is refused. `SO_BROADCAST` is set only for the duration of a send
   the policy approved as a broadcast, so a destination the kernel treats as one and the policy didn't (a network's
-  first address on BSD, an interface change the 2-second interface cache missed) fails instead of reaching the link.
+  first address on BSD, an interface that changed in between) fails, and is audited, instead of reaching the link. The
+  interfaces are listed for each send, with the broadcast address each is configured with counting as its network's.
 - Every other destination is checked as a UDP send. Datagrams from senders a UDP send couldn't reach are dropped,
   by `receive` and while the socket waits for readiness, so a flood from a refused sender never wakes the plugin.
   Devices answer a broadcast from their own address, so a plugin needs a rule for them too.
