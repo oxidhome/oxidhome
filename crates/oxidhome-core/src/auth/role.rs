@@ -396,7 +396,10 @@ impl RoleDef {
         }
         let mut deny = Vec::with_capacity(wire.deny.len());
         for d in wire.deny {
-            deny.push(d.into_deny()?);
+            let rule = d.into_deny()?;
+            if !rule.is_void() {
+                deny.push(rule);
+            }
         }
         Some(Self {
             id: id.to_owned(),
@@ -441,8 +444,10 @@ impl SelectorWire {
     /// it could never match. One narrowed to devices drops `service.call`
     /// instead of refusing: the admin surfaces stored a narrowed `*` as
     /// every action name before slice 4, and a device selector never
-    /// matched a service then either. A narrowed `*` means what the
-    /// selector can match.
+    /// matched a service then either. A rule left with no action never
+    /// matched anything: callers drop it ([`DenyRule::is_void`]), since
+    /// written back as `"actions": []` it would not read again. A
+    /// narrowed `*` means what the selector can match.
     pub(crate) fn into_deny(self) -> Option<DenyRule> {
         let wildcard = self.actions.iter().any(|a| a == "*");
         let (actions, categories, devices, services) = self.into_parts()?;
@@ -524,7 +529,10 @@ pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
 /// `true` for a service pattern: `<plugin>` or `<plugin>/<local-id>`,
 /// each half non-empty, literal or `prefix*` (`*` alone is every
 /// plugin), without control characters, at most
-/// [`MAX_SERVICE_PATTERN_BYTES`].
+/// [`MAX_SERVICE_PATTERN_BYTES`]. The plugin half uses plugin-id
+/// characters only. A trailing `*` is always a prefix and `/` always
+/// splits, so a service whose `local-id` ends in `*` or contains `/`
+/// can be named exactly only by its plugin (`<plugin>`).
 #[must_use]
 pub fn is_service_pattern(pattern: &str) -> bool {
     let well_formed = |half: &str| {
@@ -532,12 +540,22 @@ pub fn is_service_pattern(pattern: &str) -> bool {
             && !half.contains('/')
             && half.find('*').is_none_or(|i| i == half.len() - 1)
     };
+    // A plugin id is reverse-DNS (`[a-z0-9.-]`); a half that can't be
+    // one would never match.
+    let plugin_chars = |half: &str| {
+        half.trim_end_matches('*')
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+    };
+    let (plugin, service) = match pattern.split_once('/') {
+        Some((plugin, service)) => (plugin, Some(service)),
+        None => (pattern, None),
+    };
     pattern.len() <= MAX_SERVICE_PATTERN_BYTES
         && !pattern.chars().any(char::is_control)
-        && match pattern.split_once('/') {
-            Some((plugin, service)) => well_formed(plugin) && well_formed(service),
-            None => well_formed(pattern),
-        }
+        && well_formed(plugin)
+        && plugin_chars(plugin)
+        && service.is_none_or(well_formed)
 }
 
 /// Does service pattern `pattern` cover `service`? The plugin half
@@ -656,6 +674,12 @@ pub struct DenyRule {
 }
 
 impl DenyRule {
+    /// `true` when the rule names no action, so it matches nothing.
+    #[must_use]
+    pub fn is_void(&self) -> bool {
+        self.actions.is_empty()
+    }
+
     /// `true` when this rule refuses `action` on `resource`.
     #[must_use]
     pub fn matches(&self, action: Action, resource: &Resource) -> bool {
@@ -823,6 +847,8 @@ mod tests {
             "**",
             "acme/x*y",
             "acme/inst/bouncer",
+            "acme.notify /send",
+            "Acme/send",
             "a\nb",
             long.as_str(),
         ] {

@@ -11,8 +11,8 @@
 //! be rejected by the dispatcher with `InvalidArgument`, not 30s
 //! deadlocked.
 //!
-//! H6 slice 4 (event attribution): when KV `announce` is set, `kick`
-//! first publishes a custom event on topic [`RELAY_TOPIC`]. Every
+//! H6 slice 4 (event attribution): when KV `announce` is set, a leaf
+//! `kick` (no `bounce_to`) publishes a custom event on topic [`RELAY_TOPIC`]. Every
 //! bouncer subscribes to that topic; one whose KV `relay_to` names a
 //! service id answers the event in `on-event` by calling that
 //! service's `kick`, so a test can follow a reaction's hop back to
@@ -84,16 +84,19 @@ impl Plugin for Bouncer {
         if let Err(e) = host::storage::set(KICKED_KEY, &Value::BoolVal(true)) {
             return CommandResult::Err(e);
         }
-        if kv_string(ANNOUNCE_KEY).is_some()
-            && let Err(e) = host::publish_custom_event(None, RELAY_TOPIC, "{}")
-        {
-            return CommandResult::Err(e);
-        }
         // Look up the bounce target in KV. If absent or wrong-typed,
-        // there's no next hop — return Ok.
+        // there's no next hop — return Ok. Only this leaf hop announces,
+        // so an `Err` never follows a published event.
         let target = match host::storage::get(BOUNCE_KEY) {
             Ok(Some(Value::StringVal(s))) => s,
-            Ok(_) => return CommandResult::Ok,
+            Ok(_) => {
+                if kv_string(ANNOUNCE_KEY).is_some()
+                    && let Err(e) = host::publish_custom_event(None, RELAY_TOPIC, "{}")
+                {
+                    return CommandResult::Err(e);
+                }
+                return CommandResult::Ok;
+            }
             Err(e) => {
                 return CommandResult::Err(Error::Internal(format!(
                     "reading bounce_to: {e:?}"

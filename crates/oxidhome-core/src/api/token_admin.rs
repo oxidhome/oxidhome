@@ -341,7 +341,8 @@ fn selector(spec: &SelectorSpec, what: &str) -> Result<Selector, AdminError> {
             if let Some(bad) = list.iter().find(|p| !is_service_pattern(p)) {
                 return Err(invalid(format!(
                     "service pattern `{bad}` must be `<plugin>` or `<plugin>/<local-id>`, each \
-                     half literal or ending in a single `*`"
+                     half literal or ending in a single `*`, the plugin half in plugin-id \
+                     characters (`a-z`, `0-9`, `.`, `-`)"
                 )));
             }
             Some(list.clone())
