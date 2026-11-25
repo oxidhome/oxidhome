@@ -65,6 +65,11 @@ message Selector {
   // Device ids or `prefix*` patterns the entry is narrowed to; empty
   // for every device.
   repeated string devices = 3;
+  // Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+  // literal or `prefix*`) the entry is narrowed to; empty for every
+  // service. Narrows `service.call` only and excludes `category` and
+  // `devices`.
+  repeated string services = 4;
 }
 
 message CreateTokenResponse {

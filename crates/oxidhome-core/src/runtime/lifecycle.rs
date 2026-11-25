@@ -2294,7 +2294,8 @@ fn late_service_recorder(
 }
 
 /// Queue the late-result row of a service call whose caller never read
-/// the result (externally-rooted invocations only).
+/// the result (attributable invocations only: externally rooted, or a
+/// reaction to an attributed event).
 fn record_late_service_result(
     pending: &PendingCommands,
     ctx: &InvocationContext,

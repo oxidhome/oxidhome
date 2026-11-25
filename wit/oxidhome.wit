@@ -610,11 +610,12 @@ interface events {
     /// that don't hit the durable log (unusual in production; can
     /// happen in host-side test fixtures).
     row-id: option<u64>,
-    /// H6: call id (`call-<32 hex>`) of the invocation that published
-    /// this event, when it traces back to an external request (a
-    /// command or service call a token caused, or an `on-event`
-    /// reaction to such an event); `none` for work the host started
-    /// on its own (`init`, `tick`). **Host-populated on publish** —
+    /// H6: call id (`call-<32 hex>`) of the external request this
+    /// event traces back to: the publishing invocation's own call id
+    /// when a token caused it, or, when an `on-event` reaction
+    /// published it, the call id that reaction traces back to (so
+    /// every event in a chain of reactions names the same request).
+    /// `none` for work the host started on its own (`init`, `tick`). **Host-populated on publish** —
     /// any value a plugin passes is overwritten. Attribution only: an
     /// operator follows it into the audit ledger
     /// (`GET /api/v1/audit?call_id=…`); it grants nothing, and a

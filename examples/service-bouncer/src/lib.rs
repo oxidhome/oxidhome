@@ -16,7 +16,8 @@
 //! bouncer subscribes to that topic; one whose KV `relay_to` names a
 //! service id answers the event in `on-event` by calling that
 //! service's `kick`, so a test can follow a reaction's hop back to
-//! the request that caused the event.
+//! the request that caused the event. Every `kick` sets KV `kicked`,
+//! so a test can see that a relay landed.
 
 use oxidhome_sdk::Plugin;
 use oxidhome_sdk::bindings::oxidhome::plugin::devices::CommandResult;
@@ -29,6 +30,8 @@ const ANNOUNCE_KEY: &str = "announce";
 const RELAY_KEY: &str = "relay_to";
 /// Custom topic `kick` announces on when KV `announce` is set.
 const RELAY_TOPIC: &str = "bouncer.relay";
+/// KV key `kick` sets, so a test can see a relay landed.
+const KICKED_KEY: &str = "kicked";
 
 /// A string value from KV, if set.
 fn kv_string(key: &str) -> Option<String> {
@@ -78,8 +81,11 @@ impl Plugin for Bouncer {
                 "unknown bouncer command: {command}"
             )));
         }
+        if let Err(e) = host::storage::set(KICKED_KEY, &Value::BoolVal(true)) {
+            return CommandResult::Err(e);
+        }
         if kv_string(ANNOUNCE_KEY).is_some()
-            && let Err(e) = host::publish_custom_event(None, RELAY_TOPIC, "")
+            && let Err(e) = host::publish_custom_event(None, RELAY_TOPIC, "{}")
         {
             return CommandResult::Err(e);
         }

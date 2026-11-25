@@ -396,13 +396,7 @@ impl RoleDef {
         }
         let mut deny = Vec::with_capacity(wire.deny.len());
         for d in wire.deny {
-            let (actions, categories, devices, services) = d.into_parts()?;
-            deny.push(DenyRule {
-                actions,
-                categories,
-                devices,
-                services,
-            });
+            deny.push(d.into_deny()?);
         }
         Some(Self {
             id: id.to_owned(),
@@ -442,6 +436,31 @@ impl SelectorWire {
     /// device or service pattern nothing can match, or `services`
     /// mixed with a device selector: a selector that names nothing
     /// would silently match nothing.
+    /// A stored deny entry. One narrowed to `services` is refused
+    /// (`None`) when it names an action other than `service.call`, which
+    /// it could never match. One narrowed to devices drops `service.call`
+    /// instead of refusing: the admin surfaces stored a narrowed `*` as
+    /// every action name before slice 4, and a device selector never
+    /// matched a service then either. A narrowed `*` means what the
+    /// selector can match.
+    pub(crate) fn into_deny(self) -> Option<DenyRule> {
+        let wildcard = self.actions.iter().any(|a| a == "*");
+        let (actions, categories, devices, services) = self.into_parts()?;
+        let to_devices = categories.is_some() || devices.is_some();
+        let actions = deny_actions(
+            actions,
+            wildcard || to_devices,
+            services.is_some(),
+            to_devices,
+        )?;
+        Some(DenyRule {
+            actions,
+            categories,
+            devices,
+            services,
+        })
+    }
+
     pub(crate) fn into_parts(self) -> Option<SelectorParts> {
         if self.actions.is_empty()
             || self.category.as_ref().is_some_and(Vec::is_empty)
@@ -474,6 +493,31 @@ impl SelectorWire {
     }
 }
 
+/// The actions a deny entry covers, or `None` when an explicitly named
+/// action can never match its selector (see
+/// [`SelectorWire::into_deny`]).
+pub(crate) fn deny_actions(
+    actions: ActionSet,
+    wildcard: bool,
+    to_services: bool,
+    to_devices: bool,
+) -> Option<ActionSet> {
+    let unmatchable = if to_services {
+        ActionSet::ALL.without(SERVICE_NARROWABLE)
+    } else if to_devices {
+        SERVICE_NARROWABLE
+    } else {
+        return Some(actions);
+    };
+    if wildcard {
+        Some(actions.without(unmatchable))
+    } else if actions.intersection(unmatchable).is_empty() {
+        Some(actions)
+    } else {
+        None
+    }
+}
+
 /// Longest service pattern a selector accepts.
 pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
 
@@ -483,8 +527,11 @@ pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
 /// [`MAX_SERVICE_PATTERN_BYTES`].
 #[must_use]
 pub fn is_service_pattern(pattern: &str) -> bool {
-    let well_formed =
-        |half: &str| !half.is_empty() && half.find('*').is_none_or(|i| i == half.len() - 1);
+    let well_formed = |half: &str| {
+        !half.is_empty()
+            && !half.contains('/')
+            && half.find('*').is_none_or(|i| i == half.len() - 1)
+    };
     pattern.len() <= MAX_SERVICE_PATTERN_BYTES
         && !pattern.chars().any(char::is_control)
         && match pattern.split_once('/') {
@@ -775,6 +822,7 @@ mod tests {
             "a*b",
             "**",
             "acme/x*y",
+            "acme/inst/bouncer",
             "a\nb",
             long.as_str(),
         ] {
@@ -873,10 +921,20 @@ mod tests {
             r#"{"grants":[{"actions":["device.read"],"devices":["lamp"]}]}"#,
             r#"{"sensitive":["door"]}"#,
             r#"{"deny":[{"actions":["nope"]}]}"#,
+            r#"{"deny":[{"actions":["device.command"],"services":["acme"]}]}"#,
             r#"{"scopes":["*"]}"#,
         ] {
             assert!(role(bad).is_none(), "{bad}");
         }
+        // A device-narrowed deny stored before slice 4 listed every
+        // action, `service.call` included; it still reads, without it.
+        let legacy =
+            role(r#"{"deny":[{"actions":["service.call","device.command"],"category":["lock"]}]}"#)
+                .expect("legacy deny");
+        assert_eq!(
+            legacy.deny[0].actions,
+            ActionSet::of(&[Action::DeviceCommand])
+        );
     }
 
     #[test]

@@ -1630,7 +1630,7 @@ fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
         actions: s.actions,
         category: none_if_empty(s.category),
         devices: none_if_empty(s.devices),
-        services: None,
+        services: none_if_empty(s.services),
     }
 }
 
@@ -2230,6 +2230,20 @@ fn connect_error_response(err: ConnectError, req_headers: &HeaderMap) -> AxumRes
 #[cfg(test)]
 mod command_report_tests {
     use super::*;
+
+    /// H6 slice 4: a Connect role or token selector keeps its
+    /// `services` narrowing (dropping it would widen the grant).
+    #[test]
+    fn selectors_carry_services() {
+        let spec = selector_spec(ProtoSelector {
+            actions: vec!["service.call".into()],
+            services: vec!["acme.notify/push".into()],
+            ..ProtoSelector::default()
+        });
+        assert_eq!(spec.services, Some(vec!["acme.notify/push".to_owned()]));
+        assert_eq!(spec.category, None);
+        assert_eq!(selector_spec(ProtoSelector::default()).services, None);
+    }
 
     /// M7 + H5: Connect withholds a `completed` report's `bytes-val`
     /// state from a caller without `blobs:read`.

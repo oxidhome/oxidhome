@@ -254,20 +254,20 @@ fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
         .iter()
         .map(|spec| {
             let (actions, categories, devices, services) = selector(spec, "deny")?;
-            if services.is_some()
-                && spec.actions.iter().all(|a| a != "*")
-                && !SERVICE_NARROWABLE.contains_all(actions)
-            {
-                return Err(invalid(
-                    "a deny entry narrowed to services can only name service.call",
-                ));
-            }
-            // A narrowed `*` means what the selector can match.
-            let actions = if services.is_some() {
-                actions.intersection(SERVICE_NARROWABLE)
-            } else {
-                actions
-            };
+            let wildcard = spec.actions.iter().any(|a| a == "*");
+            let to_devices = categories.is_some() || devices.is_some();
+            // A narrowed `*` means what the selector can match; a named
+            // action it can never match is refused.
+            let actions =
+                crate::auth::role::deny_actions(actions, wildcard, services.is_some(), to_devices)
+                    .ok_or_else(|| {
+                        invalid(if services.is_some() {
+                            "a deny entry narrowed to services can only name service.call"
+                        } else {
+                            "a deny entry narrowed to devices can't name service.call (narrow it \
+                             with `services` instead)"
+                        })
+                    })?;
             Ok(DenyRule {
                 actions,
                 categories,
@@ -1056,6 +1056,18 @@ mod tests {
                     ..req("x", &["resident"])
                 },
                 "service pattern",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["service.call".into()],
+                        category: Some(vec!["lock".into()]),
+                        devices: None,
+                        services: None,
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "can't name service.call",
             ),
         ];
         for (r, needle) in cases {

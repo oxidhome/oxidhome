@@ -77,6 +77,15 @@ impl Bouncers {
             .expect("kv set");
     }
 
+    /// Has `instance` run `kick` (KV `kicked`)?
+    fn kicked(&self, instance: &str) -> bool {
+        self.engine
+            .kv()
+            .get(PLUGIN, instance, "kicked")
+            .expect("kv get")
+            .is_some()
+    }
+
     /// `kick` on `target` from a test driver whose own grant allows
     /// it, as an invocation rooted at `actor`.
     async fn kick_as(
@@ -196,8 +205,9 @@ async fn every_hop_needs_the_roots_service_call_permit() {
 }
 
 /// A role grant narrows the delegation grant to the services it names;
-/// the root's deny list refuses a hop whatever grants it, including on
-/// an inner hop the first one led to.
+/// the root's deny list refuses a hop whatever grants it. (Every hop
+/// here targets the same service, so refusals land on the first one;
+/// the dispatcher's unit tests cover a refused inner hop.)
 #[tokio::test(flavor = "multi_thread")]
 async fn role_grants_and_denies_follow_the_chain() {
     let b = Bouncers::start(&["alpha", "beta"]).await;
@@ -270,10 +280,10 @@ async fn role_grants_and_denies_follow_the_chain() {
     b.stop().await;
 }
 
-/// An event a request causes carries its call id, live and in history;
-/// a subscriber's reaction runs host-rooted (its own grant decides,
-/// the token's lack of `services:call` doesn't matter) and its hop row
-/// names the request as `caused_by`.
+/// An event a request causes carries its call id in history; a
+/// subscriber's reaction runs host-rooted (attributed to the subscriber
+/// instance, decided by its own grant) and its hop row names the
+/// request as `caused_by`.
 #[tokio::test(flavor = "multi_thread")]
 async fn reactions_record_what_caused_them() {
     let b = Bouncers::start(&["alpha", "beta", "gamma"]).await;
@@ -363,8 +373,12 @@ async fn host_rooted_events_are_not_attributed() {
         .expect("history");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].call_id, None);
-    // Give beta's reaction time to run; it writes no row.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // beta's reaction ran (gamma got kicked) and wrote no row.
+    let started = Instant::now();
+    while !b.kicked("gamma") {
+        assert!(started.elapsed() < Duration::from_secs(10), "no relay");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let rows: Vec<_> = b
         .engine
         .audit_log()

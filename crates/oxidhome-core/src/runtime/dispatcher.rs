@@ -254,8 +254,9 @@ pub async fn call_service_from_host_in(
 /// owner_instance, local_id, command)`, and hops to the owning
 /// instance's supervisor via `instances`.
 ///
-/// `audit` receives one row per hop of an externally-rooted invocation
-/// (H6); `None` disables hop auditing (unit tests only). `journal` (the
+/// `audit` receives one row per hop of an attributable invocation (H6:
+/// externally rooted, or a reaction to an attributed event); `None`
+/// disables hop auditing (unit tests only). `journal` (the
 /// engine's pending-command table) finalizes the hop rows; without one
 /// the finalize is a detached blocking write.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -703,8 +704,9 @@ impl std::fmt::Debug for ResultCheck {
 
 /// The [`SERVICE_CALL_RESULT_AUDIT_METHOD`] row for a service call's
 /// `result` that reached the callee's supervisor after the caller
-/// stopped waiting. `None` for host-origin invocations, which stay out
-/// of the ledger as their hops do.
+/// stopped waiting. `None` for invocations that aren't attributable
+/// (host-origin work other than a reaction to an attributed event),
+/// which stay out of the ledger as their hops do.
 ///
 /// `result` is the reply after its schema check: an `Err` (the callee
 /// ran but broke its `returns`) is `failed` / `internal` with outcome
@@ -770,7 +772,7 @@ fn result_columns(result: &CommandResult) -> (Option<&'static str>, Option<&'sta
 }
 
 /// Audit writer for one delegated hop (H6). Built only for
-/// externally-rooted invocations.
+/// attributable invocations ([`InvocationContext::is_attributable`]).
 #[derive(Clone)]
 struct HopAudit {
     log: Arc<AuditLog>,
