@@ -128,14 +128,25 @@ impl ServiceRegistry {
     ///
     /// # Errors
     ///
-    /// [`WitError::InvalidArgument`] if `(owner_instance, info.local_id)`
-    /// already identifies a live service in the registry.
+    /// [`WitError::InvalidArgument`] if `info.local_id` is not a service
+    /// local-id ([`oxidhome_manifest::is_service_local_id`]), or if
+    /// `(owner_instance, info.local_id)` already identifies a live
+    /// service in the registry.
     pub fn register(
         &self,
         owner_instance: String,
         owner_plugin_id: String,
         info: ServiceInfo,
     ) -> Result<ServiceId, WitError> {
+        if !oxidhome_manifest::is_service_local_id(&info.local_id) {
+            // The id itself is caller-controlled: the grammar explains
+            // the refusal without echoing (and sizing a reply by) it.
+            return Err(WitError::InvalidArgument(format!(
+                "service local-id must be 1-{} of `a-z`, `0-9`, `.`, `_`, `-`, \
+                 starting with a letter or digit",
+                oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES,
+            )));
+        }
         let mut guard = self.services_write();
         if guard
             .values()
@@ -461,6 +472,23 @@ mod tests {
         assert!(a.starts_with("svc-"));
         assert_ne!(a, b);
         assert_eq!(reg.list().len(), 2);
+    }
+
+    /// H6 slice 4: every entry point that registers (WIT or host Rust)
+    /// refuses a local-id outside the service grammar.
+    #[test]
+    fn register_refuses_malformed_local_ids() {
+        let reg = ServiceRegistry::new();
+        for bad in ["a/b", "send*", "Upper", ""] {
+            let err = reg
+                .register("alpha".into(), "com.example.alpha".into(), info(bad))
+                .expect_err("refused");
+            assert!(
+                matches!(&err, WitError::InvalidArgument(m) if m.contains("local-id")),
+                "{bad}: {err:?}"
+            );
+        }
+        assert_eq!(reg.list().len(), 0);
     }
 
     /// `update`/`remove`/`get` reject a non-owner with `NotFound`,

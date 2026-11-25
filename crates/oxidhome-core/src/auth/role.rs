@@ -512,8 +512,8 @@ pub(crate) fn deny_actions(
     Some(actions.without(unmatchable))
 }
 
-/// Longest plugin half of a service pattern.
-pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = 256;
+/// Longest plugin half of a service pattern: the longest plugin id.
+pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = oxidhome_manifest::MAX_PLUGIN_ID_BYTES;
 
 /// Longest service pattern a selector accepts: a plugin half of up to
 /// [`MAX_SERVICE_PATTERN_PLUGIN_BYTES`], `/`, and a local-id half of up

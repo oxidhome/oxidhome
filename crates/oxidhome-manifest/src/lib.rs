@@ -47,6 +47,6 @@ pub use network::{
     HostMatch, MAX_RULE_HOST_LEN, NetworkRule, NetworkRuleParseError, PortMatch, Proto,
 };
 pub use validate::{
-    MAX_SERVICE_LOCAL_ID_BYTES, ValidationError, WasmPathProblem, check_capability_limits,
-    check_capability_limits_owned, is_service_local_id, validate,
+    MAX_PLUGIN_ID_BYTES, MAX_SERVICE_LOCAL_ID_BYTES, ValidationError, WasmPathProblem,
+    check_capability_limits, check_capability_limits_owned, is_service_local_id, validate,
 };

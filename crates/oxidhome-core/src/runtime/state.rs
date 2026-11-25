@@ -1315,15 +1315,6 @@ impl host_services::Host for PluginState {
             );
             return Err(err);
         }
-        if !oxidhome_manifest::is_service_local_id(&info.local_id) {
-            // The id itself is caller-controlled: the grammar explains
-            // the refusal without echoing (and sizing a reply by) it.
-            return Err(WitError::InvalidArgument(format!(
-                "service local-id must be 1-{} of `a-z`, `0-9`, `.`, `_`, `-`, \
-                 starting with a letter or digit",
-                oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES,
-            )));
-        }
         check_no_wildcard_command_names(&info)?;
         super::schema::check_service_info(&info)?;
         // H10: registry now enforces `(owner_instance, local_id)`

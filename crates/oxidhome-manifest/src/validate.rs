@@ -41,7 +41,7 @@ pub enum ValidationError {
     #[error(
         "plugin.id `{got}` does not match the reverse-DNS shape \
          (`[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+` — every label must start with \
-         `[a-z0-9]`; e.g. `example.simulated-switch`)"
+         `[a-z0-9]`, at most 256 bytes; e.g. `example.simulated-switch`)"
     )]
     InvalidPluginId { got: String },
 
@@ -539,6 +539,10 @@ pub fn check_capability_limits(
     }
 }
 
+/// Longest `plugin.id` a manifest may declare (so a role selector can
+/// always name a plugin, and its services, exactly).
+pub const MAX_PLUGIN_ID_BYTES: usize = 256;
+
 /// Longest service `local-id` the host accepts.
 pub const MAX_SERVICE_LOCAL_ID_BYTES: usize = 64;
 
@@ -676,7 +680,7 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         });
     }
 
-    if !is_reverse_dns(&m.plugin.id) {
+    if m.plugin.id.len() > MAX_PLUGIN_ID_BYTES || !is_reverse_dns(&m.plugin.id) {
         errors.push(ValidationError::InvalidPluginId {
             got: m.plugin.id.clone(),
         });
@@ -1531,6 +1535,20 @@ mod tests {
 
     /// H10 round-4: manifest with a grant whose `commands` list
     /// exceeds [`MAX_COMMANDS_PER_GRANT`] is refused.
+    #[test]
+    fn overlong_plugin_ids_are_refused() {
+        let mut m = ok_manifest();
+        m.plugin.id = format!("{}.b", "a".repeat(MAX_PLUGIN_ID_BYTES - 2));
+        assert!(validate(&m).is_ok());
+        m.plugin.id.insert(0, 'a');
+        let errs = validate(&m).expect_err("refused");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidPluginId { .. })),
+            "{errs:?}"
+        );
+    }
+
     #[test]
     fn service_local_ids_are_validated() {
         for good in ["counter", "svc-1", "a", "house.mode_2", "0x"] {
