@@ -89,9 +89,10 @@ pub struct HistoricalEvent {
     pub instance_id: String,
     pub plugin_id: String,
     pub topic: String,
-    /// H6 slice 4: the publishing invocation's call id (WIT
-    /// `event.call-id`); `None` for host-started work and rows written
-    /// before migration 25.
+    /// H6 slice 4: call id of the external request the event traces
+    /// back to (WIT `event.call-id`): the publisher's own when a token
+    /// started it, the originating request's when a reaction published
+    /// it. `None` for host-started work.
     pub call_id: Option<String>,
     pub payload: EventPayload,
 }

@@ -314,8 +314,8 @@ impl InvocationContext {
     }
 
     /// Context for a subscriber's `on-event` reaction to an event
-    /// published under the invocation `caused_by` (the event's
-    /// `call-id`). Host-origin like [`Self::host_origin`]: the
+    /// whose `call-id` is `caused_by` (the external request it traces
+    /// back to). Host-origin like [`Self::host_origin`]: the
     /// reaction runs with `instance_id`'s own authority, never the
     /// causing root's. It gets its own call id; `caused_by` only links
     /// its audit rows to the cause.
@@ -394,8 +394,10 @@ impl InvocationContext {
         &self.inner.chain
     }
 
-    /// Call id of the invocation whose event this one reacts to, for
-    /// an `on-event` reaction ([`Self::reacting_to`]).
+    /// For an `on-event` reaction ([`Self::reacting_to`]), the event's
+    /// `call-id`: the external request the reaction traces back to,
+    /// through any chain of reactions (not necessarily the immediate
+    /// publisher).
     #[must_use]
     pub fn caused_by(&self) -> Option<&str> {
         self.inner.caused_by.as_deref()
