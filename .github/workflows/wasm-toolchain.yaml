@@ -4,7 +4,7 @@ name: Wasm toolchain
 # wasm-tools release (Dependabot ignores them), using only releases out of
 # a 7-day quarantine (Dependabot's cooldown) and without OSV advisories.
 # The logic lives in .github/scripts/wasm-toolchain.sh; `wasm-toolchain.sh
-# plan` is its dry run.
+# plan` is its dry run; `gh workflow run wasm-toolchain.yaml` runs it by hand.
 
 on:
   schedule:
