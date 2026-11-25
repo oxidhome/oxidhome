@@ -646,12 +646,16 @@ impl std::fmt::Debug for Response {
 
 /// `raw` with any `user:password@` in its authority replaced by `***@`.
 fn redact_userinfo(raw: &str) -> String {
-    // After `scheme://`, or a scheme-relative `//`.
-    let start = raw
-        .find("://")
-        .map(|i| i + 3)
-        .or_else(|| raw.starts_with("//").then_some(2))
-        .unwrap_or(0);
+    // After a scheme-relative `//`, or a `scheme://` that comes before
+    // any path, query or fragment (a `://` in a query is not a scheme).
+    let head = raw.find(['/', '?', '#']).unwrap_or(raw.len());
+    let start = if raw.starts_with("//") {
+        2
+    } else if raw[..head].ends_with(':') && raw[head..].starts_with("//") {
+        head + 2
+    } else {
+        0
+    };
     let end = raw[start..]
         .find(['/', '?', '#'])
         .map_or(raw.len(), |i| start + i);
@@ -886,6 +890,21 @@ mod tests {
         assert_eq!(redact_userinfo("//u:pw@cam.lan/live"), "//***@cam.lan/live");
         let shown = format!("{:?}", Request::get("//u:pw@cam.lan/live"));
         assert!(!shown.contains("pw"), "{shown}");
+        // A `://` in the query is not a scheme.
+        assert_eq!(
+            redact_userinfo("//u:pw@cam.lan/login?next=https://x"),
+            "//***@cam.lan/login?next=https://x"
+        );
+        assert_eq!(
+            redact_userinfo("u:pw@cam.lan/login?next=https://x"),
+            "***@cam.lan/login?next=https://x"
+        );
+        assert_eq!(
+            redact_userinfo("https://u:pw@cam.lan/login?next=https://v:x@y"),
+            "https://***@cam.lan/login?next=https://v:x@y"
+        );
+        let err = Url::parse("//u:pw@cam.lan/login?next=https://x").unwrap_err();
+        assert!(!format!("{err:?}").contains("pw"), "{err:?}");
     }
 
     #[test]
