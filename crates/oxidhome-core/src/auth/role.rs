@@ -512,8 +512,9 @@ pub(crate) fn deny_actions(
     Some(actions.without(unmatchable))
 }
 
-/// Longest plugin half of a service pattern: the longest plugin id.
-pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = oxidhome_manifest::MAX_PLUGIN_ID_BYTES;
+/// Longest plugin half of a service pattern: the longest plugin id,
+/// plus a trailing `*`.
+pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = oxidhome_manifest::MAX_PLUGIN_ID_BYTES + 1;
 
 /// Longest service pattern a selector accepts: a plugin half of up to
 /// [`MAX_SERVICE_PATTERN_PLUGIN_BYTES`], `/`, and a local-id half of up
@@ -571,9 +572,22 @@ fn could_name_plugin(half: &str) -> bool {
         Some(prefix) => {
             let mut labels: Vec<&str> = prefix.split('.').collect();
             let open = labels.pop().unwrap_or_default();
-            labels.into_iter().all(label) && (open.is_empty() || label(open))
+            // The shortest id it could complete to must fit: a dotless
+            // prefix still needs `.x`, an open empty label one character.
+            let needs = match (labels.is_empty(), open.is_empty()) {
+                (true, false) => 2,
+                (false, true) => 1,
+                (true, true) | (false, false) => 0,
+            };
+            labels.into_iter().all(label)
+                && (open.is_empty() || label(open))
+                && prefix.len() + needs <= oxidhome_manifest::MAX_PLUGIN_ID_BYTES
         }
-        None => half.contains('.') && half.split('.').all(label),
+        None => {
+            half.len() <= oxidhome_manifest::MAX_PLUGIN_ID_BYTES
+                && half.contains('.')
+                && half.split('.').all(label)
+        }
     }
 }
 
@@ -855,12 +869,17 @@ mod tests {
             assert!(is_service_pattern(good), "{good}");
         }
         // The longest names, exactly or as a prefix.
-        let plugin = format!("{}.b", "a".repeat(MAX_SERVICE_PATTERN_PLUGIN_BYTES - 2));
+        let max = oxidhome_manifest::MAX_PLUGIN_ID_BYTES;
+        let plugin = format!("{}.b", "a".repeat(max - 2));
         let local = "s".repeat(oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES);
         assert!(is_service_pattern(&format!("{plugin}/{local}")));
-        assert!(is_service_pattern(&format!("{plugin}/{local}*")));
+        assert!(is_service_pattern(&format!("{plugin}*/{local}*")));
         assert!(!is_service_pattern(&format!("{plugin}/{local}s")));
         assert!(!is_service_pattern(&format!("a{plugin}/x")));
+        // A prefix no id of the longest length can complete.
+        assert!(is_service_pattern(&format!("{}*", "a".repeat(max - 2))));
+        assert!(!is_service_pattern(&format!("{}*", "a".repeat(max - 1))));
+        assert!(!is_service_pattern(&format!("{}.*", "a".repeat(max - 1))));
         let long = "a".repeat(MAX_SERVICE_PATTERN_BYTES + 1);
         for bad in [
             "",

@@ -41,7 +41,7 @@ pub enum ValidationError {
     #[error(
         "plugin.id `{got}` does not match the reverse-DNS shape \
          (`[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+` — every label must start with \
-         `[a-z0-9]`, at most 256 bytes; e.g. `example.simulated-switch`)"
+         `[a-z0-9]`, at most 255 bytes; e.g. `example.simulated-switch`)"
     )]
     InvalidPluginId { got: String },
 
@@ -539,9 +539,10 @@ pub fn check_capability_limits(
     }
 }
 
-/// Longest `plugin.id` a manifest may declare (so a role selector can
-/// always name a plugin, and its services, exactly).
-pub const MAX_PLUGIN_ID_BYTES: usize = 256;
+/// Longest `plugin.id` a manifest may declare: the id is the plugin's
+/// directory name on install, so it fits a filesystem name (`NAME_MAX`,
+/// 255 bytes), and a role selector can always name it exactly.
+pub const MAX_PLUGIN_ID_BYTES: usize = 255;
 
 /// Longest service `local-id` the host accepts.
 pub const MAX_SERVICE_LOCAL_ID_BYTES: usize = 64;
