@@ -3120,7 +3120,7 @@ async fn tail_events(
 
 /// H4: response header acknowledging an accepted `after_id` on the
 /// event tails (WebSocket 101 and Connect `TailEvents`), carrying the
-/// resolved cursor. Absent on live-only streams, on expired cursors
+/// resolved cursor. Absent on live-only streams and on expired cursors
 /// (whose stream carries only `cursor_expired`).
 pub(crate) const RESUME_AFTER_ID_HEADER: &str = "oxidhome-resume-after-id";
 

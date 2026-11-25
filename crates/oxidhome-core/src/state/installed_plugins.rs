@@ -40,8 +40,8 @@
 //!   registry is a plain in-memory cache; install / uninstall
 //!   return [`InstallError::NoPluginsRoot`].
 //! - `scan` reconciles the two on boot: any FS entry without a live
-//!   SQL row gets a fresh UUID backfilled (a hand-placed or restored dir;
-//!   a crash between the FS copy and the SQL insert).
+//!   SQL row gets a fresh UUID backfilled (a hand-placed or restored
+//!   dir).
 //!
 //! ## Lifecycle ownership
 //!
@@ -938,8 +938,7 @@ impl InstalledPluginRegistry {
     ///   → reuse the stored `installation_uuid` (identity survives
     ///   process restart).
     /// - FS entry with no live SQL row → mint a fresh UUID + INSERT
-    ///   (backfill for a hand-placed or restored dir, or a crash
-    ///   between the FS copy and the SQL insert).
+    ///   (backfill for a hand-placed or restored dir).
     /// - Live SQL row with no FS entry → the row is stranded; log
     ///   and leave it — a subsequent `install` for that
     ///   `plugin_id` will refuse (unique index), matching operator
@@ -2926,6 +2925,16 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the `oxidhome:plugin-content:v1` digest: a change to the
+    /// tag or framing changes every stored digest.
+    #[test]
+    fn content_digest_is_pinned() {
+        assert_eq!(
+            content_digest(b"manifest", b"wasm", &[("ui/index.html", b"<p>")]),
+            "e2e2da66043894324ebc25f9c7ae543074d7941416e9e2c97d0034523d8e5f90"
+        );
+    }
 
     fn fresh_db() -> Arc<Db> {
         Arc::new(Db::open_in_memory().expect("in-memory db"))

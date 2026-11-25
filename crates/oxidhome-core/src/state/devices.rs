@@ -564,6 +564,16 @@ mod tests {
         }
     }
 
+    /// Pins the `oxidhome:device-id:v1` derivation: a change to the
+    /// tag or framing changes every device id.
+    #[test]
+    fn stable_device_id_is_pinned() {
+        assert_eq!(
+            &*stable_device_id("inst-0", "alpha", "lamp"),
+            "dev-f552a6883bf64409"
+        );
+    }
+
     /// `update`/`remove`/`get` must reject calls from a non-owner
     /// instance with `NotFound`, indistinguishable from "id never
     /// existed".

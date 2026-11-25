@@ -1729,6 +1729,18 @@ mod tests {
         assert!(store.deltas_since_with_revision(cursor, 10).reset_required);
         assert!(store.snapshot_capability("dev-a", "switch").is_some());
         assert!(store.close_persistence());
+        // Unusable metadata starts a history with no skipped ranges.
+        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
+        let holes: String = db
+            .read(|c| {
+                c.query_row(
+                    "SELECT json_extract(holes_json, '$.holes') FROM device_state_meta",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("holes");
+        assert_eq!(holes, "[]");
     }
 
     /// A sealed hole whose width isn't the per-boot gap is damage.
@@ -1736,12 +1748,15 @@ mod tests {
     fn a_marked_range_of_the_wrong_width_is_damage() {
         let dir = tempdir();
         let store = open(&dir);
+        // Two writes, so a range below the surviving row and the
+        // flushed revision fails only the width check.
         put(&store, "dev-a", true);
+        put(&store, "dev-a", false);
         let epoch = store.epoch();
         assert!(store.close_persistence());
         let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
         drop(store);
-        reseal_holes(&db, &[(1, 2)]);
+        reseal_holes(&db, &[(0, 1)]);
         drop(db);
         let store = open(&dir);
         assert_ne!(store.epoch(), epoch);
