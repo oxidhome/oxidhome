@@ -349,10 +349,8 @@ impl std::fmt::Display for WasmPathProblem {
     }
 }
 
-/// Every `manifest_version` this build accepts. Add to this list when
-/// a new manifest schema is introduced (and keep deserialization for
-/// the old one, per the format-evolution policy in the per-crate
-/// plan).
+/// Every `manifest_version` this build accepts. A manifest declaring
+/// any other version is refused.
 pub const SUPPORTED_MANIFEST_VERSIONS: &[u32] = &[1];
 
 /// Maximum number of entries allowed in `plugin.keywords`. Soft cap

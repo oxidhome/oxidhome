@@ -40,8 +40,8 @@
 //!   registry is a plain in-memory cache; install / uninstall
 //!   return [`InstallError::NoPluginsRoot`].
 //! - `scan` reconciles the two on boot: any FS entry without a live
-//!   SQL row gets a fresh UUID backfilled (pre-C1b installs; a hand
-//!   -placed dir; a crash between the FS copy and the SQL insert).
+//!   SQL row gets a fresh UUID backfilled (a hand-placed or restored dir;
+//!   a crash between the FS copy and the SQL insert).
 //!
 //! ## Lifecycle ownership
 //!
@@ -106,8 +106,8 @@ pub struct InstalledPlugin {
     ///
     /// The split establishes the request/grant boundary; v1
     /// intentionally has no operator-override endpoint, so
-    /// grant == request for every fresh install. Pre-C5 rows
-    /// (NULL grant JSON) and rows whose grant JSON refuses to
+    /// grant == request for every fresh install. Rows with a
+    /// NULL grant JSON and rows whose grant JSON refuses to
     /// deserialize are **quarantined** by scan — they never
     /// surface through the registry — so an operator's reinstall
     /// re-issues the boundary. C5 review F1 (fail-closed).
@@ -210,14 +210,7 @@ impl InstalledPlugin {
 /// [(field_label, bytes), …])`. `ui_assets` MUST arrive in the
 /// canonical order `validate_ui_package` returns them; that
 /// ordering is what pins the digest across the install / scan
-/// pair. A plugin with no `[ui]` section passes an empty slice
-/// and the digest reduces to the pre-Phase-13 tag-bumped form.
-///
-/// Tag v3 (was v2) — pre-Phase-13 installs' stored digests will
-/// no longer verify after this bump; the C5 fail-closed path
-/// quarantines those rows on the next scan, and the operator
-/// resolves by `uninstall` + `install` (a well-documented
-/// route that already handles grant-shape drift).
+/// pair. A plugin with no `[ui]` section passes an empty slice.
 #[must_use]
 pub fn content_digest(
     manifest_bytes: &[u8],
@@ -225,7 +218,7 @@ pub fn content_digest(
     ui_assets: &[(&str, &[u8])],
 ) -> String {
     let mut hasher = Sha256::new();
-    let tag = b"oxidhome:plugin-content:v3";
+    let tag = b"oxidhome:plugin-content:v1";
     #[allow(clippy::cast_possible_truncation)]
     hasher.update((tag.len() as u32).to_be_bytes());
     hasher.update(tag);
@@ -945,8 +938,8 @@ impl InstalledPluginRegistry {
     ///   → reuse the stored `installation_uuid` (identity survives
     ///   process restart).
     /// - FS entry with no live SQL row → mint a fresh UUID + INSERT
-    ///   (backfill for pre-C1b installs or a crash between the FS
-    ///   copy and the SQL insert).
+    ///   (backfill for a hand-placed or restored dir, or a crash
+    ///   between the FS copy and the SQL insert).
     /// - Live SQL row with no FS entry → the row is stranded; log
     ///   and leave it — a subsequent `install` for that
     ///   `plugin_id` will refuse (unique index), matching operator
@@ -1494,8 +1487,8 @@ impl InstalledPluginRegistry {
                 // failed leaves the **live** SQL row in place
                 // (tombstone step never ran), so this branch
                 // isn't reachable for that shape. FS entries
-                // with no live row are legit pre-C1b installs
-                // or hand-placed / restored packages —
+                // with no live row are hand-placed / restored
+                // packages —
                 // backfill mints a fresh UUID + computes a
                 // fresh content digest, matching what the
                 // API's `install` would have done.
@@ -2368,7 +2361,7 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                 tracing::error!(
                     plugin_id = %plugin_id,
                     installation_uuid = %uuid,
-                    "content_digest is NULL (pre-C5 install or corrupt row); \
+                    "content_digest is NULL (corrupt row); \
                      quarantining — reinstall to re-issue the grant + digest \
                      (C5 review F3 fail-closed)",
                 );
@@ -2379,7 +2372,7 @@ fn load_live_installations(db: &Db) -> Result<LiveInstallationLoad, rusqlite::Er
                 tracing::error!(
                     plugin_id = %plugin_id,
                     installation_uuid = %uuid,
-                    "granted_capabilities_json is NULL (pre-C5 install or corrupt row); \
+                    "granted_capabilities_json is NULL (corrupt row); \
                      quarantining — reinstall to re-issue the grant \
                      (C5 review F1 fail-closed)",
                 );
@@ -3243,16 +3236,14 @@ wasm = "x.wasm"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// C1b: a pre-existing plugin dir with no SQL row (upgrade
-    /// from pre-C1b, or a hand-placed dir) gets a fresh UUID
-    /// backfilled on scan and persists across restart.
+    /// C1b: a hand-placed plugin dir with no SQL row gets a fresh
+    /// UUID backfilled on scan and persists across restart.
     #[test]
-    fn scan_backfills_installation_uuid_for_pre_c1b_dirs() {
+    fn scan_backfills_installation_uuid_for_untracked_dirs() {
         let root = tempdir("backfill");
         let plugins_root = root.join("plugins");
         // Hand-place a plugin dir directly under plugins_root
-        // (skipping install), simulating an upgrade from before
-        // the plugin_installation table existed.
+        // (skipping install).
         let plugin_dir = plugins_root.join("example.legacy");
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(
@@ -3324,8 +3315,8 @@ wasm = "plugin.wasm"
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// C5 review F1 (fail-closed): a pre-C5 row (NULL grant JSON,
-    /// NULL digest) must be quarantined by scan — not silently
+    /// C5 review F1 (fail-closed): a row with a NULL grant JSON and
+    /// NULL digest must be quarantined by scan — not silently
     /// resolved from the manifest. The registry doesn't index it
     /// and `is_quarantined(plugin_id)` returns `true` so the
     /// direct-start / argv loader path refuses to shadow the
@@ -3372,7 +3363,7 @@ wasm = "plugin.wasm"
         let reg = InstalledPluginRegistry::scan(plugins_root, db).unwrap();
         assert!(
             reg.list().is_empty(),
-            "pre-C5 NULL grant must be quarantined, not resolved from manifest",
+            "a NULL grant must be quarantined, not resolved from manifest",
         );
         assert!(
             reg.is_quarantined(plugin_id),

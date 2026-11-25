@@ -52,8 +52,7 @@
 //!   A boot whose meta row or row count doesn't match its marker
 //!   treats the meta as damage and starts a new history, so a
 //!   revision inflated by damage can't keep cursors valid that the
-//!   lost writes made invalid. A meta row from before the marker has
-//!   none and is accepted once; the boot flush adds it.
+//!   lost writes made invalid.
 //! - **Encoding.** Fields use their own tagged JSON shape: floats by
 //!   bit pattern (NaN and infinities round-trip), bytes as hex, and
 //!   `u64` timestamps by bit pattern in `SQLite`'s signed integers.
@@ -267,17 +266,12 @@ struct FlushBatch {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredHole(u64, u64);
 
-/// `holes_json` as stored: the hole list with its consistency marker,
-/// or the bare list written before the marker existed.
+/// `holes_json` as stored: the hole list with its consistency marker.
 #[derive(serde::Serialize, serde::Deserialize)]
-#[serde(untagged)]
-enum StoredRanges {
-    Marked {
-        holes: Vec<StoredHole>,
-        rows: u64,
-        check: String,
-    },
-    Legacy(Vec<StoredHole>),
+struct StoredRanges {
+    holes: Vec<StoredHole>,
+    rows: u64,
+    check: String,
 }
 
 struct Meta {
@@ -285,7 +279,7 @@ struct Meta {
     revision: u64,
     evicted_through: u64,
     holes: Vec<(u64, u64)>,
-    /// The stored marker matched (or there was none).
+    /// The stored marker matched.
     consistent: bool,
 }
 
@@ -326,7 +320,7 @@ fn encode_ranges(
     writer: &str,
     rows: u64,
 ) -> serde_json::Result<String> {
-    serde_json::to_string(&StoredRanges::Marked {
+    serde_json::to_string(&StoredRanges {
         holes: holes.iter().map(|&(lo, hi)| StoredHole(lo, hi)).collect(),
         rows,
         check: meta_check(epoch, revision, evicted_through, holes, writer, rows),
@@ -1096,8 +1090,7 @@ fn load(db: &Db) -> anyhow::Result<Loaded> {
             })
             .map(|(epoch, revision, evicted, holes_json, writer)| {
                 let holes = match serde_json::from_str::<StoredRanges>(&holes_json) {
-                    Ok(StoredRanges::Legacy(holes)) => holes,
-                    Ok(StoredRanges::Marked { holes, rows, check }) => {
+                    Ok(StoredRanges { holes, rows, check }) => {
                         marker = Some((rows, check, writer));
                         holes
                     }
@@ -1683,41 +1676,6 @@ mod tests {
         }
     }
 
-    /// A meta row written before the marker existed (a bare hole list)
-    /// is accepted once, and the boot flush adds the marker.
-    #[test]
-    fn a_meta_row_without_a_marker_is_accepted() {
-        let dir = tempdir();
-        let store = open(&dir);
-        put(&store, "dev-a", true);
-        let epoch = store.epoch();
-        let cursor = store.current_revision();
-        assert!(store.close_persistence());
-        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
-        drop(store);
-        db.write(|c| {
-            c.execute(
-                "UPDATE device_state_meta SET holes_json = json_extract(holes_json, '$.holes')",
-                [],
-            )
-        })
-        .expect("strip the marker");
-        let stripped: String = db
-            .read(|c| c.query_row("SELECT holes_json FROM device_state_meta", [], |r| r.get(0)))
-            .expect("read");
-        assert!(stripped.starts_with('['), "{stripped}");
-        drop(db);
-        let store = open(&dir);
-        assert_eq!(store.epoch(), epoch);
-        assert!(!store.deltas_since_with_revision(cursor, 10).reset_required);
-        let db = Arc::clone(&store.backing.as_ref().expect("backing").db);
-        let marked: String = db
-            .read(|c| c.query_row("SELECT holes_json FROM device_state_meta", [], |r| r.get(0)))
-            .expect("read");
-        assert!(marked.contains("\"check\""), "{marked}");
-        assert!(store.close_persistence());
-    }
-
     /// Follow-up to H2: a failing flush reports the store degraded with
     /// its error, keeps the changes queued, and a later success clears
     /// it.
@@ -1754,11 +1712,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_pagination_cursor_is_a_restart() {
+    fn a_cursor_without_a_boot_field_is_bad() {
         let store = DeviceStateStore::new();
         assert_eq!(
             store.verify_cursor("epoch-00.12.dev-x.00000000000000000000000000000000"),
-            Err(CursorError::EpochChanged)
+            Err(CursorError::Bad)
         );
         assert_eq!(store.verify_cursor("x.1.y.z"), Err(CursorError::Bad));
     }
@@ -1990,16 +1948,31 @@ mod tests {
         let row_rev: i64 = db
             .read(|c| c.query_row("SELECT global_revision FROM device_state", [], |r| r.get(0)))
             .expect("row");
-        // Shift the range up so it ends on the surviving row (written
-        // as a bare list, which has no marker to fail).
+        // Shift the range up so it ends on the surviving row, and
+        // reseal the marker so only the range shape is wrong.
         let shift = row_rev - hi;
-        db.write(|c| {
-            c.execute(
-                "UPDATE device_state_meta SET holes_json = ?1",
-                [format!("[[{},{}]]", lo + shift, hi + shift)],
-            )
-        })
-        .expect("shift range");
+        let shifted = (to_u64(lo + shift), to_u64(hi + shift));
+        let (m_epoch, revision, evicted, writer, rows): (String, i64, i64, String, i64) = db
+            .read(|c| {
+                c.query_row(
+                    "SELECT epoch, revision, evicted_through, writer, \
+                     (SELECT COUNT(*) FROM device_state) FROM device_state_meta",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+            })
+            .expect("meta");
+        let sealed = encode_ranges(
+            &m_epoch,
+            to_u64(revision),
+            to_u64(evicted),
+            &[shifted],
+            &writer,
+            to_u64(rows),
+        )
+        .expect("encode");
+        db.write(|c| c.execute("UPDATE device_state_meta SET holes_json = ?1", [sealed]))
+            .expect("shift range");
         drop(db);
         let store = open(&dir);
         assert_ne!(store.epoch(), epoch, "shifted range must be damage");
