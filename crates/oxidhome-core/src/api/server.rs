@@ -3782,8 +3782,9 @@ struct AuditParams {
     /// Exact `level` match (H6 slice 2): `level=warn` lists the rows
     /// allowed sensitive actions wrote.
     level: Option<String>,
-    /// Exact `caused_by` match (H6 slice 4): the rows of `on-event`
-    /// reactions to events the invocation `caused_by` published.
+    /// Exact `caused_by` match (H6 slice 4): with an external request's
+    /// call id, the rows of every `on-event` reaction it caused, however
+    /// deep the chain.
     caused_by: Option<String>,
     /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
     /// string returned as `next_cursor` on the previous page.
@@ -3950,7 +3951,7 @@ struct WireAuditEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
     /// H6 slice 4: on an `on-event` reaction's rows, the call id of
-    /// the invocation whose event it reacts to.
+    /// the external request the reaction traces back to.
     #[serde(skip_serializing_if = "Option::is_none")]
     caused_by: Option<String>,
 }

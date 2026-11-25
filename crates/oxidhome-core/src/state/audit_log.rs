@@ -177,11 +177,10 @@ pub struct AuditEntry {
     /// `None` (info) everywhere else.
     #[serde(default)]
     pub level: Option<String>,
-    /// H6 slice 4: on rows of an `on-event` reaction, the `call_id` of
-    /// the invocation that published the event it reacts to (the
-    /// event's `call-id`). The reaction has its own `call_id`; this
-    /// links it to its cause. `None` everywhere else and on rows
-    /// written before migration 25.
+    /// H6 slice 4: on rows of an `on-event` reaction, the event's
+    /// `call-id`: the external request the reaction traces back to,
+    /// even through a chain of reactions. The reaction has its own
+    /// `call_id`; this links it to its cause. `None` everywhere else.
     #[serde(default)]
     pub caused_by: Option<String>,
 }
@@ -214,9 +213,10 @@ pub struct AuditQuery {
     /// Exact `level` match (H6 slice 2): `warn` returns the rows of
     /// allowed sensitive actions.
     pub level: Option<String>,
-    /// Exact `caused_by` match (H6 slice 4): the rows of `on-event`
-    /// reactions to events the invocation with that `call_id`
-    /// published.
+    /// Exact `caused_by` match (H6 slice 4): pass an external
+    /// request's `call_id` to get the rows of every `on-event` reaction
+    /// it caused, however deep the chain (events a reaction publishes
+    /// carry the request's id, not the reaction's).
     pub caused_by: Option<String>,
     /// Cursor-based pagination floor: return only rows strictly
     /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
