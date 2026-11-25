@@ -154,11 +154,15 @@ impl sockets::network::HostNetwork for NetView<'_> {
     }
 }
 
-/// Live TCP and UDP sockets in an instance's resource table.
-fn live_sockets(table: &mut ResourceTable) -> usize {
+/// Live TCP, UDP and discovery sockets in an instance's resource table.
+pub(super) fn live_sockets(table: &mut ResourceTable) -> usize {
     table
         .iter_mut()
-        .filter(|(_, entry)| entry.is::<TcpSocket>() || entry.is::<UdpSocket>())
+        .filter(|(_, entry)| {
+            entry.is::<TcpSocket>()
+                || entry.is::<UdpSocket>()
+                || entry.is::<super::DiscoverySocket>()
+        })
         .count()
 }
 

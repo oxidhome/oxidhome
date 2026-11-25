@@ -37,6 +37,12 @@ storage_quota_kb = 16
 #   listen <addr:port> bind + listen a TCP socket
 #   hold-udp <host:port> send "ping" from a socket kept open; ticks drain it
 #   hold-tcp <host:port> connect, send "ping\n", keep the stream; ticks drain it
+#   disc <ip:port>     send "ping" from a discovery socket, wait 2 s for a reply
+#   disc-send <ip:port> send "ping" from a discovery socket
+#   disc-bind <port>   bind an IPv4 discovery socket to that port
+#   disc-join <group>  join a multicast group from a discovery socket
+#   nets -             list the local networks the grant covers
+#   hold-disc <ip:port> send "ping" from a discovery socket kept open; ticks drain it
 type = "string"
 default = ""
 description = "Network operations to run on init."

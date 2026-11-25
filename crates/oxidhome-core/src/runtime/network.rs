@@ -8,7 +8,8 @@
 //!   the network. A component that imports `wasi:sockets` or `wasi:http`
 //!   fails to instantiate.
 //! - `streaming-plugin` / `streaming-ai-plugin`: the above plus
-//!   `wasi:sockets/*`, `wasi:http/{types,outgoing-handler}`, and the
+//!   `wasi:sockets/*`, `wasi:http/{types,outgoing-handler}`,
+//!   `host-network`, and the
 //!   `host-media` / `media` imports (placeholders until media pipelines
 //!   exist).
 //!
@@ -27,16 +28,21 @@
 //!   resolves the request's host, checks each address, and connects to
 //!   exactly the address it checked; `https://` adds TLS ([`tls`]), with
 //!   trust on first use for self-signed LAN devices.
+//! - `host-network` ([`discovery`]) lists the host's local networks the
+//!   rules cover, and serves discovery sockets, which may send to
+//!   broadcast and multicast destinations a `udp` rule names.
 //!
 //! Refusals are audited (`method = NET`) through the shared deny-audit
 //! worker, rate-limited per instance.
 
+mod discovery;
 mod dns;
 mod http;
 mod policy;
 mod sockets;
 mod tls;
 
+pub use discovery::DiscoverySocket;
 pub(crate) use dns::DnsOverrides;
 pub(crate) use http::{FIELD_SIZE_LIMIT, HttpHooks};
 pub(crate) use policy::{NetworkPolicy, covers as rule_covers};
@@ -121,6 +127,7 @@ pub(crate) fn add_wasi_to_linker(
     if is_streaming(world) {
         sockets::add_sockets(linker)?;
         http::add_to_linker(linker)?;
+        discovery::add_to_linker(linker)?;
         super::media_placeholder::add_to_linker(linker)?;
     }
     Ok(())

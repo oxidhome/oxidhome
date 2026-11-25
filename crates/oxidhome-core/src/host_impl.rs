@@ -24,7 +24,9 @@
 //! ## `with:` mappings
 //!
 //! - **Plugin-defined resources** (`pipeline-handle`, `pipe-writer`,
-//!   `model`) map to the placeholder host structs in this module.
+//!   `model`) map to the placeholder host structs in this module, and
+//!   `discovery-socket` to the host's socket
+//!   ([`crate::runtime::network::DiscoverySocket`]).
 //!   Phase 9 replaces the media handles with real pipeline state;
 //!   Phase 10 does the same for the inference model. Each world only
 //!   declares the mappings whose interfaces it actually imports —
@@ -75,11 +77,16 @@ pub mod streaming_plugin {
     wasmtime::component::bindgen!({
         path: "../../wit",
         world: "streaming-plugin",
-        imports: { default: async },
+        imports: {
+            default: async,
+            // Pushing the pollable can fail (the table is capped): a trap.
+            "oxidhome:plugin/host-network.[method]discovery-socket.subscribe": async | trappable,
+        },
         exports: { default: async },
         with: {
             "oxidhome:plugin/media.pipeline-handle": super::HostPipelineHandle,
             "oxidhome:plugin/media.pipe-writer": super::HostPipeWriter,
+            "oxidhome:plugin/host-network.discovery-socket": crate::runtime::network::DiscoverySocket,
         },
     });
 }
@@ -104,11 +111,15 @@ pub mod streaming_ai_plugin {
     wasmtime::component::bindgen!({
         path: "../../wit",
         world: "streaming-ai-plugin",
-        imports: { default: async },
+        imports: {
+            default: async,
+            "oxidhome:plugin/host-network.[method]discovery-socket.subscribe": async | trappable,
+        },
         exports: { default: async },
         with: {
             "oxidhome:plugin/media.pipeline-handle": super::HostPipelineHandle,
             "oxidhome:plugin/media.pipe-writer": super::HostPipeWriter,
+            "oxidhome:plugin/host-network.discovery-socket": crate::runtime::network::DiscoverySocket,
             "oxidhome:plugin/inference.model": super::HostModel,
         },
     });
@@ -152,12 +163,17 @@ mod tests {
 
     #[test]
     fn streaming_plugin_world_resolves() {
-        use super::streaming_plugin::oxidhome::plugin::{host_media, media};
+        use super::streaming_plugin::oxidhome::plugin::{host_media, host_network, media};
         use super::streaming_plugin::{StreamingPlugin, StreamingPluginPre};
 
         fn _accepts<H>()
         where
-            H: host_media::Host + media::Host + media::HostPipelineHandle + media::HostPipeWriter,
+            H: host_media::Host
+                + host_network::Host
+                + host_network::HostDiscoverySocket
+                + media::Host
+                + media::HostPipelineHandle
+                + media::HostPipeWriter,
         {
         }
 

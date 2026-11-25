@@ -302,3 +302,36 @@ async fn network_discovery_publishes_a_reply_without_waiting_for_its_tick() {
     assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
     instance.stop().await.unwrap();
 }
+
+/// A discovery socket wakes the plugin for a datagram the rules allow,
+/// and never for one from a sender they refuse: the host discards it
+/// while it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discovery_socket_wakes_only_for_allowed_senders() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let (peer, socket) = udp_peer();
+    let dir = probe(&format!("udp://{peer}"), Some(HOUR_MS));
+    let instance = start(&host, &dir, &format!("hold-disc {peer}")).await;
+    let storage = instance.storage();
+    wait_for(&storage, "received", 1).await;
+    assert_eq!(string(&storage, "last"), "pong");
+    assert_eq!(int(&storage, "ticks"), 1);
+    assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
+    wait_for_gate(&host).await;
+
+    let (socket, plugin) = socket.recv_timeout(WAIT).expect("peer saw the probe");
+    let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..20 {
+        stranger.send_to(b"refused", plugin).unwrap();
+    }
+    tokio::time::sleep(QUIET).await;
+    host.advance(GAP * 5).await.unwrap();
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(int(&storage, "ticks"), 1);
+
+    socket.send_to(b"allowed", plugin).unwrap();
+    wait_for(&storage, "received", 2).await;
+    assert_eq!(string(&storage, "last"), "allowed");
+    assert_eq!(int(&storage, "ticks"), 2);
+    instance.stop().await.unwrap();
+}

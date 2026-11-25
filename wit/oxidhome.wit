@@ -1544,6 +1544,91 @@ interface host-state {
   ) -> result<state-page, error>;
 }
 
+/// LAN discovery for the streaming worlds: the host's local networks, and
+/// a UDP socket that may send to broadcast and multicast destinations,
+/// which `wasi:sockets/udp` can't reach (it has no `SO_BROADCAST` and no
+/// group membership).
+///
+/// The same `[capabilities] network` rules decide everything here, on the
+/// resolved IP address:
+///
+/// - The limited broadcast `255.255.255.255` and a multicast group
+///   (`224.0.0.251`, `239.255.255.250`, `ff02::fb`, …) are reached only
+///   through a `udp` rule naming that exact address and the port
+///   (`udp://255.255.255.255:9999`, `udp://224.0.0.251:5353`). A CIDR rule
+///   never covers them. Joining a group needs a `udp` rule naming it.
+/// - A subnet-directed broadcast (`192.168.1.255` on `192.168.1.0/24`)
+///   reaches every host of that network, so it needs a `udp` rule naming
+///   it, or a `udp` IP rule covering the whole network.
+/// - Any other destination is checked as a `wasi:sockets/udp` send is.
+/// - A received datagram is kept only when its sender would pass that
+///   check; others are dropped silently.
+/// - The socket binds to the unspecified address. A fixed local port
+///   needs a broadcast or multicast rule with that port, and is shared
+///   with other sockets on the host (`SO_REUSEADDR`), so a plugin can
+///   listen next to the system's mDNS responder.
+///
+/// Refused sends, joins and binds fail with `access-denied` and are
+/// audited. Discovery sockets count towards the instance's socket limit.
+interface host-network {
+  use wasi:io/poll@0.2.0.{pollable};
+  use wasi:sockets/network@0.2.0.{error-code, ip-address, ip-address-family, ip-socket-address};
+
+  /// A network the host is attached to: `address` is its first address,
+  /// `prefix-len` its prefix (`192.168.1.0`, 24).
+  record local-network {
+    address: ip-address,
+    prefix-len: u8,
+  }
+
+  /// The networks of the host's interfaces, as far as the instance's
+  /// granted IP and CIDR rules cover them: a network inside a rule is
+  /// listed whole, and a rule inside a network is listed as the rule's
+  /// range. Name rules list nothing. Sorted, without duplicates; empty
+  /// when nothing is covered or the host can't list its interfaces.
+  local-networks: func() -> list<local-network>;
+
+  /// A datagram received on a `discovery-socket`.
+  record datagram {
+    data: list<u8>,
+    remote-address: ip-socket-address,
+  }
+
+  /// A non-blocking UDP socket for discovery. Closed when dropped.
+  resource discovery-socket {
+    /// Bind a socket of `family` to the unspecified address and
+    /// `local-port` (0 for an ephemeral port).
+    ///
+    /// Errors: `access-denied` (a fixed port no broadcast or multicast
+    /// rule names), `new-socket-limit`, `address-in-use`.
+    open: static func(family: ip-address-family, local-port: u16) -> result<discovery-socket, error-code>;
+
+    /// The address the socket is bound to.
+    local-address: func() -> result<ip-socket-address, error-code>;
+
+    /// Join the multicast group `group` on the default interface.
+    ///
+    /// Errors: `invalid-argument` (not a multicast address of the
+    /// socket's family), `access-denied` (no `udp` rule names it).
+    join-multicast: func(group: ip-address) -> result<_, error-code>;
+
+    /// Send one datagram to `remote-address`.
+    ///
+    /// Errors: `access-denied` (the rules refuse it), `invalid-argument`
+    /// (another address family, or port 0), `would-block`,
+    /// `datagram-too-large`, `remote-unreachable`.
+    send: func(data: list<u8>, remote-address: ip-socket-address) -> result<_, error-code>;
+
+    /// Up to `max-results` waiting datagrams (at most 32), without
+    /// blocking; empty when none is waiting. Datagrams longer than
+    /// 65535 bytes are truncated.
+    receive: func(max-results: u32) -> result<list<datagram>, error-code>;
+
+    /// Ready when a datagram the rules allow is waiting.
+    subscribe: func() -> pollable;
+  }
+}
+
 /// Media pipeline orchestration. Imported only by the streaming worlds —
 /// reachability is what gives the standard `plugin` world its no-raw-I/O
 /// guarantee. Capability is still gated by the manifest at the call site.
@@ -1650,9 +1735,12 @@ interface streaming {
 /// range. Binds are allowed only to the
 /// unspecified address; `listen` is refused. `wasi:http` does not follow
 /// redirects, so each hop is a new, separately checked request.
+/// Broadcast and multicast go through `host-network`'s discovery socket,
+/// behind rules naming those addresses.
 world streaming-plugin {
   include plugin;
   import host-media;
+  import host-network;
   import wasi:sockets/instance-network@0.2.0;
   import wasi:sockets/network@0.2.0;
   import wasi:sockets/tcp-create-socket@0.2.0;
