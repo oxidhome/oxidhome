@@ -613,10 +613,11 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
                 .into_iter()
                 .map(|d| {
                     d.into_parts()
-                        .map(|(actions, categories, devices)| DenyRule {
+                        .map(|(actions, categories, devices, services)| DenyRule {
                             actions,
                             categories,
                             devices,
+                            services,
                         })
                 })
                 .collect::<Option<Vec<_>>>()?,

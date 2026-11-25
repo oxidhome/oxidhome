@@ -313,6 +313,7 @@ fn record_snapshot_event(engine: &Engine) {
         origin_plugin_id: "example.camera".into(),
         origin_instance_id: "cam".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: "camera".into(),
             fields: vec![

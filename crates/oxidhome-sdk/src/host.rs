@@ -324,6 +324,7 @@ pub fn publish_state_change(
         // overwrites `None` with the durable `event_log` id
         // before broadcasting.
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: capability.into(),
             fields,
@@ -348,6 +349,7 @@ pub fn publish_custom_event(
         origin_plugin_id: String::new(),
         origin_instance_id: String::new(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: payload.into(),

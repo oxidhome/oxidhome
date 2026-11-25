@@ -635,6 +635,7 @@ pub(crate) fn reconcile(db: &Db) -> Result<usize, AuditLogError> {
 
 fn reconciled_entry(row: &PendingRow, reason: &str) -> AuditEntry {
     AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

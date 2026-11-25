@@ -180,6 +180,14 @@ pub(crate) const AUDIT_READ: Scope = Scope::new("audit:read");
 /// this scope is empowered to drive physical-world effects.
 pub(crate) const DEVICES_COMMAND: Scope = Scope::new("devices:command");
 
+/// `services:call` — H6 slice 4: lets an invocation this token roots
+/// reach a plugin service through a delegated `call-service` hop (a
+/// script the token triggered calling another plugin's service). Each
+/// hop needs it on top of the calling plugin's `consumes_services`
+/// grant; a role grant can narrow it to some services. No REST route
+/// checks it: it is the token's *delegation* grant.
+pub(crate) const SERVICES_CALL: Scope = Scope::new("services:call");
+
 /// `plugins:list` — see `GET /api/v1/plugins`.
 pub(crate) const PLUGINS_LIST: Scope = Scope::new("plugins:list");
 

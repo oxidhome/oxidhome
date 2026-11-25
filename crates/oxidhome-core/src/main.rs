@@ -861,6 +861,7 @@ fn parse_token_create(
                     actions: actions.split(',').map(str::to_owned).collect(),
                     category,
                     devices: None,
+                    services: None,
                 });
             }
             other if other.starts_with('-') => anyhow::bail!("unexpected argument `{other}`"),

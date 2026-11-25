@@ -23,7 +23,13 @@
 //!   wait at most the remaining budget;
 //! - the **delegation chain** — one [`DelegationHop`] per
 //!   `call-service` hop, outermost first. The dispatcher's cycle
-//!   detection reads the same chain.
+//!   detection reads the same chain, and every hop is authorized
+//!   against the root's authority as well as the calling plugin's
+//!   grants ([`crate::auth::authorize_hop`]);
+//! - what the invocation was **caused by** — the call id of the
+//!   invocation that published the event an `on-event` reaction is
+//!   handling ([`InvocationContext::reacting_to`]). Attribution only:
+//!   the reaction runs with the subscriber's own authority.
 //!
 //! The context is host-only: it is never serialized into the WIT
 //! surface, so a plugin can neither read nor forge it. It rides the
@@ -36,9 +42,13 @@
 //! Work that starts inside the host (plugin `init`, `tick`, `on-event`,
 //! and test drivers that call `InstanceHandle::execute_command`) runs
 //! under a [`Transport::Host`] context rooted at the plugin instance
-//! itself. Those invocations are not externally attributable, so the
-//! dispatcher keeps them out of the audit ledger (they are traced
-//! only), which keeps ledger volume proportional to external requests.
+//! itself. The dispatcher keeps those invocations out of the audit
+//! ledger (they are traced only), which keeps ledger volume
+//! proportional to external requests. The one exception is an
+//! `on-event` reaction to an event an attributable invocation
+//! published: its context records the publisher's call id as
+//! `caused_by`, and its hops are audited with it
+//! ([`InvocationContext::is_attributable`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -253,6 +263,7 @@ struct Inner {
     current: Option<String>,
     deadline: Option<Instant>,
     chain: Vec<DelegationHop>,
+    caused_by: Option<String>,
 }
 
 task_local! {
@@ -302,6 +313,21 @@ impl InvocationContext {
         )
     }
 
+    /// Context for a subscriber's `on-event` reaction to an event
+    /// published under the invocation `caused_by` (the event's
+    /// `call-id`). Host-origin like [`Self::host_origin`]: the
+    /// reaction runs with `instance_id`'s own authority, never the
+    /// causing root's. It gets its own call id; `caused_by` only links
+    /// its audit rows to the cause.
+    #[must_use]
+    pub fn reacting_to(instance_id: &str, caused_by: &str) -> Self {
+        let mut ctx = Self::host_origin(instance_id);
+        Arc::get_mut(&mut ctx.inner)
+            .expect("freshly built context is unshared")
+            .caused_by = Some(audit_cap(caused_by).to_owned());
+        ctx
+    }
+
     fn new(root: Principal, current: Option<String>, deadline: Option<Instant>) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -310,6 +336,7 @@ impl InvocationContext {
                 current,
                 deadline,
                 chain: Vec::new(),
+                caused_by: None,
             }),
         }
     }
@@ -367,6 +394,24 @@ impl InvocationContext {
         &self.inner.chain
     }
 
+    /// Call id of the invocation whose event this one reacts to, for
+    /// an `on-event` reaction ([`Self::reacting_to`]).
+    #[must_use]
+    pub fn caused_by(&self) -> Option<&str> {
+        self.inner.caused_by.as_deref()
+    }
+
+    /// `true` when the invocation traces back to an external request:
+    /// its root is external, or it reacts to an event such an
+    /// invocation (or another attributable reaction) published. Only
+    /// these invocations write hop audit rows and stamp their call id
+    /// on the events they publish, so ledger volume follows external
+    /// requests, not timers.
+    #[must_use]
+    pub fn is_attributable(&self) -> bool {
+        self.inner.root.is_external() || self.inner.caused_by.is_some()
+    }
+
     /// Derived context with `instance_id` as the executing actor.
     #[must_use]
     pub fn entering(&self, instance_id: &str) -> Self {
@@ -393,6 +438,7 @@ impl InvocationContext {
             current: self.inner.current.clone(),
             deadline: self.inner.deadline,
             chain: self.inner.chain.clone(),
+            caused_by: self.inner.caused_by.clone(),
         };
         f(&mut inner);
         Self {
@@ -402,8 +448,8 @@ impl InvocationContext {
 
     /// JSON summary stored in the audit ledger's `invocation_json`
     /// column: root principal, executing actor, delegation chain. The
-    /// call id has its own column and the deadline is a monotonic
-    /// instant, so neither is repeated here.
+    /// call id and `caused_by` have their own columns and the deadline
+    /// is a monotonic instant, so none of them is repeated here.
     #[must_use]
     pub fn audit_json(&self) -> String {
         let root = &self.inner.root;
@@ -552,6 +598,32 @@ mod tests {
         assert_eq!(b.call_id(), root.call_id());
         assert_eq!(b.root(), root.root());
         assert_eq!(b.deadline(), root.deadline());
+    }
+
+    #[test]
+    fn reactions_are_host_rooted_but_attributable() {
+        let ctx = InvocationContext::reacting_to("beta", "call-cause");
+        assert!(!ctx.root().is_external());
+        assert!(ctx.is_attributable());
+        assert_eq!(ctx.caused_by(), Some("call-cause"));
+        assert_ne!(ctx.call_id(), "call-cause");
+        assert_eq!(ctx.current_actor(), Some("beta"));
+        assert_eq!(ctx.remaining(), None);
+        // Derived contexts keep the cause.
+        let hop = ctx.delegate(hop("beta", "gamma"));
+        assert_eq!(hop.caused_by(), Some("call-cause"));
+        assert_eq!(hop.call_id(), ctx.call_id());
+        // A host-origin context without a cause isn't attributable; an
+        // external one is.
+        assert!(!InvocationContext::host_origin("beta").is_attributable());
+        let actor = Actor::api("tok-1", vec![]);
+        assert!(
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+                .is_attributable()
+        );
+        // An oversized cause is capped like other audit identifiers.
+        let long = InvocationContext::reacting_to("beta", &"x".repeat(10_000));
+        assert_eq!(long.caused_by().map(str::len), Some(MAX_AUDIT_IDENT_BYTES));
     }
 
     #[test]

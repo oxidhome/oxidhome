@@ -205,6 +205,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: "t.x".into(),
                 payload: "{}".into(),

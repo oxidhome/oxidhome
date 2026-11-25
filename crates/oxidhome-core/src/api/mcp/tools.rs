@@ -3232,6 +3232,7 @@ async fn plugins_install_call(
 /// `method`, `path`, and `credential_fp` reach the row.
 fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
     AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,
@@ -3262,6 +3263,7 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
 /// because no tool body ran.
 fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> AuditEntry {
     AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

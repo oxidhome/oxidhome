@@ -27,6 +27,7 @@ fn event(n: u64) -> Event {
         origin_plugin_id: "com.example.resume".into(),
         origin_instance_id: "resume-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: "resume.test".into(),
             payload: n.to_string(),
@@ -429,6 +430,7 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
         origin_plugin_id: "com.example.resume".into(),
         origin_instance_id: "resume-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: "camera".into(),
             fields: vec![KeyValue {

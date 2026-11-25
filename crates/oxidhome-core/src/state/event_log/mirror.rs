@@ -597,6 +597,7 @@ fn gap_marker_event(gap: &GapMarker, received_ms: i64) -> Result<(Event, Vec<u8>
         origin_plugin_id: GAP_MARKER_ORIGIN.to_owned(),
         origin_instance_id: GAP_MARKER_ORIGIN.to_owned(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: GAP_MARKER_TOPIC.to_owned(),
             payload,
@@ -630,6 +631,7 @@ mod tests {
             origin_plugin_id: "example.alpha".into(),
             origin_instance_id: "alpha".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: vec![KeyValue {

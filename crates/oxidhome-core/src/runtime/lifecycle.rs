@@ -781,7 +781,7 @@ impl InstanceHandle {
         check: &ResultCheck,
     ) -> Option<UnreadReply<anyhow::Result<CommandResult>>> {
         let pending = self.pending.as_ref()?.upgrade()?;
-        if !ctx.root().is_external() {
+        if !ctx.is_attributable() {
             return None;
         }
         let ctx = ctx.clone();

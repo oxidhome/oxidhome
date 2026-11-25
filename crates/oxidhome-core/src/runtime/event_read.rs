@@ -263,6 +263,7 @@ mod tests {
             origin_plugin_id: "example.pub".into(),
             origin_instance_id: "pub".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: payload.into(),
@@ -277,6 +278,7 @@ mod tests {
             origin_plugin_id: "example.pub".into(),
             origin_instance_id: "pub".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "camera".into(),
                 fields: vec![KeyValue {

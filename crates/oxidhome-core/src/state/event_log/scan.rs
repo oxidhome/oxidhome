@@ -79,7 +79,7 @@ impl EventLog {
             // One statement, stepped lazily: a row is decoded only
             // when the scan gets to it, so a full page stops decoding.
             let mut stmt = conn.prepare(
-                "SELECT id, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
+                "SELECT id, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob, call_id \
                  FROM event_log WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
             )?;
             let mut rows = stmt.query(rusqlite::params![
@@ -183,6 +183,7 @@ fn decode_row(
             origin_plugin_id: row.get(4)?,
             origin_instance_id: row.get(3)?,
             row_id: Some(id),
+            call_id: row.get(7)?,
             payload: stored.into_wit(),
         }))
     })();
@@ -226,6 +227,7 @@ mod tests {
                 origin_plugin_id: "example.test".into(),
                 origin_instance_id: "inst".into(),
                 row_id: None,
+                call_id: None,
             };
             #[allow(clippy::cast_possible_wrap)]
             log.record(n as i64, &ev, "inst", "example.test")

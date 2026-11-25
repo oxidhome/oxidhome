@@ -135,6 +135,7 @@ async fn supervisor_delivers_bus_events() {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),

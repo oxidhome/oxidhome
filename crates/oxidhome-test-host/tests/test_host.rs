@@ -511,6 +511,7 @@ async fn plugin_reads_event_history_from_its_cursor() {
         origin_plugin_id: "test.publisher".into(),
         origin_instance_id: "publisher".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: "{}".into(),

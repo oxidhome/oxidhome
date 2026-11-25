@@ -1570,6 +1570,14 @@ impl host_events::Host for PluginState {
         let mut ev = ev;
         ev.origin_plugin_id = self.manifest.plugin.id.clone();
         ev.origin_instance_id = self.instance_id.clone();
+        // H6 slice 4: attribution, host-stamped like the origin. The
+        // publishing invocation's call id when it traces back to an
+        // external request; `None` for the host's own work (`init`,
+        // `tick`), so timer-driven events don't pull their reactions
+        // into the audit ledger.
+        ev.call_id = crate::auth::invocation::current()
+            .filter(crate::auth::InvocationContext::is_attributable)
+            .map(|ctx| ctx.call_id().to_owned());
 
         // C4 review P2 F2: serialize the payload ONCE, cap on the
         // exact bytes that will hit disk, then hand the same
@@ -2764,6 +2772,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),
@@ -2778,6 +2787,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -2793,6 +2803,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Button(ButtonEvent::Pressed),
         }
     }
@@ -2804,6 +2815,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
@@ -3197,6 +3209,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(events::CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),
@@ -4095,6 +4108,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "test".into(),
@@ -4270,6 +4284,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "escape-test".into(),
@@ -4303,6 +4318,7 @@ mod tests {
             origin_plugin_id: "x".repeat(MAX_EVENT_PAYLOAD_BYTES),
             origin_instance_id: "y".repeat(MAX_EVENT_PAYLOAD_BYTES),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "tiny".into(),

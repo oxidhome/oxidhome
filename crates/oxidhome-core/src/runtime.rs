@@ -1801,6 +1801,7 @@ fn purge_tls_pins_audited(
             command_id: None,
             command_outcome: None,
             level: None,
+            caused_by: None,
         };
         match audit_log.record_intent_durable(&entry) {
             Ok(id) => intents.push(id),

@@ -1165,6 +1165,7 @@ fn record_restore(state_dir: &Path, archive_created_ms: u64) -> anyhow::Result<(
     let engine = crate::Engine::with_state_dir(state_dir)
         .with_context(|| format!("opening engine state at {}", state_dir.display()))?;
     let entry = crate::state::AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

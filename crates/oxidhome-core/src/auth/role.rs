@@ -20,9 +20,13 @@
 //! # Grants
 //!
 //! A [`RoleGrant`] names actions (`*` is every action a scope can
-//! grant; `token.manage`, `policy.manage`, `service.call` and
-//! `state.read` can't be granted). Without selectors it covers every
-//! resource. With a `category` and / or `devices` selector it covers a
+//! grant; `token.manage`, `policy.manage` and `state.read` can't be
+//! granted). Without selectors it covers every resource. A `services`
+//! selector (H6 slice 4) narrows `service.call`, the delegation grant
+//! every `call-service` hop of an invocation the token roots needs, to
+//! the services it names: `<plugin>` or `<plugin>/<local-id>`, each
+//! half literal or `prefix*`. It can't be combined with the device
+//! selectors. With a `category` and / or `devices` selector it covers a
 //! device whose display category is listed and whose id matches a
 //! pattern, and the *pre-check* on the device kind
 //! ([`crate::auth::Resource::PreCheck`]), since the per-device check
@@ -49,11 +53,14 @@
 //! device-narrowed rule matches every blob (a blob names no device) and
 //! a category rule a camera instance's blob when it names `camera`. No
 //! rule with a selector matches a pre-check, so a deny on locks doesn't
-//! stop a token from commanding lights.
+//! stop a token from commanding lights. A `services` deny matches only
+//! the services it names; a device selector never matches a service
+//! (services carry no category yet), so a deny of `service.call` on
+//! some services names them.
 
 use std::str::FromStr;
 
-use super::authorize::{Action, Resource, ResourceKind};
+use super::authorize::{Action, Resource, ResourceKind, ServiceResource};
 use super::category::{DeviceCategory, SensitiveCategory};
 use super::policy::match_pattern;
 
@@ -188,9 +195,12 @@ impl FromStr for Action {
 pub const SCOPED: ActionSet = ActionSet::ALL.without(ActionSet::of(&[
     Action::TokenManage,
     Action::PolicyManage,
-    Action::ServiceCall,
     Action::StateRead,
 ]));
+
+/// The actions a `services` selector may narrow: a narrowed `*`
+/// means these.
+pub const SERVICE_NARROWABLE: ActionSet = ActionSet::of(&[Action::ServiceCall]);
 
 /// The actions a role grant may narrow to devices: the ones whose
 /// target is a device. A narrowed `*` means these.
@@ -200,11 +210,15 @@ pub const NARROWABLE: ActionSet = ActionSet::of(&[
     Action::DeviceCommand,
 ]);
 
-/// One grant of a role: actions, optionally narrowed to devices.
+/// One grant of a role: actions, optionally narrowed to devices or to
+/// services.
 ///
 /// Wire shape: `{"actions": ["device.read"], "category": ["light"],
-/// "devices": ["dev-a1b2*"]}`; `category` and `devices` are optional,
-/// non-empty when present, and both must match when both are given.
+/// "devices": ["dev-a1b2*"]}` or `{"actions": ["service.call"],
+/// "services": ["acme.notify/send"]}`; `category`, `devices` and
+/// `services` are optional and non-empty when present; `category` and
+/// `devices` must both match when both are given, and `services`
+/// stands alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleGrant {
     /// Actions granted (a subset of [`SCOPED`]).
@@ -214,6 +228,9 @@ pub struct RoleGrant {
     /// Device-id patterns (literal or `prefix*`) the grant is narrowed
     /// to.
     pub devices: Option<Vec<String>>,
+    /// Service patterns (`<plugin>[/<local-id>]`, see
+    /// [`service_pattern_matches`]) the grant is narrowed to.
+    pub services: Option<Vec<String>>,
 }
 
 impl RoleGrant {
@@ -222,6 +239,9 @@ impl RoleGrant {
     pub fn permits(&self, action: Action, resource: &Resource) -> bool {
         if !self.actions.contains(action) {
             return false;
+        }
+        if let Some(services) = &self.services {
+            return matches!(resource, Resource::Service(svc) if services.iter().any(|p| service_pattern_matches(p, svc)));
         }
         if self.categories.is_none() && self.devices.is_none() {
             return true;
@@ -250,6 +270,7 @@ impl RoleGrant {
             self.actions,
             self.categories.as_deref(),
             self.devices.as_deref(),
+            self.services.as_deref(),
         )
     }
 
@@ -260,6 +281,7 @@ impl RoleGrant {
             self.actions,
             self.categories.as_deref(),
             self.devices.as_deref(),
+            self.services.as_deref(),
         )
     }
 }
@@ -341,10 +363,12 @@ impl RoleDef {
         let mut grants = Vec::with_capacity(wire.grants.len());
         for g in wire.grants {
             let wildcard = g.actions.iter().any(|a| a == "*");
-            let (actions, categories, devices) = g.into_parts()?;
+            let (actions, categories, devices, services) = g.into_parts()?;
             // `*` is every action a scope grants; naming one no scope
             // grants refuses the definition.
-            let allowed = if categories.is_some() || devices.is_some() {
+            let allowed = if services.is_some() {
+                SERVICE_NARROWABLE
+            } else if categories.is_some() || devices.is_some() {
                 NARROWABLE
             } else {
                 SCOPED
@@ -360,6 +384,7 @@ impl RoleDef {
                 actions,
                 categories,
                 devices,
+                services,
             });
         }
         let mut sensitive = Vec::with_capacity(wire.sensitive.len());
@@ -371,11 +396,12 @@ impl RoleDef {
         }
         let mut deny = Vec::with_capacity(wire.deny.len());
         for d in wire.deny {
-            let (actions, categories, devices) = d.into_parts()?;
+            let (actions, categories, devices, services) = d.into_parts()?;
             deny.push(DenyRule {
                 actions,
                 categories,
                 devices,
+                services,
             });
         }
         Some(Self {
@@ -388,7 +414,8 @@ impl RoleDef {
     }
 }
 
-/// Wire form of a grant or deny: `{actions, category?, devices?}`.
+/// Wire form of a grant or deny: `{actions, category?, devices?,
+/// services?}`.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SelectorWire {
@@ -397,21 +424,35 @@ pub(crate) struct SelectorWire {
     category: Option<Vec<String>>,
     #[serde(default)]
     devices: Option<Vec<String>>,
+    #[serde(default)]
+    services: Option<Vec<String>>,
 }
 
-/// Parsed parts of a [`SelectorWire`].
-type SelectorParts = (ActionSet, Option<Vec<DeviceCategory>>, Option<Vec<String>>);
+/// Parsed parts of a [`SelectorWire`]: actions, categories, device
+/// patterns, service patterns.
+pub(crate) type SelectorParts = (
+    ActionSet,
+    Option<Vec<DeviceCategory>>,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+);
 
 impl SelectorWire {
-    /// `None` for an unknown action or category, an empty list or a
-    /// device pattern no device id can match: a selector that names
-    /// nothing would silently match nothing.
+    /// `None` for an unknown action or category, an empty list, a
+    /// device or service pattern nothing can match, or `services`
+    /// mixed with a device selector: a selector that names nothing
+    /// would silently match nothing.
     pub(crate) fn into_parts(self) -> Option<SelectorParts> {
         if self.actions.is_empty()
             || self.category.as_ref().is_some_and(Vec::is_empty)
             || self.devices.as_ref().is_some_and(|d| {
                 d.is_empty() || !d.iter().all(|p| crate::state::is_device_pattern(p))
             })
+            || self
+                .services
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || !s.iter().all(|p| is_service_pattern(p)))
+            || (self.services.is_some() && (self.category.is_some() || self.devices.is_some()))
         {
             return None;
         }
@@ -429,7 +470,39 @@ impl SelectorWire {
                 Some(out)
             })
             .map_or(Some(None), |c| c.map(Some))?;
-        Some((actions, categories, self.devices))
+        Some((actions, categories, self.devices, self.services))
+    }
+}
+
+/// Longest service pattern a selector accepts.
+pub const MAX_SERVICE_PATTERN_BYTES: usize = 256;
+
+/// `true` for a service pattern: `<plugin>` or `<plugin>/<local-id>`,
+/// each half non-empty, literal or `prefix*` (`*` alone is every
+/// plugin), without control characters, at most
+/// [`MAX_SERVICE_PATTERN_BYTES`].
+#[must_use]
+pub fn is_service_pattern(pattern: &str) -> bool {
+    let well_formed =
+        |half: &str| !half.is_empty() && half.find('*').is_none_or(|i| i == half.len() - 1);
+    pattern.len() <= MAX_SERVICE_PATTERN_BYTES
+        && !pattern.chars().any(char::is_control)
+        && match pattern.split_once('/') {
+            Some((plugin, service)) => well_formed(plugin) && well_formed(service),
+            None => well_formed(pattern),
+        }
+}
+
+/// Does service pattern `pattern` cover `service`? The plugin half
+/// matches the owning plugin id and the optional `/<local-id>` half the
+/// service's immutable `local-id`; each is literal or `prefix*`.
+#[must_use]
+pub fn service_pattern_matches(pattern: &str, service: &ServiceResource) -> bool {
+    match pattern.split_once('/') {
+        Some((plugin, local)) => {
+            match_pattern(plugin, service.plugin_id()) && match_pattern(local, service.local_id())
+        }
+        None => match_pattern(pattern, service.plugin_id()),
     }
 }
 
@@ -465,6 +538,7 @@ fn selector_json(
     actions: ActionSet,
     categories: Option<&[DeviceCategory]>,
     devices: Option<&[String]>,
+    services: Option<&[String]>,
 ) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("actions".into(), serde_json::json!(actions.names()));
@@ -477,6 +551,9 @@ fn selector_json(
     if let Some(d) = devices {
         obj.insert("devices".into(), serde_json::json!(d));
     }
+    if let Some(s) = services {
+        obj.insert("services".into(), serde_json::json!(s));
+    }
     serde_json::Value::Object(obj)
 }
 
@@ -484,6 +561,7 @@ fn describe(
     actions: ActionSet,
     categories: Option<&[DeviceCategory]>,
     devices: Option<&[String]>,
+    services: Option<&[String]>,
 ) -> String {
     let mut s = actions.names().join(",");
     if let Some(c) = categories {
@@ -494,6 +572,11 @@ fn describe(
         s.push('[');
         s.push_str(&d.join(" "));
         s.push(']');
+    }
+    if let Some(svc) = services {
+        s.push('{');
+        s.push_str(&svc.join(" "));
+        s.push('}');
     }
     s
 }
@@ -507,9 +590,10 @@ fn describe(
 /// ```
 ///
 /// `actions` is required and non-empty (`"*"` is every action);
-/// `category` and `devices` are optional, non-empty when present, and
-/// both must match when both are given. See the module docs for how a
-/// deny matches.
+/// `category`, `devices` and `services` are optional and non-empty when
+/// present; `category` and `devices` must both match when both are
+/// given, and `services` (`["zwave.*/door"]`) stands alone. See the
+/// module docs for how a deny matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyRule {
     /// Actions denied.
@@ -519,6 +603,9 @@ pub struct DenyRule {
     /// Device-id patterns (literal or `prefix*`) the deny is narrowed
     /// to.
     pub devices: Option<Vec<String>>,
+    /// Service patterns the deny is narrowed to
+    /// ([`service_pattern_matches`]).
+    pub services: Option<Vec<String>>,
 }
 
 impl DenyRule {
@@ -529,6 +616,7 @@ impl DenyRule {
             self.actions,
             self.categories.as_deref(),
             self.devices.as_deref(),
+            self.services.as_deref(),
             action,
             resource,
         )
@@ -541,6 +629,7 @@ impl DenyRule {
             self.actions,
             self.categories.as_deref(),
             self.devices.as_deref(),
+            self.services.as_deref(),
         )
     }
 
@@ -551,6 +640,7 @@ impl DenyRule {
             self.actions,
             self.categories.as_deref(),
             self.devices.as_deref(),
+            self.services.as_deref(),
         )
     }
 }
@@ -572,11 +662,15 @@ fn deny_matches(
     actions: ActionSet,
     categories: Option<&[DeviceCategory]>,
     devices: Option<&[String]>,
+    services: Option<&[String]>,
     action: Action,
     resource: &Resource,
 ) -> bool {
     if !actions.contains(action) {
         return false;
+    }
+    if let Some(services) = services {
+        return matches!(resource, Resource::Service(svc) if services.iter().any(|p| service_pattern_matches(p, svc)));
     }
     if categories.is_none() && devices.is_none() {
         return true;
@@ -609,7 +703,9 @@ fn deny_matches(
         | Resource::Host
         | Resource::Plugin(_)
         | Resource::Instance(_)
-        | Resource::Dashboard(_) => false,
+        | Resource::Dashboard(_)
+        // A service carries no device attributes (yet).
+        | Resource::Service(_) => false,
     }
 }
 
@@ -635,6 +731,7 @@ mod tests {
             actions: ActionSet::of(&[action]),
             categories: Some(vec![c]),
             devices: None,
+            services: None,
         };
         let offline = Resource::device("dev-a1b2c3d4e5f60718", DeviceClass::unregistered());
         assert!(
@@ -655,6 +752,65 @@ mod tests {
         assert!(
             deny(Action::BlobRead, DeviceCategory::Camera).matches(Action::BlobRead, &camera_light)
         );
+    }
+
+    #[test]
+    fn service_patterns_and_selectors_parse() {
+        for good in [
+            "*",
+            "acme.notify",
+            "acme.*",
+            "acme.notify/send",
+            "acme.*/s*",
+            "a/*",
+        ] {
+            assert!(is_service_pattern(good), "{good}");
+        }
+        let long = "a".repeat(MAX_SERVICE_PATTERN_BYTES + 1);
+        for bad in [
+            "",
+            "/",
+            "acme/",
+            "/send",
+            "a*b",
+            "**",
+            "acme/x*y",
+            "a\nb",
+            long.as_str(),
+        ] {
+            assert!(!is_service_pattern(bad), "{bad}");
+        }
+        let def = role(
+            r#"{"grants":[{"actions":["*"],"services":["acme.notify/send"]}],
+                "deny":[{"actions":["service.call"],"services":["zwave.*"]}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(def.grants[0].actions, SERVICE_NARROWABLE);
+        assert_eq!(
+            def.grants[0].services,
+            Some(vec!["acme.notify/send".to_string()])
+        );
+        assert_eq!(def.grants[0].describe(), "service.call{acme.notify/send}");
+        assert_eq!(def.deny[0].services, Some(vec!["zwave.*".to_string()]));
+        assert_eq!(
+            RoleDef::parse(&def.id, &def.name, &def.definition_json()).as_ref(),
+            Some(&def)
+        );
+        // `services` stands alone, narrows only `service.call`, and
+        // names something.
+        for bad in [
+            r#"{"grants":[{"actions":["service.call"],"services":["a"],"category":["light"]}]}"#,
+            r#"{"deny":[{"actions":["service.call"],"services":["a"],"devices":["dev-a*"]}]}"#,
+            r#"{"grants":[{"actions":["device.read"],"services":["a"]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"services":[]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"services":["a*b"]}]}"#,
+            r#"{"grants":[{"actions":["service.call"],"category":["light"]}]}"#,
+        ] {
+            assert!(role(bad).is_none(), "{bad}");
+        }
+        // `service.call` is scoped now: an unnarrowed `*` includes it.
+        let all = role(r#"{"grants":[{"actions":["*"]}]}"#).expect("parses");
+        assert!(all.grants[0].actions.contains(Action::ServiceCall));
     }
 
     #[test]
@@ -710,7 +866,7 @@ mod tests {
         );
         for bad in [
             r#"{"grants":[{"actions":["token.manage"]}]}"#,
-            r#"{"grants":[{"actions":["service.call"]}]}"#,
+            r#"{"grants":[{"actions":["state.read"]}]}"#,
             r#"{"grants":[{"actions":[]}]}"#,
             r#"{"grants":[{"actions":["device.read"],"category":[]}]}"#,
             r#"{"grants":[{"actions":["device.read"],"category":["door"]}]}"#,
@@ -733,6 +889,7 @@ mod tests {
             ]),
             categories: Some(vec![DeviceCategory::Light]),
             devices: None,
+            services: None,
         };
         assert!(g.permits(Action::DeviceCommand, &device(DeviceCategory::Light)));
         assert!(!g.permits(Action::DeviceCommand, &device(DeviceCategory::Switch)));
@@ -772,6 +929,7 @@ mod tests {
             actions: ActionSet::of(&[Action::DeviceCommand]),
             categories: Some(vec![DeviceCategory::Lock]),
             devices: None,
+            services: None,
         };
         assert!(lock.matches(Action::DeviceCommand, &device(DeviceCategory::Lock)));
         // A light that the host has ever seen as a lock still falls
@@ -794,6 +952,7 @@ mod tests {
             actions: ActionSet::ALL,
             categories: Some(vec![DeviceCategory::Camera]),
             devices: None,
+            services: None,
         };
         assert!(cam.matches(Action::BlobRead, &Resource::blob("c", "s", true)));
         assert!(!cam.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
@@ -804,6 +963,7 @@ mod tests {
             actions: ActionSet::ALL,
             categories: None,
             devices: Some(vec!["dev-a1*".into()]),
+            services: None,
         };
         assert!(ids.matches(Action::DeviceRead, &device(DeviceCategory::Other)));
         assert!(!ids.matches(
@@ -823,6 +983,7 @@ mod tests {
             actions: ActionSet::of(&[Action::HostLogs]),
             categories: None,
             devices: None,
+            services: None,
         };
         assert!(all.matches(Action::HostLogs, &Resource::Host));
         assert!(!all.matches(Action::HostStatus, &Resource::Host));
@@ -834,6 +995,7 @@ mod tests {
             actions: ActionSet::of(&[Action::DeviceCommand]),
             categories: Some(vec![DeviceCategory::Lock, DeviceCategory::Alarm]),
             devices: Some(vec!["dev-a1*".into()]),
+            services: None,
         };
         assert_eq!(d.describe(), "device.command@lock,alarm[dev-a1*]");
         assert_eq!(

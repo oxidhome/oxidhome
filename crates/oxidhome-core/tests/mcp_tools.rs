@@ -3152,6 +3152,7 @@ fn inject_event(engine: &oxidhome_core::Engine, topic: &str) -> u64 {
         origin_plugin_id: "com.example.subscribe-test".into(),
         origin_instance_id: "sub-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: String::new(),
@@ -3676,6 +3677,7 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
                 origin_plugin_id: "com.example.subscribe-test".into(),
                 origin_instance_id: "sub-a".into(),
                 row_id: None,
+                call_id: None,
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "sub.expire".into(),
                     payload: String::new(),

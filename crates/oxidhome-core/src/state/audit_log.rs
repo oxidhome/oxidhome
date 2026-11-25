@@ -177,6 +177,13 @@ pub struct AuditEntry {
     /// `None` (info) everywhere else.
     #[serde(default)]
     pub level: Option<String>,
+    /// H6 slice 4: on rows of an `on-event` reaction, the `call_id` of
+    /// the invocation that published the event it reacts to (the
+    /// event's `call-id`). The reaction has its own `call_id`; this
+    /// links it to its cause. `None` everywhere else and on rows
+    /// written before migration 25.
+    #[serde(default)]
+    pub caused_by: Option<String>,
 }
 
 /// Audit `level` of the row an allowed sensitive action writes.
@@ -207,6 +214,10 @@ pub struct AuditQuery {
     /// Exact `level` match (H6 slice 2): `warn` returns the rows of
     /// allowed sensitive actions.
     pub level: Option<String>,
+    /// Exact `caused_by` match (H6 slice 4): the rows of `on-event`
+    /// reactions to events the invocation with that `call_id`
+    /// published.
+    pub caused_by: Option<String>,
     /// Cursor-based pagination floor: return only rows strictly
     /// *older* than `(before.0, before.1)` in `(intent_ms, id)`
     /// order. The default `ORDER BY intent_ms DESC, id DESC LIMIT
@@ -405,8 +416,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
                     "INSERT INTO audit_event \
-                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome) \
-                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL, ?7, ?8, ?9, NULL)",
+                     (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, caused_by) \
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 0, 'pending', NULL, ?6, NULL, NULL, ?7, ?8, ?9, NULL, ?10)",
                     params![
                         intent_ms,
                         &entry.token_id,
@@ -417,6 +428,7 @@ impl AuditLog {
                         &entry.call_id,
                         scrub_opt(entry.invocation.as_deref()),
                         &entry.command_id,
+                        &entry.caused_by,
                     ],
                 )?;
         Ok(conn.last_insert_rowid())
@@ -593,8 +605,8 @@ impl AuditLog {
     ) -> Result<i64, AuditLogError> {
         conn.execute(
             "INSERT INTO audit_event \
-             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level) \
-             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             (intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level, caused_by) \
+             VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 now,
                 &entry.token_id,
@@ -612,6 +624,7 @@ impl AuditLog {
                 &entry.command_id,
                 &entry.command_outcome,
                 &entry.level,
+                &entry.caused_by,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -637,7 +650,7 @@ impl AuditLog {
         use std::fmt::Write as _;
 
         let mut sql = String::from(
-            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level \
+            "SELECT id, intent_ms, finalized_ms, token_id, actor_kind, method, path, status, decision, required_scope, credential_fp, execution_outcome, domain_error, call_id, invocation_json, command_id, command_outcome, level, caused_by \
              FROM audit_event WHERE 1=1",
         );
         let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -665,6 +678,9 @@ impl AuditLog {
         }
         if let Some(c) = &filter.call_id {
             push(&mut binds, &mut sql, "call_id =", c.clone().into());
+        }
+        if let Some(c) = &filter.caused_by {
+            push(&mut binds, &mut sql, "caused_by =", c.clone().into());
         }
         if let Some(l) = &filter.level {
             // Ordinary rows store NULL for `info`.
@@ -734,6 +750,7 @@ impl AuditLog {
                     command_id: row.get(15)?,
                     command_outcome: row.get(16)?,
                     level: row.get(17)?,
+                    caused_by: row.get(18)?,
                 })
             })?;
             let mut out = Vec::new();
@@ -844,6 +861,7 @@ mod tests {
 
     fn sample_intent(token: &str, path: &str) -> AuditEntry {
         AuditEntry {
+            caused_by: None,
             id: 0,
             intent_ms: 0,
             finalized_ms: None,
@@ -1010,6 +1028,7 @@ mod tests {
     fn record_completed_writes_all_columns() {
         let log = store();
         let entry = AuditEntry {
+            caused_by: None,
             id: 0,
             intent_ms: 0,
             finalized_ms: None,
@@ -1044,6 +1063,7 @@ mod tests {
     fn query_filters_by_token_id() {
         fn allow_row(token: &str) -> AuditEntry {
             AuditEntry {
+                caused_by: None,
                 id: 0,
                 intent_ms: 0,
                 finalized_ms: None,
@@ -1129,6 +1149,7 @@ mod tests {
             command_id: None,
             command_outcome: None,
             level: level.map(str::to_owned),
+            caused_by: None,
         };
         log.record_completed(&entry(None)).unwrap();
         log.record_completed(&entry(Some(AUDIT_LEVEL_WARN)))
@@ -1157,6 +1178,7 @@ mod tests {
         db.write(|c| c.pragma_update(None, "synchronous", "OFF"))
             .unwrap();
         let entry = AuditEntry {
+            caused_by: None,
             id: 0,
             intent_ms: 0,
             finalized_ms: None,

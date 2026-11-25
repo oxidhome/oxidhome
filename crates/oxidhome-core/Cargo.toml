@@ -108,6 +108,10 @@ name = "token_roles"
 path = "tests/token_roles.rs"
 
 [[test]]
+name = "delegated_authority"
+path = "tests/delegated_authority.rs"
+
+[[test]]
 name = "network_tls_pins"
 path = "tests/network_tls_pins.rs"
 

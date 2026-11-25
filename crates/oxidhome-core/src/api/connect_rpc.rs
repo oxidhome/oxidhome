@@ -1630,6 +1630,7 @@ fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
         actions: s.actions,
         category: none_if_empty(s.category),
         devices: none_if_empty(s.devices),
+        services: None,
     }
 }
 
@@ -2029,6 +2030,7 @@ async fn connect_auth_middleware(
                 // offending key (and field, on a field-level
                 // refusal) in `required_scope`.
                 let entry = crate::state::AuditEntry {
+                    caused_by: None,
                     id: 0,
                     intent_ms: 0,
                     finalized_ms: None,
@@ -2091,6 +2093,7 @@ async fn connect_auth_middleware(
     // (F1) Pre-audit intent — same shape as the JSON middleware.
     // Fail-closed on ledger error.
     let intent = crate::state::AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

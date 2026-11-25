@@ -657,6 +657,7 @@ mod tests {
 
     fn row(method: &str, call: Option<&str>, command: Option<(&str, &str)>) -> AuditEntry {
         AuditEntry {
+            caused_by: None,
             id: 0,
             intent_ms: 0,
             finalized_ms: None,
