@@ -109,6 +109,12 @@ pub mod __buffa {
         reg.register_json_any(super::__STOP_PLUGIN_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__UNINSTALL_PLUGIN_REQUEST_JSON_ANY);
         reg.register_json_any(super::__UNINSTALL_PLUGIN_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__SET_PLUGIN_NETWORK_GRANT_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__SET_PLUGIN_NETWORK_GRANT_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__RESET_PLUGIN_NETWORK_GRANT_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__RESET_PLUGIN_NETWORK_GRANT_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__NETWORK_GRANT_CHANGE_JSON_ANY);
+        reg.register_json_any(super::__NOT_RESTARTED_INSTANCE_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_REQUEST_JSON_ANY);
         reg.register_json_any(super::__SELECTOR_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_RESPONSE_JSON_ANY);
@@ -335,6 +341,30 @@ pub use self::__buffa::view::UninstallPluginRequestOwnedView;
 pub use self::__buffa::view::UninstallPluginResponseView;
 #[doc(inline)]
 pub use self::__buffa::view::UninstallPluginResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginNetworkGrantRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginNetworkGrantRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginNetworkGrantResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginNetworkGrantResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginNetworkGrantRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginNetworkGrantRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginNetworkGrantResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginNetworkGrantResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::NetworkGrantChangeView;
+#[doc(inline)]
+pub use self::__buffa::view::NetworkGrantChangeOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::NotRestartedInstanceView;
+#[doc(inline)]
+pub use self::__buffa::view::NotRestartedInstanceOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateTokenRequestView;
 #[doc(inline)]

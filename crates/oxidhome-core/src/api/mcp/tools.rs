@@ -25,6 +25,10 @@
 //! - `plugins.stop` (14.3e — mutating admin, gated on
 //!   `plugins:stop`; tool-shape of `POST
 //!   /api/v1/plugins/{id}/stop`).
+//! - `plugins.set_network_grant` / `plugins.reset_network_grant`
+//!   (Phase 8.5 — owner-only `policy.manage`; narrow a plugin's
+//!   network grant or reset it to the request, restarting its running
+//!   instances).
 //! - `plugins.uninstall` (14.3e — mutating admin,
 //!   destructive, gated on `plugins:uninstall`; tool-shape
 //!   of `DELETE /api/v1/plugins/{id}`).
@@ -269,6 +273,43 @@ pub(super) fn list_tools() -> Vec<Tool> {
             Arc::new(plugins_uninstall_schema()),
         )
         .with_title("Uninstall plugin")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.set_network_grant",
+            "Set an installed plugin's network grant: the `[capabilities] network` rules \
+             its instances may use, in manifest syntax (`tcp://192.168.1.20:554`, \
+             `https://api.example.com`). Every rule must lie inside a rule the manifest \
+             requests: a grant narrows the request, never widens it (a wider rule is \
+             refused). An empty list grants no network access. Running instances restart \
+             under the new grant with their config. Returns the new `network` lists (as \
+             `plugins.show` shows them) and the restarted instances. Owner only \
+             (`policy.manage`); audited with the old and new grant.",
+            Arc::new(plugins_set_network_grant_schema()),
+        )
+        .with_title("Narrow plugin network grant")
+        .annotate(
+            ToolAnnotations::new()
+                // Mutates persistent host state and restarts
+                // running instances.
+                .read_only(false)
+                // Reversible via `plugins.reset_network_grant`, but
+                // the restart interrupts in-flight work.
+                .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.reset_network_grant",
+            "Reset an installed plugin's network grant to what its manifest requests, \
+             undoing `plugins.set_network_grant`. Running instances restart under it. \
+             Owner only (`policy.manage`); audited with the old and new grant.",
+            Arc::new(plugins_reset_network_grant_schema()),
+        )
+        .with_title("Reset plugin network grant")
         .annotate(
             ToolAnnotations::new()
                 .read_only(false)
@@ -587,6 +628,8 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
         "plugins.uninstall" => "plugins.uninstall",
         "plugins.start" => "plugins.start",
         "plugins.install" => "plugins.install",
+        "plugins.set_network_grant" => "plugins.set_network_grant",
+        "plugins.reset_network_grant" => "plugins.reset_network_grant",
         "tokens.list" => "tokens.list",
         _ => "unknown",
     }
@@ -673,6 +716,16 @@ pub(super) async fn call(
         ),
         "plugins.install" => ("plugins.install", Action::PluginInstall, Resource::Host),
         "tokens.list" => ("tokens.list", Action::TokenManage, Resource::Host),
+        "plugins.set_network_grant" => (
+            "plugins.set_network_grant",
+            Action::PolicyManage,
+            Resource::pre_check(ResourceKind::Plugin),
+        ),
+        "plugins.reset_network_grant" => (
+            "plugins.reset_network_grant",
+            Action::PolicyManage,
+            Resource::pre_check(ResourceKind::Plugin),
+        ),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -760,6 +813,12 @@ pub(super) async fn call(
             plugins_install_call(engine.clone(), request.arguments, &invocation).await
         }
         "tokens.list" => tokens_list_call(engine.clone(), request.arguments).await,
+        "plugins.set_network_grant" => {
+            network_grant_call(engine.clone(), request.arguments, &invocation, false).await
+        }
+        "plugins.reset_network_grant" => {
+            network_grant_call(engine.clone(), request.arguments, &invocation, true).await
+        }
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
         // table forgets to add one, surface it as a
@@ -2580,6 +2639,137 @@ async fn plugins_stop_call(
         },
         EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
         EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+    }
+}
+
+// ── plugins.set_network_grant / reset_network_grant (Phase 8.5) ─
+
+fn plugins_set_network_grant_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id", "rules"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Installed `plugin_id` whose network grant to set.",
+            },
+            "rules": {
+                "type": "array",
+                "maxItems": oxidhome_manifest::validate::MAX_NETWORK_RULES,
+                "items": {"type": "string"},
+                "description": "Network rules to grant, in manifest syntax; each must lie inside a rule the manifest requests. Empty grants no network access.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+fn plugins_reset_network_grant_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Installed `plugin_id` whose network grant to reset to its manifest's request.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkGrantArgs {
+    plugin_id: String,
+    /// Absent on reset; required (by the schema and below) on set.
+    #[serde(default)]
+    rules: Option<Vec<String>>,
+}
+
+/// `plugins.set_network_grant` (`reset = false`) and
+/// `plugins.reset_network_grant`: `policy.manage` on the plugin, then
+/// [`crate::api::network_admin::change_network_grant`].
+async fn network_grant_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+    invocation: &InvocationContext,
+    reset: bool,
+) -> ToolOutcome {
+    use crate::state::NetworkGrantError as E;
+    let tool = if reset {
+        "plugins.reset_network_grant"
+    } else {
+        "plugins.set_network_grant"
+    };
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let args: NetworkGrantArgs = match serde_json::from_value(args_value) {
+        Ok(a) => a,
+        Err(err) => {
+            return ToolOutcome::InvalidParams(format!(
+                "{tool} arguments do not match the input schema: {err}",
+            ));
+        }
+    };
+    if args.plugin_id.is_empty() {
+        return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
+    }
+    let rules = match (reset, args.rules) {
+        (true, None) => None,
+        (true, Some(_)) => {
+            return ToolOutcome::InvalidParams(format!("{tool} takes no `rules`"));
+        }
+        (false, None) => {
+            return ToolOutcome::InvalidParams(format!("{tool} requires a `rules` argument"));
+        }
+        (false, Some(rules)) => match crate::api::network_admin::parse_grant_rules(&rules) {
+            Ok(rules) => Some(rules),
+            Err(reason) => return ToolOutcome::InvalidParams(reason),
+        },
+    };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::PolicyManage,
+        &Resource::plugin(args.plugin_id.as_str()),
+    ) {
+        return denied;
+    }
+    let plugin_id = args.plugin_id.clone();
+    match crate::api::network_admin::change_network_grant(
+        engine,
+        crate::api::network_admin::GrantActor::of("mcp", invocation),
+        args.plugin_id,
+        rules,
+    )
+    .await
+    {
+        Ok(view) => match serde_json::to_value(&view) {
+            Ok(value) => ToolOutcome::Ok {
+                value,
+                plugin_reached: false,
+            },
+            Err(err) => ToolOutcome::Internal(format!("encoding the grant failed: {err}")),
+        },
+        Err(e @ E::NotInstalled(_)) => ToolOutcome::ExecErr {
+            message: e.to_string(),
+            structured: Some(json!({"kind": "not_installed", "plugin_id": plugin_id})),
+            domain_kind: None,
+        },
+        Err(e @ (E::Widens(_) | E::TooMany { .. })) => ToolOutcome::InvalidParams(e.to_string()),
+        Err(e @ (E::Unavailable(..) | E::Store(_))) => {
+            tracing::error!(target: "mcp.tool.network_grant", error = %e, "network grant change failed");
+            ToolOutcome::Internal("network grant change failed; see server logs".into())
+        }
     }
 }
 

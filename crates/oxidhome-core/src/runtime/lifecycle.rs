@@ -319,6 +319,20 @@ pub(crate) enum ServiceCallOutcome {
 pub(crate) struct LoadedSlots {
     installation_uuid: std::sync::OnceLock<Arc<str>>,
     config_view: std::sync::OnceLock<Arc<serde_json::Value>>,
+    /// The config overrides the supervisor was spawned with, so an
+    /// operator action that restarts the instance (a network grant
+    /// change) starts it with the same config.
+    overrides: std::sync::OnceLock<StartOverrides>,
+}
+
+/// Raw instance config overrides. May hold secrets: `Debug` prints
+/// nothing of them.
+pub(crate) struct StartOverrides(Option<toml::Value>);
+
+impl std::fmt::Debug for StartOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StartOverrides(..)")
+    }
 }
 
 /// Host-side handle to one supervised instance. Cheap to clone and
@@ -513,6 +527,12 @@ impl InstanceHandle {
     #[must_use]
     pub fn installation_uuid(&self) -> Option<&str> {
         self.loaded.installation_uuid.get().map(Arc::as_ref)
+    }
+
+    /// The raw config overrides the instance was started with (secrets
+    /// included), to start it again with the same config.
+    pub(crate) fn start_overrides(&self) -> Option<toml::Value> {
+        self.loaded.overrides.get().and_then(|o| o.0.clone())
     }
 
     /// M7: the instance's resolved config as the read APIs show it —
@@ -1188,6 +1208,7 @@ pub(crate) fn spawn_supervisor(
     let (state_tx, state_rx) = watch::channel(InstanceState::Loading);
     let (stop_tx, stop_rx) = watch::channel(false);
     let loaded: Arc<LoadedSlots> = Arc::default();
+    let _ = loaded.overrides.set(StartOverrides(overrides.clone()));
     // ADR-0001 follow-up: compile once per supervisor. A supervisor
     // whose manifest is pinned pins the component bytes with it, and
     // its sandboxes share that cache; the unpinned test entry points

@@ -357,6 +357,9 @@ pub struct OfflineStores {
     pub devices: crate::state::DeviceMetaStore,
     /// The `network_tls_pin` table (Phase 8.2).
     pub tls_pins: crate::state::TlsPinStore,
+    /// The database itself, for tables without a store
+    /// (`plugin_installation`).
+    pub db: std::sync::Arc<crate::state::Db>,
 }
 
 /// Run `op` against the stores of the database under `state_dir`,
@@ -377,7 +380,9 @@ pub fn with_offline_stores<T>(
         audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
         devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
             .context("reading device_meta")?,
-        tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
+        tls_pins: crate::state::TlsPinStore::open(std::sync::Arc::clone(&db))
+            .context("reading TLS pins")?,
+        db,
     };
     op(&stores)
 }

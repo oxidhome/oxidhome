@@ -46,6 +46,10 @@
 //! - **`plugin list` (Phase 8.5)** — offline: the installed plugins
 //!   with their network rules (requested, granted, effective), read
 //!   without touching the registry.
+//! - **`plugin grant <plugin_id> (<rule>... | --none | --reset)`
+//!   (Phase 8.5)** — offline: set a plugin's network grant (each rule
+//!   inside one its manifest requests) or reset it to the request,
+//!   audited; the daemon applies it when it next starts the plugin.
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
 //!   of the database, the blob files it indexes and the installed
 //!   plugin packages to a new directory with a checksummed
@@ -994,35 +998,127 @@ fn run_tls_pin() -> anyhow::Result<()> {
     Ok(())
 }
 
-const PLUGIN_USAGE: &str = "usage: oxidhome plugin list";
+const PLUGIN_USAGE: &str = "usage: oxidhome plugin list
+       oxidhome plugin grant <plugin_id> (<rule>... | --none | --reset)
 
-/// Phase 8.5: `oxidhome plugin list`. Offline and read-only.
+  list   installed plugins and their network rules (requested, granted,
+         effective)
+  grant  set a plugin's network grant: each rule (manifest syntax, e.g.
+         tcp://192.168.1.20:554) must lie inside one the manifest
+         requests. --none grants no network access, --reset grants what
+         the manifest requests. The daemon must be stopped; it applies
+         the grant when it next starts the plugin.";
+
+/// What `oxidhome plugin` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum PluginCmd {
+    Help,
+    List,
+    /// `rules: None` resets the grant to the request.
+    Grant {
+        plugin_id: String,
+        rules: Option<Vec<String>>,
+    },
+}
+
+fn parse_plugin_args(args: &[Option<String>]) -> anyhow::Result<PluginCmd> {
+    let args: Vec<&str> = args
+        .iter()
+        .map(|a| {
+            a.as_deref()
+                .ok_or_else(|| anyhow::anyhow!("{PLUGIN_USAGE}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(match args.as_slice() {
+        ["list"] => PluginCmd::List,
+        ["-h" | "--help"] => PluginCmd::Help,
+        ["grant", plugin_id, rest @ ..] if !plugin_id.starts_with('-') && !rest.is_empty() => {
+            let rules = match rest {
+                ["--reset"] => None,
+                ["--none"] => Some(Vec::new()),
+                rules if rules.iter().all(|r| !r.starts_with('-')) => {
+                    Some(rules.iter().map(|r| (*r).to_owned()).collect())
+                }
+                _ => anyhow::bail!("{PLUGIN_USAGE}"),
+            };
+            PluginCmd::Grant {
+                plugin_id: (*plugin_id).to_owned(),
+                rules,
+            }
+        }
+        _ => anyhow::bail!("{PLUGIN_USAGE}"),
+    })
+}
+
+/// Phase 8.5: `oxidhome plugin list` (read-only) and `oxidhome plugin
+/// grant`. Offline: the daemon must be stopped.
 fn run_plugin() -> anyhow::Result<()> {
     // `args_os`: a non-UTF-8 argument is a usage error, not a panic.
     let args: Vec<Option<String>> = std::env::args_os()
         .skip(2)
         .map(|a| a.into_string().ok())
         .collect();
-    match args
-        .iter()
-        .map(Option::as_deref)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [Some("list")] => {}
-        [Some("-h" | "--help")] => {
-            println!("{PLUGIN_USAGE}");
-            return Ok(());
-        }
-        _ => anyhow::bail!("{PLUGIN_USAGE}"),
+    let cmd = parse_plugin_args(&args)?;
+    if cmd == PluginCmd::Help {
+        println!("{PLUGIN_USAGE}");
+        return Ok(());
     }
     init_cli_tracing();
     let state_dir = resolve_state_dir()?;
-    let plugins = with_offline_db(&state_dir, |db| {
-        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), db)
-    })?;
-    print!("{}", format_plugin_list(&plugins));
-    Ok(())
+    let plugins_root = state_dir.join("plugins");
+    match cmd {
+        PluginCmd::Help => Ok(()),
+        PluginCmd::List => {
+            let plugins = with_offline_db(&state_dir, |db| {
+                oxidhome_core::state::list_installations_offline(&plugins_root, db)
+            })?;
+            print!("{}", format_plugin_list(&plugins));
+            Ok(())
+        }
+        PluginCmd::Grant { plugin_id, rules } => {
+            let rules = rules
+                .as_deref()
+                .map(oxidhome_core::api::network_admin::parse_grant_rules)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let change = with_offline_stores(&state_dir, |stores| {
+                oxidhome_core::api::network_admin::set_network_grant_offline(
+                    &plugins_root,
+                    &stores.audit,
+                    &stores.db,
+                    &plugin_id,
+                    rules.as_deref(),
+                )
+            })?;
+            print!("{}", format_grant_change(&plugin_id, &change));
+            Ok(())
+        }
+    }
+}
+
+/// `oxidhome plugin grant` output: the plugin's rules after the change,
+/// shaped like a `plugin list` entry.
+fn format_grant_change(
+    plugin_id: &str,
+    change: &oxidhome_core::state::NetworkGrantChange,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "{}\tinstallation={}\n",
+        printable(plugin_id),
+        printable(&change.installation_uuid)
+    );
+    let (requested, granted, effective) = change.network.to_strings();
+    for (tag, rules) in [
+        ("requested", requested),
+        ("granted", granted),
+        ("effective", effective),
+    ] {
+        for rule in rules {
+            let _ = writeln!(out, "\t{tag}\t{}", printable(&rule));
+        }
+    }
+    out
 }
 
 /// `text` with control characters escaped (`\u{1b}`), so a manifest

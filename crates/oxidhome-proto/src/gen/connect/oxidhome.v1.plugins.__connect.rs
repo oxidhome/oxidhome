@@ -38,6 +38,26 @@ pub type OwnedUninstallPluginRequestView = ::buffa::view::OwnedView<
 pub type OwnedUninstallPluginResponseView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::UninstallPluginResponseView<'static>,
 >;
+///Shorthand for `OwnedView<SetPluginNetworkGrantRequestView<'static>>`.
+pub type OwnedSetPluginNetworkGrantRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantRequestView<'static>,
+>;
+///Shorthand for `OwnedView<SetPluginNetworkGrantResponseView<'static>>`.
+pub type OwnedSetPluginNetworkGrantResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantResponseView<'static>,
+>;
+///Shorthand for `OwnedView<ResetPluginNetworkGrantRequestView<'static>>`.
+pub type OwnedResetPluginNetworkGrantRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantRequestView<
+        'static,
+    >,
+>;
+///Shorthand for `OwnedView<ResetPluginNetworkGrantResponseView<'static>>`.
+pub type OwnedResetPluginNetworkGrantResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantResponseView<
+        'static,
+    >,
+>;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListPluginsResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListPluginsResponseView<'_> {
     fn encode(
@@ -208,6 +228,76 @@ for ::buffa::view::OwnedView<
         )
     }
 }
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::SetPluginNetworkGrantResponse>
+for crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::SetPluginNetworkGrantResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse>
+for crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantResponseView<
+        'static,
+    >,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
 /// Full service name for this service.
 pub const PLUGINS_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.PluginsService";
 /// Static [`Spec`](::connectrpc::Spec) for the `ListPlugins` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
@@ -237,6 +327,18 @@ pub const PLUGINS_SERVICE_STOP_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::S
 /// Static [`Spec`](::connectrpc::Spec) for the `UninstallPlugin` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.PluginsService/UninstallPlugin",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `SetPluginNetworkGrant` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/SetPluginNetworkGrant",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `ResetPluginNetworkGrant` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/ResetPluginNetworkGrant",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -422,6 +524,58 @@ pub trait PluginsService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
+    /// Set a plugin's network grant (Phase 8.5). Every rule must lie
+    /// inside one the manifest requests: a grant narrows the request,
+    /// never widens it (INVALID_ARGUMENT otherwise). Running instances
+    /// restart under the new grant. `policy.manage`: the owner only.
+    /// Same shape as `PUT /api/v1/plugins/{plugin_id}/network-grant`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn set_plugin_network_grant<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::SetPluginNetworkGrantResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Reset a plugin's network grant to what its manifest requests,
+    /// restarting its running instances. `policy.manage`. Same shape as
+    /// `DELETE /api/v1/plugins/{plugin_id}/network-grant`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn reset_plugin_network_grant<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
 }
 /// Extension trait for registering a service implementation with a Router.
 ///
@@ -599,6 +753,64 @@ impl<S: PluginsService> PluginsServiceExt for S {
                 },
             )
             .with_spec(PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "SetPluginNetworkGrant",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.set_plugin_network_grant(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::SetPluginNetworkGrantResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "ResetPluginNetworkGrant",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.reset_plugin_network_grant(ctx, sreq)
+                                .await?
+                                .encode::<
+                                    crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse,
+                                >(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC)
     }
 }
 /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
@@ -681,6 +893,18 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC),
+                )
+            }
+            "SetPluginNetworkGrant" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC),
+                )
+            }
+            "ResetPluginNetworkGrant" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC),
                 )
             }
             _ => None,
@@ -803,6 +1027,50 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                         .await?
                         .encode::<
                             crate::proto::oxidhome::v1::UninstallPluginResponse,
+                        >(format)
+                })
+            }
+            "SetPluginNetworkGrant" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+                    >::from_parts(&req, &body);
+                    svc.set_plugin_network_grant(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::SetPluginNetworkGrantResponse,
+                        >(format)
+                })
+            }
+            "ResetPluginNetworkGrant" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+                    >::from_parts(&req, &body);
+                    svc.reset_plugin_network_grant(ctx, req)
+                        .await?
+                        .encode::<
+                            crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse,
                         >(format)
                 })
             }
@@ -1153,6 +1421,96 @@ where
                 &self.transport,
                 &self.config,
                 PLUGINS_SERVICE_UNINSTALL_PLUGIN_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the SetPluginNetworkGrant RPC. Sends a request to /oxidhome.v1.PluginsService/SetPluginNetworkGrant.
+    pub async fn set_plugin_network_grant(
+        &self,
+        request: crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.set_plugin_network_grant_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the SetPluginNetworkGrant RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn set_plugin_network_grant_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::SetPluginNetworkGrantRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::SetPluginNetworkGrantResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the ResetPluginNetworkGrant RPC. Sends a request to /oxidhome.v1.PluginsService/ResetPluginNetworkGrant.
+    pub async fn reset_plugin_network_grant(
+        &self,
+        request: crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.reset_plugin_network_grant_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the ResetPluginNetworkGrant RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn reset_plugin_network_grant_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::ResetPluginNetworkGrantRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::ResetPluginNetworkGrantResponseView<
+                    'static,
+                >,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC
                     .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,

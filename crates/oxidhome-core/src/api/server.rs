@@ -115,6 +115,11 @@ pub fn build_router(engine: Engine) -> Router {
             "/api/v1/plugins/{plugin_id}/stop",
             post(stop_plugin_instances),
         )
+        // Phase 8.5: the operator narrows a plugin's network grant.
+        .route(
+            "/api/v1/plugins/{plugin_id}/network-grant",
+            axum::routing::put(set_network_grant).delete(reset_network_grant),
+        )
         // Phase 13 slice 2: schema-driven UI. Returns the
         // installed manifest's `config` schema (Phase 4)
         // and `[ui]` section (Phase 13 slice 1) so the
@@ -850,6 +855,120 @@ fn rest_admin(call_id: &str) -> super::token_admin::Audited<'_> {
         actor_kind: "api",
         call_id: Some(call_id),
     }
+}
+
+// ── Plugin network grants (Phase 8.5) ────────────────────────────
+
+/// Body of `PUT /api/v1/plugins/{plugin_id}/network-grant`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkGrantBody {
+    /// The rules to grant, in manifest syntax; each must lie inside a
+    /// rule the manifest requests. Empty grants no network access.
+    rules: Vec<String>,
+}
+
+/// Why a grant change failed, as REST answers it.
+enum NetworkGrantApiError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Grant(super::network_admin::NetworkGrantError),
+}
+
+impl IntoResponse for NetworkGrantApiError {
+    fn into_response(self) -> axum::response::Response {
+        use crate::state::NetworkGrantError as E;
+        let bad = |error: &str, reason: String| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error, "reason": reason})),
+            )
+                .into_response()
+        };
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(reason) => bad("bad_request", reason),
+            Self::Grant(e @ E::NotInstalled(_)) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_installed", "reason": e.to_string()})),
+            )
+                .into_response(),
+            Self::Grant(e @ E::Widens(_)) => bad("widens_request", e.to_string()),
+            Self::Grant(e @ E::TooMany { .. }) => bad("too_many_rules", e.to_string()),
+            Self::Grant(e @ (E::Unavailable(..) | E::Store(_))) => {
+                tracing::error!(target: "api.plugins", error = %e, "network grant change failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
+}
+
+/// `PUT /api/v1/plugins/{plugin_id}/network-grant` with
+/// `{"rules": [...]}` — set the plugin's network grant. Every rule must
+/// lie inside one the manifest requests: a grant narrows the request,
+/// never widens it. Running instances restart under the new grant.
+/// `policy.manage`: the owner only. Answers the new rules (as the
+/// listings show them) and the restarted instances.
+///
+/// # Errors
+/// - `400` a bad body, a rule that doesn't parse, widens the request,
+///   or too many rules.
+/// - `403` not the owner.
+/// - `404` no such installed plugin.
+async fn set_network_grant(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    body: Result<Json<NetworkGrantBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<super::network_admin::NetworkGrantView>, NetworkGrantApiError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    )
+    .map_err(NetworkGrantApiError::Scope)?;
+    let Json(body) =
+        body.map_err(|e| NetworkGrantApiError::BadRequest(format!("invalid body: {e}")))?;
+    let rules = super::network_admin::parse_grant_rules(&body.rules)
+        .map_err(NetworkGrantApiError::BadRequest)?;
+    let view = super::network_admin::change_network_grant(
+        state.engine.clone(),
+        super::network_admin::GrantActor::of("api", &ctx),
+        plugin_id,
+        Some(rules),
+    )
+    .await
+    .map_err(NetworkGrantApiError::Grant)?;
+    Ok(Json(view))
+}
+
+/// `DELETE /api/v1/plugins/{plugin_id}/network-grant` — reset the
+/// plugin's network grant to what its manifest requests, restarting its
+/// running instances. `policy.manage`: the owner only.
+///
+/// # Errors
+/// - `403` not the owner.
+/// - `404` no such installed plugin.
+async fn reset_network_grant(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<super::network_admin::NetworkGrantView>, NetworkGrantApiError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    )
+    .map_err(NetworkGrantApiError::Scope)?;
+    let view = super::network_admin::change_network_grant(
+        state.engine.clone(),
+        super::network_admin::GrantActor::of("api", &ctx),
+        plugin_id,
+        None,
+    )
+    .await
+    .map_err(NetworkGrantApiError::Grant)?;
+    Ok(Json(view))
 }
 
 // ── TLS certificate pins (Phase 8.2) ─────────────────────────────

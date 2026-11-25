@@ -2186,7 +2186,296 @@ impl InstalledPluginRegistry {
     }
 }
 
+// ── Operator network grants (Phase 8.5) ──────────────────────────────
+
+/// Why a network grant change was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkGrantError {
+    /// No installed plugin with this id (or it is quarantined). API: `404`.
+    #[error("plugin {0} is not installed")]
+    NotInstalled(String),
+    /// A rule the manifest's requested rules don't contain. API: `400`.
+    #[error(
+        "rule `{0}` is not within the plugin's requested network rules; a grant can only narrow \
+         the request"
+    )]
+    Widens(NetworkRule),
+    /// More rules than a manifest may hold. API: `400`.
+    #[error("a network grant holds at most {max} rules, got {got}")]
+    TooMany {
+        /// The ceiling.
+        max: usize,
+        /// The number asked for.
+        got: usize,
+    },
+    /// The change couldn't be made: the package on disk is missing,
+    /// unreadable or changed since install (offline), or the audit
+    /// write or a task failed.
+    #[error("plugin {0}: {1}")]
+    Unavailable(String, String),
+    /// Persisting the grant failed.
+    #[error("storing the network grant: {0}")]
+    Store(#[from] rusqlite::Error),
+}
+
+/// A network grant change: the installation it applied to and the
+/// rules before and after (the effective rules follow from them and
+/// the request, see [`NetworkGrants`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkGrantChange {
+    /// The installation whose grant changed.
+    pub installation_uuid: Arc<str>,
+    /// The grant before.
+    pub old: Vec<NetworkRule>,
+    /// The listing after the change.
+    pub network: NetworkGrants,
+}
+
+impl NetworkGrantChange {
+    /// The audit `path` suffix: the installation and the old and new
+    /// granted rules, as JSON (rules in manifest syntax).
+    #[must_use]
+    pub fn audit_detail(&self) -> String {
+        serde_json::json!({
+            "installation": &*self.installation_uuid,
+            "old": self.old,
+            "new": self.network.granted,
+        })
+        .to_string()
+    }
+}
+
+/// The grant an operator asks for, checked against `requested`: every
+/// rule must lie inside some requested rule (the containment check
+/// narrowing uses), so a grant can narrow the request but never widen
+/// it. `None` is the reset: grant what the manifest requests.
+/// Duplicates are dropped, keeping the first.
+///
+/// # Errors
+///
+/// [`NetworkGrantError::Widens`] for the first rule outside the
+/// request, [`NetworkGrantError::TooMany`] past the manifest ceiling.
+pub fn narrowed_network_grant(
+    requested: &[NetworkRule],
+    rules: Option<&[NetworkRule]>,
+) -> Result<Vec<NetworkRule>, NetworkGrantError> {
+    let Some(rules) = rules else {
+        return Ok(requested.to_vec());
+    };
+    let max = oxidhome_manifest::validate::MAX_NETWORK_RULES;
+    if rules.len() > max {
+        return Err(NetworkGrantError::TooMany {
+            max,
+            got: rules.len(),
+        });
+    }
+    let mut out: Vec<NetworkRule> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        if !requested.iter().any(|r| network_rule_covers(r, rule)) {
+            return Err(NetworkGrantError::Widens(rule.clone()));
+        }
+        if !out.contains(rule) {
+            out.push(rule.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Store `network` as the grant of the live installation
+/// `installation_uuid`, keeping the rest of its persisted grant.
+fn persist_network_grant(
+    db: &Db,
+    installation_uuid: &str,
+    granted: &CapabilitiesSection,
+) -> Result<(), NetworkGrantError> {
+    let json = serde_json::to_string(granted)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let updated = db.write(|conn| {
+        conn.execute(
+            "UPDATE plugin_installation SET granted_capabilities_json = ?1
+             WHERE installation_uuid = ?2 AND uninstalled_ms IS NULL",
+            (json, installation_uuid),
+        )
+    })?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(NetworkGrantError::Store(
+            rusqlite::Error::QueryReturnedNoRows,
+        ))
+    }
+}
+
+impl InstalledPluginRegistry {
+    /// Set the network grant of installed plugin `plugin_id` to `rules`
+    /// (see [`narrowed_network_grant`]; `None` resets it to the
+    /// request). Persists it before the in-memory row changes, so a
+    /// rescan or restart keeps it; instances pick it up on their next
+    /// load. The caller serializes against install / uninstall with the
+    /// plugin's lifecycle lock.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkGrantError`]: not installed, a rule outside the
+    /// request, too many rules, or the store failed.
+    pub fn set_network_grant(
+        &self,
+        plugin_id: &str,
+        rules: Option<&[NetworkRule]>,
+    ) -> Result<NetworkGrantChange, NetworkGrantError> {
+        let row = self
+            .get(plugin_id)
+            .ok_or_else(|| NetworkGrantError::NotInstalled(plugin_id.to_owned()))?;
+        let new = narrowed_network_grant(&row.requested_network, rules)?;
+        let mut granted = (*row.granted_capabilities).clone();
+        let old = std::mem::replace(&mut granted.network, new);
+        if let Some(db) = &self.db {
+            persist_network_grant(db, &row.installation_uuid, &granted)?;
+        }
+        let granted = Arc::new(granted);
+        {
+            let mut entries = self.write_entries();
+            match entries.get_mut(plugin_id) {
+                Some(live) if live.installation_uuid == row.installation_uuid => {
+                    live.granted_capabilities = Arc::clone(&granted);
+                }
+                // Uninstalled meanwhile (the caller's lock should rule
+                // this out): the SQL update matched no live row either.
+                _ => return Err(NetworkGrantError::NotInstalled(plugin_id.to_owned())),
+            }
+        }
+        Ok(NetworkGrantChange {
+            installation_uuid: Arc::clone(&row.installation_uuid),
+            network: NetworkGrants::new(&row.requested_network, &granted.network),
+            old,
+        })
+    }
+}
+
+/// A network grant change checked against the database and the package
+/// on disk, not yet stored: [`plan_network_grant_offline`].
+#[derive(Debug)]
+pub struct OfflineGrantPlan {
+    /// What the change does.
+    pub change: NetworkGrantChange,
+    granted: CapabilitiesSection,
+}
+
+impl OfflineGrantPlan {
+    /// Store the planned grant.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkGrantError::Store`], also when the installation is no
+    /// longer live.
+    pub fn commit(&self, db: &Db) -> Result<(), NetworkGrantError> {
+        persist_network_grant(db, &self.change.installation_uuid, &self.granted)
+    }
+}
+
+/// The offline CLI's [`InstalledPluginRegistry::set_network_grant`]:
+/// against the database and the package on disk, with the daemon
+/// stopped. The requested rules come from the package's manifest, which
+/// must still match the installation's content digest (as scan would
+/// check). Nothing is stored until [`OfflineGrantPlan::commit`].
+///
+/// # Errors
+///
+/// As [`InstalledPluginRegistry::set_network_grant`], plus
+/// [`NetworkGrantError::Unavailable`] when the package is missing,
+/// unreadable, ambiguous or changed since install.
+pub fn plan_network_grant_offline(
+    plugins_root: &Path,
+    db: &Db,
+    plugin_id: &str,
+    rules: Option<&[NetworkRule]>,
+) -> Result<OfflineGrantPlan, NetworkGrantError> {
+    let LiveInstallationLoad { live, .. } = load_live_installations(db)?;
+    let row = live
+        .get(plugin_id)
+        .ok_or_else(|| NetworkGrantError::NotInstalled(plugin_id.to_owned()))?;
+    let package = offline_package(plugins_root, plugin_id)
+        .map_err(|e| NetworkGrantError::Unavailable(plugin_id.to_owned(), e.to_string()))?;
+    let manifest = match package {
+        Err(why) => return Err(NetworkGrantError::Unavailable(plugin_id.to_owned(), why)),
+        Ok((digest, _)) if digest != *row.content_digest => {
+            return Err(NetworkGrantError::Unavailable(
+                plugin_id.to_owned(),
+                "contents changed since install; reinstall".to_owned(),
+            ));
+        }
+        Ok((_, manifest)) => manifest,
+    };
+    let requested = &manifest.capabilities.network;
+    let new = narrowed_network_grant(requested, rules)?;
+    let mut granted = (*row.granted_capabilities).clone();
+    let old = std::mem::replace(&mut granted.network, new);
+    Ok(OfflineGrantPlan {
+        change: NetworkGrantChange {
+            installation_uuid: Arc::clone(&row.installation_uuid),
+            network: NetworkGrants::new(requested, &granted.network),
+            old,
+        },
+        granted,
+    })
+}
+
 // ── Offline listing (Phase 8.5) ─────────────────────────────────────
+
+/// Manifest id → package directories declaring it, in the order scan
+/// sees them: only `.staging-*` is skipped, and ids are collected from
+/// the manifest alone, before any wasm or UI asset is read, so a
+/// duplicate is caught even when one copy is otherwise broken.
+fn offline_packages(plugins_root: &Path) -> std::io::Result<HashMap<String, Vec<PathBuf>>> {
+    let mut dirs_by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    if plugins_root.exists() {
+        for entry in std::fs::read_dir(plugins_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || entry
+                    .file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with(".staging-")
+            {
+                continue;
+            }
+            if let Ok((manifest, _)) = read_manifest_sync_capturing_bytes(&entry.path()) {
+                dirs_by_id
+                    .entry(manifest.plugin.id.clone())
+                    .or_default()
+                    .push(entry.path());
+            }
+        }
+    }
+    Ok(dirs_by_id)
+}
+
+/// The digest and manifest of `plugin_id`'s one package in `packages`,
+/// or why there isn't one scan would accept.
+fn offline_package_in(
+    packages: &mut HashMap<String, Vec<PathBuf>>,
+    plugin_id: &str,
+) -> Result<(String, PluginManifest), String> {
+    match packages.remove(plugin_id).as_deref() {
+        None | Some([]) => Err("no readable package on disk".to_owned()),
+        Some([dir]) => {
+            recompute_digest_and_manifest(dir).map_err(|err| format!("package unreadable: {err:#}"))
+        }
+        Some(_) => Err("more than one package directory claims this plugin id".to_owned()),
+    }
+}
+
+/// [`offline_package_in`] for one plugin under `plugins_root`.
+fn offline_package(
+    plugins_root: &Path,
+    plugin_id: &str,
+) -> std::io::Result<Result<(String, PluginManifest), String>> {
+    Ok(offline_package_in(
+        &mut offline_packages(plugins_root)?,
+        plugin_id,
+    ))
+}
 
 /// One installation as the offline `oxidhome plugin list` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2221,39 +2510,8 @@ pub fn list_installations_offline(
         live,
         quarantined_uuids,
     } = load_live_installations(db)?;
-    // Manifest id → package directories declaring it, in the order scan
-    // sees them: only `.staging-*` is skipped, and ids are collected from
-    // the manifest alone, before any wasm or UI asset is read, so a
-    // duplicate is caught even when one copy is otherwise broken.
-    let mut dirs_by_id: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    if plugins_root.exists() {
-        for entry in std::fs::read_dir(plugins_root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir()
-                || entry
-                    .file_name()
-                    .to_str()
-                    .unwrap_or("")
-                    .starts_with(".staging-")
-            {
-                continue;
-            }
-            if let Ok((manifest, _)) = read_manifest_sync_capturing_bytes(&entry.path()) {
-                dirs_by_id
-                    .entry(manifest.plugin.id.clone())
-                    .or_default()
-                    .push(entry.path());
-            }
-        }
-    }
-    let mut package = |plugin_id: &str| -> Result<(String, PluginManifest), String> {
-        match dirs_by_id.remove(plugin_id).as_deref() {
-            None | Some([]) => Err("no readable package on disk".to_owned()),
-            Some([dir]) => recompute_digest_and_manifest(dir)
-                .map_err(|err| format!("package unreadable: {err:#}")),
-            Some(_) => Err("more than one package directory claims this plugin id".to_owned()),
-        }
-    };
+    let mut packages = offline_packages(plugins_root)?;
+    let mut package = |plugin_id: &str| offline_package_in(&mut packages, plugin_id);
     let mut out: Vec<OfflinePlugin> = live
         .into_iter()
         .map(|(plugin_id, row)| {
