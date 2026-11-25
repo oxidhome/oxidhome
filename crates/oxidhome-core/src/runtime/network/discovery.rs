@@ -405,7 +405,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         }
         // Listed per send (IPv4 only: IPv6 has no broadcast), so the
         // check sees the interfaces as they are now.
-        let interfaces = if addr.is_ipv4() {
+        let interfaces = if addr.is_ipv4() && !super::policy::is_group_address(addr.ip()) {
             list_interfaces().ok()
         } else {
             Some(Vec::new())

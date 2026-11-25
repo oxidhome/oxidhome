@@ -78,9 +78,12 @@
 //! - Other private addresses, and every loopback and link-local one, need
 //!   an IP or CIDR rule inside that range (`tcp://127.0.0.1:1883`,
 //!   `udp://192.168.0.0/16:9999`).
-//! - Broadcast and multicast need a [`discovery::DiscoverySocket`] and a
-//!   `udp` rule naming the address (`udp://255.255.255.255:9999`,
-//!   `udp://224.0.0.251:5353`); `std::net` sockets can't reach them.
+//! - Broadcast and multicast need a [`discovery::DiscoverySocket`]. The
+//!   limited broadcast and multicast groups need a `udp` rule naming the
+//!   address (`udp://255.255.255.255:9999`, `udp://224.0.0.251:5353`); a
+//!   subnet-directed broadcast needs a `udp` (or `any`) rule covering the
+//!   whole local network (`udp://192.168.1.0/24:9999`). `std::net`
+//!   sockets can't reach them.
 //! - Sockets may bind only to the unspecified address (`0.0.0.0:0` and
 //!   the like, any port); listening is refused.
 //! - Datagrams from senders the rules don't cover are dropped.

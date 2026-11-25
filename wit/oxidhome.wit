@@ -1739,7 +1739,8 @@ interface streaming {
 /// unspecified address; `listen` is refused. `wasi:http` does not follow
 /// redirects, so each hop is a new, separately checked request.
 /// Broadcast and multicast go through `host-network`'s discovery socket,
-/// behind rules naming those addresses.
+/// behind `udp` rules naming the groups and the limited broadcast, or
+/// covering the whole network a subnet broadcast reaches.
 world streaming-plugin {
   include plugin;
   import host-media;

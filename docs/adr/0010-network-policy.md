@@ -62,7 +62,8 @@ broadcast or multicast address. On a discovery socket:
   rule naming the address. Joining a group needs a `udp` rule naming it. Multicast is sent with a TTL (hop limit) of 1,
   and on Linux a socket hears only the groups it joined itself (`IP_MULTICAST_ALL` off).
 - A subnet-directed broadcast (the last address of one of the host's IPv4 networks, `192.168.1.255` on
-  `192.168.1.0/24`, or its first, which BSD kernels also treat as one) reaches every host of that network, so it needs a `udp` (or `any`) IP rule covering the whole
+  `192.168.1.0/24`, or its first, or the first or last of its classful network, which BSD kernels also treat as
+  broadcasts; checked on every platform, so a Linux host on a subnet's first address needs the whole subnet granted) reaches every host of that network, so it needs a `udp` (or `any`) IP rule covering the whole
   network, and every interface network it is the broadcast address of; a rule for part of the network, or a literal
   naming the address (which a partial range covers in grant narrowing), doesn't do. When the host can't list its
   networks, every IPv4 destination but a named group is refused. `SO_BROADCAST` is set only for the duration of a send

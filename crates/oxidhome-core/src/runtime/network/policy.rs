@@ -354,6 +354,31 @@ fn old_style_broadcast(net: &IpNet) -> Option<IpAddr> {
     directed_broadcast(net).map(|_| net.network())
 }
 
+/// The first and last addresses of the classful (A/B/C) network an
+/// IPv4 network lies in, which BSD kernels (macOS) also treat as
+/// broadcast addresses on that interface.
+fn classful_broadcasts(net: &IpNet) -> [Option<IpAddr>; 2] {
+    let IpNet::V4(v4) = net else {
+        return [None, None];
+    };
+    let prefix = match v4.network().octets()[0] {
+        0..=127 => 8,
+        128..=191 => 16,
+        192..=223 => 24,
+        _ => return [None, None],
+    };
+    match ipnet::Ipv4Net::new(v4.network(), prefix) {
+        Ok(class) => {
+            let class = class.trunc();
+            [
+                Some(IpAddr::V4(class.network())),
+                Some(IpAddr::V4(class.broadcast())),
+            ]
+        }
+        Err(_) => [None, None],
+    }
+}
+
 /// A CIDR inside the IPv4-mapped IPv6 range (`::ffff:0:0/96`) as the
 /// IPv4 range it maps, since addresses are matched in canonical form.
 fn canonical_net(net: IpNet) -> IpNet {
@@ -775,6 +800,7 @@ impl NetworkPolicy {
             .filter(|iface| {
                 directed_broadcast(&iface.net) == Some(ip)
                     || old_style_broadcast(&iface.net) == Some(ip)
+                    || classful_broadcasts(&iface.net).contains(&Some(ip))
                     || iface.broadcast.map(|b| b.to_canonical()) == Some(ip)
             })
             .map(|iface| &iface.net)
@@ -1677,6 +1703,35 @@ mod tests {
     }
 
     #[test]
+    fn bsd_broadcast_forms_need_the_whole_network() {
+        let local = ifaces(&["192.168.1.0/24"]);
+        let half = policy(&["udp://192.168.1.0/25:9999", "udp://192.168.1.0:9999"]);
+        // The first address counts too (BSD treats it as a broadcast).
+        assert!(
+            half.check_discovery_send(sa("192.168.1.0:9999"), Some(&local))
+                .is_err()
+        );
+        assert_eq!(
+            policy(&["udp://192.168.1.0/24:9999"])
+                .check_discovery_send(sa("192.168.1.0:9999"), Some(&local)),
+            Ok(true)
+        );
+        // So do the classful network's first and last (BSD again): on
+        // 10.1.2.0/24, 10.255.255.255 needs that /24 whole.
+        let classful = ifaces(&["10.1.2.0/24"]);
+        assert!(
+            policy(&["udp://10.255.255.255:9999", "udp://10.1.2.0/25:9999"])
+                .check_discovery_send(sa("10.255.255.255:9999"), Some(&classful))
+                .is_err()
+        );
+        assert_eq!(
+            policy(&["udp://10.0.0.0/8:9999"])
+                .check_discovery_send(sa("10.255.255.255:9999"), Some(&classful)),
+            Ok(true)
+        );
+    }
+
+    #[test]
     fn subnet_broadcasts_need_the_whole_network() {
         let local = ifaces(&["192.168.1.0/24", "10.0.0.2/31", "198.18.0.0/24"]);
         let whole = policy(&["udp://192.168.0.0/16:9999"]);
@@ -1735,16 +1790,6 @@ mod tests {
         assert!(
             half.check_discovery_send(sa("192.168.1.255:9999"), Some(&overlapping))
                 .is_err()
-        );
-        // The first address counts too (BSD treats it as a broadcast).
-        assert!(
-            half.check_discovery_send(sa("192.168.1.0:9999"), Some(&local))
-                .is_err()
-        );
-        assert_eq!(
-            policy(&["udp://192.168.1.0/24:9999"])
-                .check_discovery_send(sa("192.168.1.0:9999"), Some(&local)),
-            Ok(true)
         );
         // A /31 has no broadcast address.
         let p2p = policy(&["udp://10.0.0.3:9999"]);
