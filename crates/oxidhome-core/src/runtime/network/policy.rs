@@ -40,8 +40,9 @@
 //!   ([`is_group_address`]) are reached only through a `udp` rule naming
 //!   that exact address, for the port. A CIDR never covers them, and
 //!   `wasi:sockets` never reaches them.
-//! - A subnet-directed broadcast (the last address of a local IPv4
-//!   network) reaches every host of that network, so it needs a `udp`
+//! - A subnet-directed broadcast (an address the kernel treats as a
+//!   broadcast of a local IPv4 network: its last or first address, its
+//!   classful network's, or the interface's configured one) reaches every host of that network, so it needs a `udp`
 //!   (or `any`) IP rule covering the whole network. When the host can't
 //!   list its networks, IPv4 destinations other than named groups are
 //!   refused.
@@ -348,15 +349,19 @@ fn directed_broadcast(net: &IpNet) -> Option<IpAddr> {
 }
 
 /// An IPv4 network's first address, which BSD kernels (macOS) also
-/// treat as a broadcast address; none where [`directed_broadcast`] has
-/// none.
+/// treat as a broadcast address on any network but a `/32`.
 fn old_style_broadcast(net: &IpNet) -> Option<IpAddr> {
-    directed_broadcast(net).map(|_| net.network())
+    match net {
+        IpNet::V4(v4) if v4.prefix_len() < 32 => Some(IpAddr::V4(v4.network())),
+        _ => None,
+    }
 }
 
 /// The first and last addresses of the classful (A/B/C) network an
 /// IPv4 network lies in, which BSD kernels (macOS) also treat as
-/// broadcast addresses on that interface.
+/// broadcast addresses on that interface. Like XNU, the classful mask
+/// is narrowed to the network's own, so a supernet's classful network
+/// is the network itself.
 fn classful_broadcasts(net: &IpNet) -> [Option<IpAddr>; 2] {
     let IpNet::V4(v4) = net else {
         return [None, None];
@@ -367,6 +372,7 @@ fn classful_broadcasts(net: &IpNet) -> [Option<IpAddr>; 2] {
         192..=223 => 24,
         _ => return [None, None],
     };
+    let prefix = v4.prefix_len().min(prefix);
     match ipnet::Ipv4Net::new(v4.network(), prefix) {
         Ok(class) => {
             let class = class.trunc();
@@ -1791,7 +1797,23 @@ mod tests {
             half.check_discovery_send(sa("192.168.1.255:9999"), Some(&overlapping))
                 .is_err()
         );
-        // A /31 has no broadcast address.
+        // A supernet's classful network is the supernet itself, so a
+        // host inside it stays unicast.
+        let supernet = ifaces(&["192.168.0.0/23"]);
+        assert_eq!(
+            policy(&["udp://192.168.0.255:9999"])
+                .check_discovery_send(sa("192.168.0.255:9999"), Some(&supernet)),
+            Ok(false)
+        );
+        // A /31's first address counts (BSD exempts only a /32).
+        let p2p_first = ifaces(&["10.0.0.2/31"]);
+        assert!(
+            policy(&["udp://10.0.0.2:9999"])
+                .check_discovery_send(sa("10.0.0.2:9999"), Some(&p2p_first))
+                .is_err()
+        );
+        // A /31 has no last-address broadcast (its first is checked as
+        // the BSD form).
         let p2p = policy(&["udp://10.0.0.3:9999"]);
         assert!(
             p2p.check_discovery_send(sa("10.0.0.3:9999"), Some(&local))

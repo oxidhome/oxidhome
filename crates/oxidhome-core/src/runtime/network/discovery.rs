@@ -95,7 +95,14 @@ impl wasmtime_wasi::p2::Pollable for DiscoverySocket {
                 Ok(from) if self.admits(from) => return,
                 Ok(_) => {
                     // Dropped unread.
-                    let _ = self.socket.recv_from(&mut self.peek_buf);
+                    match self.socket.recv_from(&mut self.peek_buf) {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => {
+                            self.pending_error = Some(e);
+                            return;
+                        }
+                    }
                     discarded += 1;
                     if discarded.is_multiple_of(DISCARDS_PER_YIELD) {
                         tokio::task::yield_now().await;
@@ -127,7 +134,10 @@ fn list_interfaces() -> std::io::Result<Vec<LocalInterface>> {
                 if_addrs::IfAddr::V4(v4) => {
                     // A non-contiguous mask has no CIDR: refuse to guess
                     // which addresses its broadcast reaches.
-                    if u32::from(v4.netmask).leading_ones() != u32::from(v4.prefixlen) {
+                    let mask = u32::from(v4.netmask);
+                    if mask.leading_ones() != mask.count_ones()
+                        || mask.leading_ones() != u32::from(v4.prefixlen)
+                    {
                         return Some(Err(std::io::Error::other(format!(
                             "{}: non-contiguous netmask {}",
                             iface.name, v4.netmask
@@ -260,10 +270,9 @@ fn bind(ipv6: bool, port: u16) -> std::io::Result<(std::net::UdpSocket, tokio::n
         socket.set_only_v6(true)?;
         socket.set_multicast_hops_v6(MULTICAST_HOPS)?;
     } else {
-        // `SO_BROADCAST` stays off except around a send the policy
-        // approved as a broadcast, so a destination the kernel treats as
-        // a broadcast and the policy didn't (a network's first address,
-        // an interface change the cached list missed) is refused.
+        // `SO_BROADCAST` is on only for a send the policy approved as a
+        // broadcast, so a destination the kernel treats as a broadcast
+        // and the policy didn't is refused.
         socket.set_multicast_ttl_v4(MULTICAST_HOPS)?;
     }
     // Linux otherwise delivers every group joined on the host (by any
@@ -405,7 +414,13 @@ impl host_network::HostDiscoverySocket for PluginState {
         }
         // Listed per send (IPv4 only: IPv6 has no broadcast), so the
         // check sees the interfaces as they are now.
-        let interfaces = if addr.is_ipv4() && !super::policy::is_group_address(addr.ip()) {
+        let group = super::policy::is_group_address(addr.ip());
+        // Every destination but a group needs a rule for the address
+        // itself: refuse before listing the interfaces.
+        if !group && let Err(denial) = self.network.check_addr(Use::Udp, addr, None) {
+            return Err(self.refuse("send", &addr.to_string(), &denial));
+        }
+        let interfaces = if addr.is_ipv4() && !group {
             list_interfaces().ok()
         } else {
             Some(Vec::new())
@@ -437,6 +452,7 @@ impl host_network::HostDiscoverySocket for PluginState {
             Err(e)
                 if !broadcast
                     && addr.is_ipv4()
+                    && !group
                     && e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
                 Err(self.refuse("send", &addr.to_string(), &Denial::UnlistedBroadcast(addr)))
