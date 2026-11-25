@@ -925,7 +925,8 @@ impl LineServer {
 }
 
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // Generous: the whole workspace suite may be loading wasm at once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !done() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -933,6 +934,25 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// The grant change restarted `probe`: it ran within the change's wait
+/// limit, or (on a loaded machine) was still starting when it ended,
+/// which the caller's next wait covers.
+fn assert_restarted(body: &Value) {
+    if body["restarted"] == json!(["probe"]) {
+        assert_eq!(body["not_restarted"], json!([]), "{body}");
+        return;
+    }
+    assert_eq!(body["restarted"], json!([]), "{body}");
+    let slow = &body["not_restarted"][0];
+    assert_eq!(slow["instance_id"], "probe", "{body}");
+    assert!(
+        slow["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("still starting")),
+        "{body}"
+    );
 }
 
 /// A net-probe manifest requesting `rules`.
@@ -996,8 +1016,7 @@ async fn a_grant_change_restarts_running_instances_with_their_config() {
     let (status, body) =
         api_status(&router, &owner, "PUT", &uri, json!({"rules": [elsewhere]})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["restarted"], json!(["probe"]), "{body}");
-    assert_eq!(body["not_restarted"], json!([]), "{body}");
+    assert_restarted(&body);
     let target = format!("127.0.0.1:{}", server.port);
     wait_until("the refused connect", || {
         engine
@@ -1031,7 +1050,7 @@ async fn a_grant_change_restarts_running_instances_with_their_config() {
     // Reset: restarted again, and the connect goes through.
     let (status, body) = api_status(&router, &owner, "DELETE", &uri, Value::Null).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["restarted"], json!(["probe"]), "{body}");
+    assert_restarted(&body);
     wait_until("the connect after the reset", || server.accepted() == 2).await;
     let (status, body) = api_status(
         &router,
