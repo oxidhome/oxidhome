@@ -100,6 +100,7 @@ fn approx_size(event: &Event) -> usize {
         + event.device.as_ref().map_or(0, String::len)
         + event.origin_plugin_id.len()
         + event.origin_instance_id.len()
+        + event.call_id.as_ref().map_or(0, String::len)
         + payload
 }
 
@@ -269,6 +270,17 @@ mod tests {
                 payload: payload.into(),
             }),
         }
+    }
+
+    /// H6 slice 4: the page budget counts an event's call id.
+    #[test]
+    fn page_size_counts_the_call_id() {
+        let plain = custom("t", "{}");
+        let attributed = Event {
+            call_id: Some(format!("call-{:032x}", 1)),
+            ..plain.clone()
+        };
+        assert_eq!(approx_size(&attributed), approx_size(&plain) + 37);
     }
 
     fn camera(device: &str, frame: Vec<u8>) -> Event {
