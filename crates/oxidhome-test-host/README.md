@@ -191,7 +191,8 @@ to the machine's resolver. `TestHost::with_dns_overrides` answers them
 from a table instead, so a test can use any name and get the same
 answer on every machine; a name the table doesn't list is unresolvable.
 The network policy still checks every answer, so a public name that
-answers with a LAN address is refused just as it would be in the daemon:
+answers with a LAN address no IP or CIDR rule covers is refused, just
+as it would be in the daemon:
 
 ```rust,no_run
 use std::net::IpAddr;

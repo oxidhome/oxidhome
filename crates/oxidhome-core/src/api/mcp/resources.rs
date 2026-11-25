@@ -138,7 +138,9 @@ pub(super) fn list_resources() -> Vec<Resource> {
                 "JSON list of every plugin known to the host: installed manifests \
                  plus running-but-not-installed instances, each with its live \
                  instance count and, when installed, its `network` rules \
-                 (`requested`, `granted`, `effective`). Mirrors `oxidhome plugin list`.",
+                 (`requested`, `granted`, `effective`). Same body as the \
+                 `plugins.list` tool; the offline `oxidhome plugin list` shows \
+                 the same rules for installed plugins.",
             )
             .with_mime_type("application/json"),
         Resource::new("oxidhome://events", "events")
@@ -222,8 +224,8 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
             .with_description(
                 "JSON detail for a single installed plugin — version, manifest \
                  digest, singleton flag, `network` rules (`requested`, `granted`, \
-                 `effective`), plus live instances. Mirrors \
-                 `oxidhome plugin show <plugin-id>`.",
+                 `effective`), plus live instances. Same body as the \
+                 `plugins.show` tool.",
             )
             .with_mime_type("application/json"),
         ResourceTemplate::new("oxidhome://blobs/{instance_id}/{name}", "blob")

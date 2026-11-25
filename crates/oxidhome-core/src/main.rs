@@ -878,10 +878,11 @@ fn parse_token_create(
 fn run_device() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome device set-category <dev-id> <category>|--clear\n\
          categories: alarm lock opener camera light climate media switch sensor other";
-    let args: Vec<String> = std::env::args().skip(2).collect();
+    // `args_os`: a non-UTF-8 argument is a usage error, not a panic.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(2).collect();
     match args
         .iter()
-        .map(String::as_str)
+        .map(|a| a.to_str().unwrap_or("\u{fffd}"))
         .collect::<Vec<_>>()
         .as_slice()
     {

@@ -213,7 +213,7 @@ impl TestHost {
     /// get the same answer everywhere. A name not listed is unresolvable;
     /// a name listed twice gets both entries' addresses. The network
     /// policy still checks every answer (a public name answering with a
-    /// LAN address is refused). Call before loading plugins; replaces
+    /// LAN address no IP or CIDR rule covers is refused). Call before loading plugins; replaces
     /// any earlier table.
     #[must_use]
     pub fn with_dns_overrides<N: Into<String>>(
