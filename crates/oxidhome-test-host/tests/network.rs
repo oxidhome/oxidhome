@@ -429,6 +429,14 @@ async fn lookups_hand_over_only_the_answers_the_rules_allow() {
     // a policy refusal, and never sent to the machine's resolver.
     assert!(results[4].starts_with("err:"), "{results:?}");
     assert_ne!(results[4], results[2], "{results:?}");
+    // Every queued denial is written before checking none names it.
+    let engine = host.engine().clone();
+    assert!(
+        tokio::task::spawn_blocking(move || engine.drain_state_read_audit(Duration::from_secs(10)))
+            .await
+            .unwrap(),
+        "deny-audit queue drained"
+    );
     let rows = host
         .engine()
         .audit_log()

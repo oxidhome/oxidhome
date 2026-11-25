@@ -370,17 +370,16 @@ pub fn with_offline_stores<T>(
     state_dir: &Path,
     op: impl FnOnce(&OfflineStores) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    with_offline_db(state_dir, |db| {
-        let db = std::sync::Arc::new(db);
-        let stores = OfflineStores {
-            tokens: TokenStore::new(std::sync::Arc::clone(&db)),
-            audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
-            devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
-                .context("reading device_meta")?,
-            tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
-        };
-        op(&stores)
-    })
+    let (_lock, db) = open_offline(state_dir)?;
+    let db = std::sync::Arc::new(db);
+    let stores = OfflineStores {
+        tokens: TokenStore::new(std::sync::Arc::clone(&db)),
+        audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
+        devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
+            .context("reading device_meta")?,
+        tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
+    };
+    op(&stores)
 }
 
 /// Run `op` against the bare database under `state_dir`, with the same
@@ -394,15 +393,22 @@ pub fn with_offline_stores<T>(
 /// failed.
 pub fn with_offline_db<T>(
     state_dir: &Path,
-    op: impl FnOnce(crate::state::Db) -> anyhow::Result<T>,
+    op: impl FnOnce(&crate::state::Db) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    let (_lock, db) = open_offline(state_dir)?;
+    op(&db)
+}
+
+/// Take the exclusive state-dir lock, check the schema, and open the
+/// database. The guard must outlive every use of the handle.
+fn open_offline(state_dir: &Path) -> anyhow::Result<(std::fs::File, crate::state::Db)> {
     if !state_dir.join(crate::state::db::DB_FILE_NAME).exists() {
         anyhow::bail!(
             "no oxidhome database under {} (set $OXIDHOME_STATE_DIR to the daemon's state dir)",
             state_dir.display(),
         );
     }
-    let _lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
+    let lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("this command needs exclusive access — stop the daemon first")?;
     // Migrations are the daemon's to run: some come with engine-side
     // cleanup (files on disk) that opening the database alone skips,
@@ -421,7 +427,7 @@ pub fn with_offline_db<T>(
     }
     let db = crate::state::Db::open_file(state_dir)
         .with_context(|| format!("opening the database under {}", state_dir.display()))?;
-    op(db)
+    Ok((lock, db))
 }
 
 /// Set (or with `None` clear) the operator's category raise for

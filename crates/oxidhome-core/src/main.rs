@@ -1019,7 +1019,7 @@ fn run_plugin() -> anyhow::Result<()> {
     init_cli_tracing();
     let state_dir = resolve_state_dir()?;
     let plugins = with_offline_db(&state_dir, |db| {
-        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), &db)
+        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), db)
     })?;
     print!("{}", format_plugin_list(&plugins));
     Ok(())

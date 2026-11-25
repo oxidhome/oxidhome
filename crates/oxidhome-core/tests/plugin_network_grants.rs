@@ -404,3 +404,47 @@ async fn the_offline_listing_flags_what_scan_would_quarantine() {
         .unwrap();
     assert!(reason(&state).contains("grant or content digest"));
 }
+
+#[test]
+fn the_cli_prints_the_listing_and_rejects_bad_arguments() {
+    let state = support::tempdir("net-grants-cli");
+    drop(installed_and_narrowed(&state));
+    let cli = |args: &[&std::ffi::OsStr]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_oxidhome-core"))
+            .args(args)
+            .env("OXIDHOME_STATE_DIR", state.path())
+            .output()
+            .expect("run oxidhome")
+    };
+    let out = cli(&["plugin".as_ref(), "list".as_ref()]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert!(
+        lines
+            .next()
+            .is_some_and(|l| l.starts_with(&format!("{PLUGIN_ID}\t0.3.0\tinstallation=inst-"))),
+        "{stdout}"
+    );
+    let rules: Vec<&str> = lines.collect();
+    let expected: Vec<String> = [
+        ("requested", &REQUESTED[..]),
+        ("granted", &GRANTED[..]),
+        ("effective", &EFFECTIVE[..]),
+    ]
+    .iter()
+    .flat_map(|(tag, rules)| rules.iter().map(move |r| format!("\t{tag}\t{r}")))
+    .collect();
+    assert_eq!(rules, expected);
+
+    let out = cli(&["plugin".as_ref(), "lst".as_ref()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: oxidhome plugin list"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let out = cli(&["plugin".as_ref(), std::ffi::OsStr::from_bytes(b"\xff")]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("usage: oxidhome plugin list"));
+    }
+}
