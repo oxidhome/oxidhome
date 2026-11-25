@@ -74,8 +74,14 @@ fn reached_by(scopes: &[String]) -> SensitiveSet {
 }
 
 /// The tokens [`sensitive_access_report`] would name, from records.
+/// `role_sensitive` maps a role id to the sensitive categories its
+/// definition grants on every device; a token holding such a role is
+/// covered for them.
 #[must_use]
-pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
+pub fn sensitive_gaps<S: std::hash::BuildHasher>(
+    records: &[TokenRecord],
+    role_sensitive: &std::collections::HashMap<String, SensitiveSet, S>,
+) -> Vec<SensitiveGap> {
     records
         .iter()
         .filter(|r| r.revoked_ms.is_none() && !r.owner)
@@ -88,6 +94,13 @@ pub fn sensitive_gaps(records: &[TokenRecord]) -> Vec<SensitiveGap> {
                 .get("device.send_command")
                 .and_then(|c| c.devices.as_deref());
             let covered = |c: SensitiveCategory| {
+                if policy
+                    .roles
+                    .iter()
+                    .any(|id| role_sensitive.get(id).is_some_and(|s| s.contains(c)))
+                {
+                    return true;
+                }
                 let grants = policy.sensitive.iter().filter(|g| g.category == c);
                 if grants.clone().any(|g| g.devices.is_none()) {
                     return true;
@@ -151,7 +164,20 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             return Vec::new();
         }
     };
-    let gaps = sensitive_gaps(&records);
+    let role_sensitive = match tokens.roles() {
+        Ok(roles) => roles
+            .into_iter()
+            .filter_map(|r| {
+                let def = r.def()?;
+                Some((r.id, def.sensitive.into_iter().collect::<SensitiveSet>()))
+            })
+            .collect(),
+        Err(err) => {
+            tracing::error!(target: "auth.sensitive", error = %err, "listing roles for the sensitive-access check failed");
+            std::collections::HashMap::<String, SensitiveSet>::new()
+        }
+    };
+    let gaps = sensitive_gaps(&records, &role_sensitive);
     if !records.is_empty() && !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) {
         // The upgrade marks the owner from the bootstrap / recovery
         // audit rows; retention may have pruned them.
@@ -196,21 +222,12 @@ fn live_policy(tokens: &TokenStore, token_id: &str) -> anyhow::Result<TokenPolic
     })
 }
 
-fn check_devices(devices: &[String]) -> anyhow::Result<()> {
+pub(crate) fn check_devices(devices: &[String]) -> anyhow::Result<()> {
     if devices.len() > MAX_DEVICE_PATTERNS {
         anyhow::bail!("at most {MAX_DEVICE_PATTERNS} --device patterns");
     }
     for d in devices {
-        let ok = match d.strip_suffix('*') {
-            // A prefix of some `dev-<16 hex>` id.
-            Some(prefix) => {
-                !prefix.is_empty()
-                    && prefix.len() < "dev-0123456789abcdef".len()
-                    && could_prefix_device_id(prefix)
-            }
-            None => crate::state::is_device_id(d),
-        };
-        if !ok || d.len() > MAX_DEVICE_PATTERN_LEN {
+        if !crate::state::is_device_pattern(d) || d.len() > MAX_DEVICE_PATTERN_LEN {
             anyhow::bail!(
                 "device pattern {d:?} must be a device id (dev-<16 hex>) or a `prefix*` of one \
                  (omit --device to grant every device)"
@@ -218,18 +235,6 @@ fn check_devices(devices: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-/// `true` when `prefix` could start a `dev-<16 lowercase hex>` id.
-fn could_prefix_device_id(prefix: &str) -> bool {
-    let template = "dev-";
-    if prefix.len() <= template.len() {
-        return template.starts_with(prefix);
-    }
-    prefix.starts_with(template)
-        && prefix[template.len()..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `policy` with `category` granted: on every device (`devices` empty)

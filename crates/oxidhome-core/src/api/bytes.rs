@@ -77,7 +77,13 @@ impl BytesGate {
             ctx: ctx.clone(),
             devices: engine.devices(),
             guard: engine.sensitive(),
-            general: authorize(ctx, Action::BlobRead, &Resource::blobs()).allow,
+            // A pre-check: every value is decided per source below.
+            general: authorize(
+                ctx,
+                Action::BlobRead,
+                &Resource::pre_check(crate::auth::ResourceKind::Blob),
+            )
+            .allow,
             deferred: false,
             state: Mutex::new(GateState::default()),
         }
@@ -150,7 +156,7 @@ impl BytesGate {
             Some(id) => {
                 let mut class = self.devices.class_of(id);
                 if camera_source {
-                    class = class.raised(crate::auth::DeviceCategory::Camera);
+                    class = class.with_camera_bytes();
                 }
                 Resource::device(id, class)
             }

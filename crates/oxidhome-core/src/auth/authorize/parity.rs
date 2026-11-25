@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 
-use super::{Action, Resource, authorize};
+use super::{Action, Resource, ResourceKind, authorize};
 use crate::api::auth::first_constraint_refusal;
 use crate::api::mcp::MCP_ENFORCED_CONSTRAINTS;
 use crate::api::scopes::{self, Scope, require_scope};
@@ -118,7 +118,7 @@ fn sites() -> Vec<Site> {
             Rest,
             scopes::DEVICES_LIST,
             Action::DeviceList,
-            Resource::devices()
+            Resource::pre_check(ResourceKind::Device)
         ),
         Site {
             name: "rest GET /devices/{id}/state",
@@ -276,7 +276,7 @@ fn sites() -> Vec<Site> {
             Rest,
             scopes::BLOBS_READ,
             Action::BlobRead,
-            Resource::blobs()
+            Resource::pre_check(ResourceKind::Blob)
         ),
         // ── Connect (`api/connect_rpc.rs`) ──
         flat!(
@@ -291,7 +291,7 @@ fn sites() -> Vec<Site> {
             Connect,
             scopes::DEVICES_LIST,
             Action::DeviceList,
-            Resource::devices()
+            Resource::pre_check(ResourceKind::Device)
         ),
         Site {
             name: "connect ExecuteCommand",
@@ -383,7 +383,7 @@ fn sites() -> Vec<Site> {
             Connect,
             scopes::BLOBS_READ,
             Action::BlobRead,
-            Resource::blobs()
+            Resource::pre_check(ResourceKind::Blob)
         ),
         // ── MCP tools (`api/mcp/tools.rs`): route pre-check ──
         flat!(
@@ -391,7 +391,7 @@ fn sites() -> Vec<Site> {
             McpHttp,
             scopes::DEVICES_COMMAND,
             Action::DeviceCommand,
-            Resource::devices()
+            Resource::pre_check(ResourceKind::Device)
         ),
         flat!(
             "mcp tool logs.query",
@@ -419,21 +419,21 @@ fn sites() -> Vec<Site> {
             McpHttp,
             scopes::PLUGINS_STOP,
             Action::InstanceStop,
-            Resource::instances()
+            Resource::pre_check(ResourceKind::Instance)
         ),
         flat!(
             "mcp tool plugins.uninstall pre-check",
             McpHttp,
             scopes::PLUGINS_UNINSTALL,
             Action::PluginUninstall,
-            Resource::plugins()
+            Resource::pre_check(ResourceKind::Plugin)
         ),
         flat!(
             "mcp tool plugins.start pre-check",
             McpHttp,
             scopes::PLUGINS_START,
             Action::InstanceStart,
-            Resource::instances()
+            Resource::pre_check(ResourceKind::Instance)
         ),
         flat!(
             "mcp tool plugins.install pre-check",
@@ -447,7 +447,7 @@ fn sites() -> Vec<Site> {
             McpHttp,
             scopes::BLOBS_READ,
             Action::BlobRead,
-            Resource::blobs()
+            Resource::pre_check(ResourceKind::Blob)
         ),
         // ── MCP tools: per-target checks (pre-check passed first) ──
         Site {
@@ -525,7 +525,7 @@ fn sites() -> Vec<Site> {
             McpHttp,
             scopes::DEVICES_LIST,
             Action::DeviceList,
-            Resource::devices()
+            Resource::pre_check(ResourceKind::Device)
         ),
         Site {
             name: "mcp resource devices/{id}",
@@ -962,4 +962,492 @@ fn sensitive_targets_diverge_from_legacy_by_design() {
     }
     // Camera *control* is not sensitive (Q4).
     assert_eq!(decide(&wildcard, Action::DeviceCommand, &camera), Ok(()));
+}
+
+// ── H6 slice 3: roles and the deny list ─────────────────────────────
+
+fn role_actor(roles: &[crate::auth::RoleDef], sensitive: Vec<SensitiveGrant>) -> Actor {
+    Actor::from_token_policy(
+        "tok-role",
+        TokenPolicy {
+            roles: roles.iter().map(|r| r.id.clone()).collect(),
+            sensitive,
+            ..TokenPolicy::default()
+        },
+        false,
+    )
+    .with_roles(roles.iter().cloned().map(std::sync::Arc::new).collect())
+}
+
+fn decide(actor: &Actor, action: Action, resource: &Resource) -> Result<(), &'static str> {
+    let ctx = InvocationContext::external(Principal::token(ActorKind::Api, actor, Transport::Rest));
+    authorize(&ctx, action, resource).into_result().map(drop)
+}
+
+/// Every resource shape the evaluator distinguishes.
+fn resources() -> Vec<Resource> {
+    let mut out = vec![
+        Resource::Host,
+        Resource::plugin("acme.lamp"),
+        Resource::instance("acme.lamp", Some("lamp".into())),
+        Resource::blob("cam", "snap.jpg", true),
+        Resource::blob("lamp", "x.bin", false),
+        Resource::dashboard(7),
+    ];
+    for kind in [
+        ResourceKind::Device,
+        ResourceKind::Event,
+        ResourceKind::Blob,
+        ResourceKind::Instance,
+        ResourceKind::Plugin,
+        ResourceKind::Dashboard,
+    ] {
+        out.push(Resource::Collection(kind));
+        out.push(Resource::PreCheck(kind));
+    }
+    for category in DeviceCategory::ALL {
+        for id in ["dev-a1b2c3d4e5f60718", "dev-ff00000000000000"] {
+            out.push(Resource::device(id, DeviceClass::of(category)));
+        }
+    }
+    // Offline: its display category is unknown.
+    for id in ["dev-a1b2c3d4e5f60718", "dev-ff00000000000000"] {
+        out.push(Resource::device(id, DeviceClass::unregistered()));
+    }
+    out
+}
+
+/// A sample role, through the stored-definition parser.
+fn role(name: &str, definition: &str) -> crate::auth::RoleDef {
+    crate::auth::RoleDef::parse(
+        &format!("role-{:0>16}", name.len()),
+        name,
+        definition.as_bytes(),
+    )
+    .unwrap_or_else(|| panic!("{name}: {definition}"))
+}
+
+const READ: &[&str] = &[
+    "device.list",
+    "device.read",
+    "event.read",
+    "event.subscribe",
+    "instance.read",
+    "plugin.read",
+    "host.status",
+    "dashboard.read",
+];
+
+/// One oracle grant: actions, categories, device prefix.
+type OracleGrant = (
+    Vec<&'static str>,
+    Option<Vec<DeviceCategory>>,
+    Option<&'static str>,
+);
+
+/// Sample roles with the oracle's own reading of each:
+/// `(role, grants, denied (action, category), sensitive)`.
+#[allow(clippy::type_complexity)]
+fn samples() -> Vec<(
+    crate::auth::RoleDef,
+    Vec<OracleGrant>,
+    Vec<(&'static str, DeviceCategory)>,
+    Vec<SensitiveCategory>,
+)> {
+    let with = |extra: &[&'static str]| {
+        let mut v = READ.to_vec();
+        v.extend_from_slice(extra);
+        v
+    };
+    let use_ = vec!["device.list", "device.read", "device.command"];
+    vec![
+        (
+            role(
+                "household",
+                r#"{"grants":[{"actions":["device.list","device.read","event.read","event.subscribe","instance.read","plugin.read","host.status","dashboard.read","device.command","blob.read"]}]}"#,
+            ),
+            vec![(with(&["device.command", "blob.read"]), None, None)],
+            vec![],
+            vec![],
+        ),
+        (
+            role(
+                "tablet",
+                r#"{"grants":[{"actions":["device.list","device.read","device.command"],"category":["light"]}]}"#,
+            ),
+            vec![(use_.clone(), Some(vec![DeviceCategory::Light]), None)],
+            vec![],
+            vec![],
+        ),
+        (
+            role(
+                "visitor",
+                r#"{"grants":[{"actions":["device.list","device.read","device.command"],"category":["light","media","climate"]}]}"#,
+            ),
+            vec![(
+                use_.clone(),
+                Some(vec![
+                    DeviceCategory::Light,
+                    DeviceCategory::Media,
+                    DeviceCategory::Climate,
+                ]),
+                None,
+            )],
+            vec![],
+            vec![],
+        ),
+        (
+            role(
+                "one-device",
+                r#"{"grants":[{"actions":["device.read","device.command"],"devices":["dev-a1*"]}]}"#,
+            ),
+            vec![(vec!["device.read", "device.command"], None, Some("dev-a1"))],
+            vec![],
+            vec![],
+        ),
+        (
+            role(
+                "assistant",
+                r#"{"grants":[{"actions":["device.list","device.read","event.read","event.subscribe","instance.read","plugin.read","host.status","dashboard.read"]},{"actions":["device.command"],"category":["light"]}],
+                   "deny":[{"actions":["device.command"],"category":["lock"]}]}"#,
+            ),
+            vec![
+                (READ.to_vec(), None, None),
+                (
+                    vec!["device.command"],
+                    Some(vec![DeviceCategory::Light]),
+                    None,
+                ),
+            ],
+            vec![("device.command", DeviceCategory::Lock)],
+            vec![],
+        ),
+        (
+            role(
+                "keyholder",
+                r#"{"grants":[{"actions":["device.command"],"category":["lock","light"]}],"sensitive":["lock"]}"#,
+            ),
+            vec![(
+                vec!["device.command"],
+                Some(vec![DeviceCategory::Lock, DeviceCategory::Light]),
+                None,
+            )],
+            vec![],
+            vec![SensitiveCategory::Lock],
+        ),
+        (
+            role("admin", r#"{"grants":[{"actions":["*"]}]}"#),
+            vec![(
+                Action::ALL
+                    .into_iter()
+                    .filter(|a| a.legacy_scope().is_some())
+                    .map(Action::as_str)
+                    .collect(),
+                None,
+                None,
+            )],
+            vec![],
+            vec![],
+        ),
+    ]
+}
+
+/// What the oracle expects for one role token without its own
+/// sensitive grants.
+fn oracle(
+    grants: &[OracleGrant],
+    denies: &[(&'static str, DeviceCategory)],
+    sensitive_granted: &[SensitiveCategory],
+    action: Action,
+    resource: &Resource,
+) -> bool {
+    let permitted = grants.iter().any(|(actions, categories, prefix)| {
+        actions.contains(&action.as_str())
+            && match (categories, prefix, resource) {
+                (None, None, _) | (_, _, Resource::PreCheck(ResourceKind::Device)) => true,
+                (_, _, Resource::Device(d)) => {
+                    categories.as_ref().is_none_or(|c| {
+                        d.class().is_registered() && c.contains(&d.class().category())
+                    }) && prefix.is_none_or(|p| d.id().starts_with(p))
+                }
+                _ => false,
+            }
+    });
+    let refused = denies.iter().any(|(a, c)| {
+        *a == action.as_str()
+            && matches!(resource, Resource::Device(d) if !d.class().is_registered()
+                || d.class().category() == *c
+                || c.sensitive().is_some_and(|s| d.class().sensitive().contains(s)))
+    });
+    let needed: Vec<SensitiveCategory> = match (action, resource) {
+        (Action::DeviceCommand, Resource::Device(d)) => d
+            .class()
+            .sensitive()
+            .iter()
+            .filter(|c| c.guards_commands())
+            .collect(),
+        (Action::BlobRead, Resource::Device(d)) if d.class().is_camera() => {
+            vec![SensitiveCategory::Camera]
+        }
+        (Action::BlobRead, Resource::Blob(b)) if b.is_camera() => vec![SensitiveCategory::Camera],
+        _ => vec![],
+    };
+    permitted && !refused && needed.iter().all(|c| sensitive_granted.contains(c))
+}
+
+#[test]
+fn every_role_matches_the_oracle() {
+    let mut allowed = 0usize;
+    let mut compared = 0usize;
+    for (def, grants, denies, sensitive) in samples() {
+        let actor = role_actor(std::slice::from_ref(&def), Vec::new());
+        for action in Action::ALL {
+            for resource in resources() {
+                let got = decide(&actor, action, &resource).is_ok();
+                assert_eq!(
+                    got,
+                    oracle(&grants, &denies, &sensitive, action, &resource),
+                    "{} {} {resource:?}",
+                    def.name,
+                    action.as_str()
+                );
+                compared += 1;
+                allowed += usize::from(got);
+            }
+        }
+    }
+    assert!(compared > 1_000 && allowed > 200, "{allowed}/{compared}");
+}
+
+/// A role whose grants are unnarrowed decides every legacy call site
+/// like the equivalent scope list does.
+#[test]
+fn unnarrowed_roles_match_their_scope_equivalents() {
+    for (def, _, _, _) in samples()
+        .into_iter()
+        .filter(|(d, ..)| ["household", "admin"].contains(&d.name.as_str()))
+    {
+        let scopes: Vec<String> = def
+            .actions()
+            .iter()
+            .filter_map(|a| a.legacy_scope().map(|s| s.name().to_owned()))
+            .collect();
+        let by_role = role_actor(std::slice::from_ref(&def), Vec::new());
+        let by_scope = Actor::api("tok", scopes);
+        for site in sites() {
+            for target in TARGETS {
+                let (action, resource) = (site.modern)(target);
+                assert_eq!(
+                    decide(&by_role, action, &resource).is_ok(),
+                    decide(&by_scope, action, &resource).is_ok(),
+                    "{} at {} target `{target}`",
+                    def.name,
+                    site.name,
+                );
+            }
+        }
+    }
+}
+
+/// A token whose role ids weren't resolved (or were deleted) holds
+/// nothing through them.
+#[test]
+fn unresolved_role_ids_grant_nothing() {
+    let actor = Actor::from_token_policy(
+        "tok",
+        TokenPolicy {
+            roles: vec!["role-00000000000000a1".into()],
+            ..TokenPolicy::default()
+        },
+        false,
+    );
+    for action in Action::ALL {
+        for resource in resources() {
+            assert!(decide(&actor, action, &resource).is_err());
+        }
+    }
+}
+
+/// Sensitive grants and constraints apply on top of a role exactly as
+/// on top of a scope; the assistant's deny beats a sensitive grant.
+#[test]
+fn roles_compose_with_sensitive_grants_constraints_and_denies() {
+    let by_name = |n: &str| {
+        samples()
+            .into_iter()
+            .find(|(d, ..)| d.name == n)
+            .map(|(d, ..)| d)
+            .unwrap()
+    };
+    let lock = Resource::device(
+        "dev-a1b2c3d4e5f60718",
+        DeviceClass::of(DeviceCategory::Lock),
+    );
+    let resident = role_actor(
+        &[by_name("household")],
+        vec![SensitiveGrant::all(SensitiveCategory::Lock)],
+    );
+    assert_eq!(decide(&resident, Action::DeviceCommand, &lock), Ok(()));
+    let assistant = role_actor(
+        &[by_name("assistant"), by_name("household")],
+        vec![SensitiveGrant::all(SensitiveCategory::Lock)],
+    );
+    assert_eq!(
+        decide(&assistant, Action::DeviceCommand, &lock),
+        Err(super::DENIED_LABEL)
+    );
+    // Not on a light, which the resident role reaches.
+    let light = Resource::device(
+        "dev-a1b2c3d4e5f60718",
+        DeviceClass::of(DeviceCategory::Light),
+    );
+    assert_eq!(decide(&assistant, Action::DeviceCommand, &light), Ok(()));
+
+    // A 14.4 device allowlist narrows a role's command too.
+    let mut constraints = HashMap::new();
+    constraints.insert("device.send_command".to_string(), devices(&["dev-ffff*"]));
+    let tablet = by_name("tablet");
+    let narrowed = Actor::from_token_policy(
+        "tok",
+        TokenPolicy {
+            roles: vec![tablet.id.clone()],
+            constraints,
+            ..TokenPolicy::default()
+        },
+        false,
+    )
+    .with_roles(vec![std::sync::Arc::new(tablet.clone())]);
+    assert_eq!(
+        decide(&narrowed, Action::DeviceCommand, &light),
+        Err("constraint:device.send_command:devices")
+    );
+    let other_light = Resource::device(
+        "dev-ffff000000000000",
+        DeviceClass::of(DeviceCategory::Light),
+    );
+    assert_eq!(
+        decide(&narrowed, Action::DeviceCommand, &other_light),
+        Ok(())
+    );
+
+    // Labels: a scope it lacks entirely, `no-permit` for a role that
+    // grants the action elsewhere.
+    let dashboard = role_actor(&[tablet], Vec::new());
+    assert_eq!(
+        decide(&dashboard, Action::HostLogs, &Resource::Host),
+        Err("logs:read")
+    );
+    assert_eq!(
+        decide(&dashboard, Action::DeviceCommand, &lock),
+        Err(super::NO_PERMIT_LABEL)
+    );
+}
+
+/// A token's own deny list beats the wildcard and the owner flag, and
+/// never blocks a pre-check.
+#[test]
+fn deny_list_beats_every_grant() {
+    use crate::auth::{ActionSet, DenyRule};
+    let deny = vec![
+        DenyRule {
+            actions: ActionSet::of(&[Action::DeviceCommand]),
+            categories: Some(vec![DeviceCategory::Alarm]),
+            devices: None,
+        },
+        DenyRule {
+            actions: ActionSet::of(&[Action::HostLogs]),
+            categories: None,
+            devices: None,
+        },
+    ];
+    for owner in [false, true] {
+        let actor = Actor::from_token_policy(
+            "tok",
+            TokenPolicy {
+                scopes: vec!["*".into()],
+                sensitive: vec![SensitiveGrant::all(SensitiveCategory::Alarm)],
+                deny: deny.clone(),
+                ..TokenPolicy::default()
+            },
+            owner,
+        );
+        let alarm = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Alarm),
+        );
+        assert_eq!(
+            decide(&actor, Action::DeviceCommand, &alarm),
+            Err(super::DENIED_LABEL)
+        );
+        assert_eq!(
+            decide(&actor, Action::HostLogs, &Resource::Host),
+            Err(super::DENIED_LABEL)
+        );
+        assert_eq!(
+            decide(
+                &actor,
+                Action::DeviceCommand,
+                &Resource::pre_check(ResourceKind::Device)
+            ),
+            Ok(())
+        );
+        let light = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Light),
+        );
+        assert_eq!(decide(&actor, Action::DeviceCommand, &light), Ok(()));
+        assert_eq!(decide(&actor, Action::HostStatus, &Resource::Host), Ok(()));
+    }
+}
+
+/// `token.manage` is the owner's alone, like `policy.manage`.
+#[test]
+fn token_manage_is_owner_only() {
+    let owner = Actor::from_token_policy(
+        "tok-owner",
+        TokenPolicy {
+            scopes: vec!["*".into()],
+            ..TokenPolicy::default()
+        },
+        true,
+    );
+    assert_eq!(decide(&owner, Action::TokenManage, &Resource::Host), Ok(()));
+    assert!(
+        decide(
+            &Actor::api("tok", vec!["*".into()]),
+            Action::TokenManage,
+            &Resource::Host
+        )
+        .is_err()
+    );
+    for (role, ..) in samples() {
+        for action in [Action::TokenManage, Action::PolicyManage] {
+            assert!(
+                decide(
+                    &role_actor(std::slice::from_ref(&role), Vec::new()),
+                    action,
+                    &Resource::Host
+                )
+                .is_err()
+            );
+        }
+    }
+    // A role's sensitive category reaches the lock it grants.
+    let keyholder = samples()
+        .into_iter()
+        .find(|(d, ..)| d.name == "keyholder")
+        .unwrap()
+        .0;
+    let lock = Resource::device(
+        "dev-a1b2c3d4e5f60718",
+        DeviceClass::of(DeviceCategory::Lock),
+    );
+    assert_eq!(
+        decide(
+            &role_actor(&[keyholder], Vec::new()),
+            Action::DeviceCommand,
+            &lock
+        ),
+        Ok(())
+    );
 }

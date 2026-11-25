@@ -3926,3 +3926,181 @@ async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
         .expect("deny row");
     assert_eq!(deny.required_scope.as_deref(), Some("events:read"));
 }
+
+/// H6 slice 3: `tokens.list` is the owner's alone and never carries a
+/// secret; there is no `tokens.create` (M7 keeps credentials out of
+/// MCP responses).
+#[tokio::test(flavor = "current_thread")]
+async fn tokens_list_is_owner_only_and_there_is_no_create() {
+    let engine = Engine::new().expect("engine");
+    let issued = oxidhome_core::state::TokenStore::generate();
+    assert!(
+        engine
+            .auth_tokens()
+            .insert_owner_if_empty(&issued, "admin", br#"["*"]"#)
+            .expect("owner")
+    );
+    let owner = issued.plaintext;
+    let wildcard = mint_bearer(&engine);
+    let assistant = engine
+        .auth_tokens()
+        .create_role("assistant", br#"{"grants":[{"actions":["device.list"]}]}"#)
+        .expect("role");
+    engine
+        .auth_tokens()
+        .create(
+            "llm",
+            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, assistant.id).as_bytes(),
+        )
+        .expect("role token");
+    let router = build_router(engine.clone());
+
+    let (router, session) = handshake(router, &wildcard).await;
+    let response = call(
+        &router,
+        &wildcard,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.list", "arguments": {}}),
+    )
+    .await;
+    assert!(response["error"].is_object(), "{response}");
+
+    let (router, session) = handshake(router, &owner).await;
+    let response = call(
+        &router,
+        &owner,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.create", "arguments": {"label": "x", "roles": ["monitor"]}}),
+    )
+    .await;
+    assert!(response["error"].is_object(), "{response}");
+
+    let response = call(
+        &router,
+        &owner,
+        &session,
+        "tools/call",
+        json!({"name": "tokens.list", "arguments": {}}),
+    )
+    .await;
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let tokens = response["result"]["structuredContent"]["tokens"]
+        .as_array()
+        .expect("tokens");
+    assert_eq!(tokens.len(), 3, "{response}");
+    assert_eq!(tokens[0]["roles"], json!(["owner"]));
+    assert_eq!(tokens[2]["roles"], json!(["assistant"]));
+    assert!(!response.to_string().contains(&owner));
+}
+
+/// H6 slice 3: a `dashboard` role token over MCP reaches only light
+/// devices: a `switch` is missing from `oxidhome://devices`, its detail
+/// and `device.send_command` are refused, until the owner raises it to
+/// `light`.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_role_reaches_only_lights_over_mcp() {
+    let _wasm = _support::build_example("simulated-switch", "simulated_switch.wasm");
+    let switch_dir = _support::workspace_root()
+        .join("examples")
+        .join("simulated-switch");
+    let engine = Engine::new().expect("engine");
+    let dashboard = engine
+        .auth_tokens()
+        .create_role(
+            "dashboard",
+            br#"{"grants":[{"actions":["device.list","device.read","device.command"],"category":["light"]}]}"#,
+        )
+        .expect("role");
+    let bearer = engine
+        .auth_tokens()
+        .create(
+            "tablet",
+            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, dashboard.id).as_bytes(),
+        )
+        .expect("role token")
+        .plaintext;
+    let handle = engine
+        .start_instance(switch_dir, "switch-role", None)
+        .await
+        .expect("start_instance");
+    handle.wait_for_running().await.expect("running");
+    let device_id = engine
+        .devices()
+        .list()
+        .into_iter()
+        .find(|d| d.owner_instance == "switch-role")
+        .expect("device")
+        .id
+        .clone();
+    let router = build_router(engine.clone());
+    let (router, session) = handshake(router, &bearer).await;
+    let read = |uri: String| {
+        let router = router.clone();
+        let bearer = bearer.clone();
+        let session = session.clone();
+        async move {
+            call(
+                &router,
+                &bearer,
+                &session,
+                "resources/read",
+                json!({ "uri": uri }),
+            )
+            .await
+        }
+    };
+    let toggle = || {
+        let router = router.clone();
+        let bearer = bearer.clone();
+        let session = session.clone();
+        let device_id = device_id.clone();
+        async move {
+            call(
+                &router,
+                &bearer,
+                &session,
+                "tools/call",
+                json!({
+                    "name": "device.send_command",
+                    "arguments": {"device_id": device_id, "capability": "switch", "action": "toggle"},
+                }),
+            )
+            .await
+        }
+    };
+
+    let list = read("oxidhome://devices".into()).await;
+    let text = list["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("body");
+    assert!(!text.contains(&device_id), "{list}");
+    let detail = read(format!("oxidhome://devices/{device_id}")).await;
+    assert!(detail["error"].is_object(), "{detail}");
+    let refused = toggle().await;
+    assert!(
+        refused["error"].is_object() || refused["result"]["isError"] == true,
+        "{refused}"
+    );
+
+    engine
+        .devices()
+        .meta()
+        .set_override(
+            &device_id,
+            Some(oxidhome_core::auth::DeviceCategory::Light),
+            None,
+        )
+        .expect("raise to light");
+    let list = read("oxidhome://devices".into()).await;
+    let text = list["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("body");
+    assert!(text.contains(&device_id), "{list}");
+    let detail = read(format!("oxidhome://devices/{device_id}")).await;
+    assert!(detail["result"].is_object(), "{detail}");
+    let done = toggle().await;
+    assert_ne!(done["result"]["isError"], true, "{done}");
+    assert!(done["error"].is_null(), "{done}");
+}

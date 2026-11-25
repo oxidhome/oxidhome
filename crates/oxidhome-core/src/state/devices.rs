@@ -179,12 +179,16 @@ impl DeviceRegistry {
     /// The host-owned class of `id`: derived from its registered
     /// capabilities (when it is registered right now), widened by the
     /// durable floor and the operator's override. An id the host knows
-    /// nothing about is `other`.
+    /// nothing about, or one not registered right now, is
+    /// [`DeviceClass::unregistered`] plus its floor and override.
     #[must_use]
     pub fn class_of(&self, id: &str) -> DeviceClass {
-        let derived = self.read().get(id).map_or_else(DeviceClass::other, |m| {
-            DeviceClass::derive(&m.info.capabilities)
-        });
+        let derived = self
+            .read()
+            .get(id)
+            .map_or_else(DeviceClass::unregistered, |m| {
+                DeviceClass::derive(&m.info.capabilities)
+            });
         match self.meta.get(id) {
             Some(row) => row.apply(derived),
             None => derived,
@@ -196,9 +200,12 @@ impl DeviceRegistry {
     /// without a second, racing read of the override.
     #[must_use]
     pub fn class_with(&self, id: &str, row: &super::DeviceMetaRow) -> DeviceClass {
-        let derived = self.read().get(id).map_or_else(DeviceClass::other, |m| {
-            DeviceClass::derive(&m.info.capabilities)
-        });
+        let derived = self
+            .read()
+            .get(id)
+            .map_or_else(DeviceClass::unregistered, |m| {
+                DeviceClass::derive(&m.info.capabilities)
+            });
         row.apply(derived)
     }
 

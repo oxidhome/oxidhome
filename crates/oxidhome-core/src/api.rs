@@ -14,10 +14,12 @@
 //! / plugin / events / logs endpoints + full scope enforcement land
 //! on top of this shell.
 //!
-//! The CLI (Phase 12 follow-up) is the only path that mints
-//! / rotates / revokes tokens; this module never issues them — it
-//! only verifies inbound `Authorization: Bearer …` headers against
-//! [`TokenStore::verify`](crate::state::TokenStore::verify).
+//! Inbound `Authorization: Bearer …` headers are verified against
+//! [`TokenStore::verify`](crate::state::TokenStore::verify). The only
+//! network path that issues tokens is the owner's `token.manage`
+//! (`POST /api/v1/tokens`, Connect `TokensService.CreateToken`, H6
+//! slice 3, see [`token_admin`]); rotation and revocation stay offline
+//! (`oxidhome recover-admin-token`).
 
 pub(crate) mod auth;
 mod bootstrap;
@@ -27,6 +29,7 @@ pub mod mcp;
 pub(crate) mod scopes;
 pub mod sensitive_admin;
 pub(crate) mod server;
+pub mod token_admin;
 mod ui_ticket;
 
 pub use bootstrap::{

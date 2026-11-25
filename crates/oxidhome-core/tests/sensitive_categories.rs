@@ -204,7 +204,80 @@ async fn lock_commands_need_an_explicit_grant() {
     assert_eq!(owner_rows.len(), 1);
     assert_eq!(owner_rows[0].required_scope.as_deref(), Some("owner:lock"));
 
-    // Rate limit: the granted token's lock allowance runs out.
+    // A command that never reaches the plugin (its deadline passed
+    // before dispatch) keeps no charge once dropped and leaves no `warn` row: far
+    // more of them than the allowance leave it whole.
+    {
+        use oxidhome_core::auth::{
+            Action, ActorKind, InvocationContext, Principal, SensitiveGrant, TokenPolicy,
+            Transport, authorize,
+        };
+        use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::Command;
+        let actor = oxidhome_core::Actor::from_token_policy(
+            &granted.id,
+            TokenPolicy {
+                scopes: vec!["devices:command".into()],
+                sensitive: vec![SensitiveGrant::all(SensitiveCategory::Lock)],
+                ..TokenPolicy::default()
+            },
+            false,
+        );
+        let expired =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+                .with_deadline(Some(tokio::time::Instant::now()));
+        let decision = authorize(
+            &expired,
+            Action::DeviceCommand,
+            &engine.devices().resource(&device),
+        );
+        assert!(decision.allow, "{decision:?}");
+        for _ in 0..30 {
+            let charge = engine
+                .sensitive()
+                .reserve(&expired, Action::DeviceCommand, &device, &decision)
+                .expect("a withdrawn command keeps no charge");
+            let report = handle
+                .execute_command_admitted(
+                    expired.clone(),
+                    device.clone(),
+                    Command {
+                        id: String::new(),
+                        capability: "switch".into(),
+                        action: "toggle".into(),
+                        args: Vec::new(),
+                    },
+                    charge,
+                )
+                .await;
+            assert_eq!(report.outcome.as_str(), "timed_out", "{report:?}");
+            // The supervisor drops the withdrawn command (refunding its
+            // charge) when it dequeues it; a host command queued behind
+            // it returns once it has.
+            let flushed = handle
+                .execute_command(
+                    device.clone(),
+                    Command {
+                        id: String::new(),
+                        capability: "switch".into(),
+                        action: "toggle".into(),
+                        args: Vec::new(),
+                    },
+                )
+                .await;
+            assert_eq!(flushed.outcome.as_str(), "completed", "{flushed:?}");
+        }
+        assert_eq!(
+            warn_rows(&engine)
+                .into_iter()
+                .filter(|r| r.token_id == granted.id)
+                .count(),
+            1,
+            "only the command that ran left a row"
+        );
+    }
+
+    // Rate limit: the granted token's lock allowance runs out: one
+    // charge went to the command above, nine remain.
     let mut limited = None;
     for _ in 0..20 {
         let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;

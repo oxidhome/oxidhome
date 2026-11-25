@@ -10,18 +10,30 @@
 //!
 //! The decision is made against the root principal's resolved
 //! [`Authority`] carried on the [`InvocationContext`]: its scopes, its
-//! 14.4 constraints, its sensitive grants and owner flag. Nothing is
-//! read from the request itself.
+//! 14.4 constraints, its resolved roles and deny list, its sensitive
+//! grants and owner flag. Nothing is read from the request itself.
 //!
 //! # Evaluator
 //!
-//! The evaluator reproduces the token scope semantics, then adds the
-//! sensitive-category rule:
+//! The evaluator reproduces the token scope semantics, then adds
+//! owner-defined roles, the deny list and the sensitive-category rule:
 //!
+//! 0. **Deny list (H6 slice 3).** A [`crate::auth::DenyRule`] of the
+//!    token, or a deny that comes with one of its roles, that matches
+//!    the action and resource refuses it ([`Reason::Denied`], label
+//!    `deny`), whatever grants it below.
 //! 1. Each action maps to the one scope that has always gated it
 //!    (`Action::legacy_scope`). A token holds the action when its scope
-//!    list contains that scope literally or the wildcard `*`. An action
-//!    no scope maps to is refused ([`Reason::NoPermit`]).
+//!    list contains that scope literally or the wildcard `*`, **or**
+//!    when one of its roles ([`crate::auth::RoleDef`]) has a grant for
+//!    the action that covers the resource ([`Reason::Role`]). A role
+//!    grant narrowed to device categories or ids covers a matching
+//!    device and the device pre-check ([`Resource::PreCheck`]), never a
+//!    whole collection. A token with no grant for the action is
+//!    refused with the scope it lacks ([`Reason::MissingScope`]); one
+//!    whose role grants the action elsewhere, with
+//!    [`Reason::NoPermit`]. An action no scope maps to is refused
+//!    ([`Reason::NoPermit`]).
 //! 2. For a few (action, resource) pairs, a 14.4 per-token constraint
 //!    narrows the scope to an id allowlist: `device.send_command`
 //!    (`devices`) on a device command, and `plugins.show` /
@@ -34,20 +46,23 @@
 //!    ([`DeviceClass`], host-derived) includes `lock`, `opener` or
 //!    `alarm`, and `blob.read` of camera bytes (a camera device, or a
 //!    blob of a camera instance), additionally need a
-//!    [`SensitiveGrant`] covering every such category and the device
-//!    ([`Reason::MissingSensitive`], label `sensitive:<category>`).
+//!    [`SensitiveGrant`] (or a role's sensitive category) covering
+//!    every such category and the device ([`Reason::MissingSensitive`],
+//!    label `sensitive:<category>`).
 //!    The wildcard scope never satisfies this; the owner token
 //!    ([`Authority::is_owner`]) does. An allow carries
 //!    [`Obligations`] — `warn` audit level, the categories, and a
 //!    per-category [`RateLimit`] for non-owners — which the caller
 //!    meets with [`crate::auth::sensitive::SensitiveGuard`] before it
 //!    acts. Collection-level checks are never sensitive.
-//! 4. [`Action::PolicyManage`] (category overrides) is the owner's
-//!    alone; no scope grants it.
+//! 4. [`Action::PolicyManage`] (category overrides) and
+//!    [`Action::TokenManage`] (minting and listing tokens) are the
+//!    owner's alone; no scope or role grants them.
 //!
 //! The parity tests (`parity.rs`) pin that steps 1 and 2 match the
-//! checks they replaced on non-sensitive targets, and list each
-//! intentional departure on sensitive ones.
+//! checks they replaced on non-sensitive targets, list each
+//! intentional departure on sensitive ones, and check sample
+//! owner-defined roles against an independent oracle.
 //!
 //! Plugin principals are still authorized by their manifest grants at
 //! their own call sites (`consumes_services`, `reads_state`,
@@ -71,6 +86,7 @@ use super::invocation::InvocationContext;
 use super::policy::{
     DEVICE_COMMAND_DENIED_SENTINEL, DEVICE_COMMAND_ENFORCED, SensitiveGrant, ToolConstraint,
 };
+use super::role::{DenyRule, RoleDef};
 use crate::api::scopes::{self, Scope};
 
 /// What the caller wants to do. Closed: a new action is a host change,
@@ -114,7 +130,8 @@ pub enum Action {
     HostLogs,
     /// Read the audit ledger (`audit:read`).
     HostAudit,
-    /// Manage tokens. CLI only today; no scope grants it.
+    /// Mint and list tokens over the API. The owner's alone; no scope
+    /// or role grants it.
     TokenManage,
     /// Manage authorization policy. No scope grants it.
     PolicyManage,
@@ -182,6 +199,11 @@ impl Action {
         }
     }
 
+    /// This action's bit in an [`crate::auth::ActionSet`].
+    pub(crate) const fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+
     /// The token scope that grants this action, if any.
     #[must_use]
     pub(crate) fn legacy_scope(self) -> Option<Scope> {
@@ -240,10 +262,20 @@ pub enum Resource {
     /// The host itself: status, configuration, logs, audit, and a plugin
     /// install before its manifest is read.
     Host,
-    /// Resources of one kind in general: list endpoints, streams, route
-    /// pre-checks made before the target is known, and reads not yet
-    /// checked per target. Never narrowed by a per-target constraint.
+    /// Every resource of one kind: list endpoints and streams that
+    /// release every item, and reads not checked per target. Never
+    /// narrowed by a per-target constraint. A role grant narrowed to
+    /// device categories never covers it, and a deny with a selector
+    /// covers it when the kind can hold a denied device (devices,
+    /// events, blobs).
     Collection(ResourceKind),
+    /// A pre-check made before the target is known, which a
+    /// per-target check (or a per-item filter) always follows: may the
+    /// root do this to *some* resource of this kind? The scope check
+    /// alone, like [`Self::Collection`]; a category-narrowed role grant
+    /// covers it and a selector deny never does, since the per-target
+    /// check decides.
+    PreCheck(ResourceKind),
     /// One device.
     Device(DeviceResource),
     /// One installed plugin.
@@ -306,6 +338,12 @@ impl Resource {
         Self::Dashboard(DashboardResource { id })
     }
 
+    /// The pre-check for `kind`, before a per-target check.
+    #[must_use]
+    pub const fn pre_check(kind: ResourceKind) -> Self {
+        Self::PreCheck(kind)
+    }
+
     /// The device collection.
     #[must_use]
     pub const fn devices() -> Self {
@@ -318,9 +356,9 @@ impl Resource {
         Self::Collection(ResourceKind::Event)
     }
 
-    /// Blob payloads in general: the `blobs:read` pre-check. Never
-    /// sensitive, so it never decides whether a camera's bytes are
-    /// released; that is `blob.read` on the device or blob itself.
+    /// Blob payloads in general. Never sensitive, so it never decides
+    /// whether a camera's bytes are released; that is `blob.read` on
+    /// the device or blob itself.
     #[must_use]
     pub const fn blobs() -> Self {
         Self::Collection(ResourceKind::Blob)
@@ -480,6 +518,8 @@ struct AuthorityInner {
     constraints: HashMap<String, ToolConstraint>,
     sensitive: Vec<SensitiveGrant>,
     owner: bool,
+    roles: Vec<Arc<RoleDef>>,
+    deny: Vec<DenyRule>,
 }
 
 impl PartialEq for Authority {
@@ -489,6 +529,8 @@ impl PartialEq for Authority {
             && self.constraints() == other.constraints()
             && self.sensitive_grants() == other.sensitive_grants()
             && self.owner_flag() == other.owner_flag()
+            && self.roles() == other.roles()
+            && self.deny_rules() == other.deny_rules()
     }
 }
 
@@ -516,6 +558,8 @@ impl Authority {
                 constraints,
                 sensitive: Vec::new(),
                 owner: false,
+                roles: Vec::new(),
+                deny: Vec::new(),
             })),
         }
     }
@@ -586,6 +630,25 @@ impl Authority {
         }
     }
 
+    /// Resolved owner-defined roles (H6 slice 3).
+    #[must_use]
+    pub fn roles(&self) -> &[Arc<RoleDef>] {
+        match &self.source {
+            Source::Owned(inner) => &inner.roles,
+            Source::Actor { actor, .. } => actor.roles(),
+        }
+    }
+
+    /// The token's own deny list (H6 slice 3); role denies are not
+    /// included.
+    #[must_use]
+    pub fn deny_rules(&self) -> &[DenyRule] {
+        match &self.source {
+            Source::Owned(inner) => &inner.deny,
+            Source::Actor { actor, .. } => actor.deny_rules(),
+        }
+    }
+
     fn owner_flag(&self) -> bool {
         match &self.source {
             Source::Owned(inner) => inner.owner,
@@ -617,6 +680,18 @@ pub enum Reason {
         /// Scope that granted the action.
         scope: &'static str,
     },
+    /// Allowed: a grant of the role named `role` covers the action on
+    /// this resource (H6 slice 3), and no constraint narrows it.
+    Role {
+        /// Name of the role whose grant decided.
+        role: String,
+    },
+    /// Denied: an entry of the deny list matched (the token's own, or
+    /// one of the role named `role`).
+    Denied {
+        /// The role whose deny matched; `None` for the token's own.
+        role: Option<String>,
+    },
     /// Denied: the token does not hold `scope`.
     MissingScope {
         /// Scope the action needs.
@@ -634,11 +709,12 @@ pub enum Reason {
     },
     /// Denied: no scope grants this action.
     NoPermit,
-    /// Allowed on a sensitive resource: the token holds `scope` and
-    /// either an explicit grant for every sensitive category the
-    /// resource falls under, or is the owner.
+    /// Allowed on a sensitive resource: the token holds `scope` (or a
+    /// role grant) and either an explicit grant for every sensitive
+    /// category the resource falls under, or is the owner.
     Sensitive {
-        /// Scope that granted the action.
+        /// Scope that granted the action, or [`ROLE_LABEL`] when a
+        /// role grant did.
         scope: &'static str,
         /// The sensitive categories the resource falls under.
         categories: SensitiveSet,
@@ -651,12 +727,19 @@ pub enum Reason {
         /// The first category without a grant.
         category: SensitiveCategory,
     },
-    /// Allowed: an owner-only host action (`policy.manage`).
+    /// Allowed: an owner-only host action (`policy.manage`,
+    /// `token.manage`).
     Owner,
 }
 
 /// Audit label for [`Reason::NoPermit`].
 pub const NO_PERMIT_LABEL: &str = "no-permit";
+
+/// Audit label for [`Reason::Denied`].
+pub const DENIED_LABEL: &str = "deny";
+
+/// What [`Reason::Sensitive`] names as the grant when a role decided.
+pub const ROLE_LABEL: &str = "role";
 
 impl Reason {
     /// The value a deny writes to the audit row's `required_scope`
@@ -665,7 +748,11 @@ impl Reason {
     #[must_use]
     pub fn audit_label(&self) -> Option<&'static str> {
         match self {
-            Reason::Scope { .. } | Reason::Sensitive { .. } | Reason::Owner => None,
+            Reason::Scope { .. }
+            | Reason::Role { .. }
+            | Reason::Sensitive { .. }
+            | Reason::Owner => None,
+            Reason::Denied { .. } => Some(DENIED_LABEL),
             Reason::MissingScope { scope } => Some(*scope),
             Reason::Constraint { sentinel, .. } => Some(*sentinel),
             Reason::NoPermit => Some(NO_PERMIT_LABEL),
@@ -779,19 +866,41 @@ pub fn authorize(ctx: &InvocationContext, action: Action, resource: &Resource) -
 /// The evaluator behind [`authorize`], on an [`Authority`] directly.
 #[must_use]
 pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resource) -> Decision {
+    if let Some(reason) = denied_by(authority, action, resource) {
+        return Decision::deny(reason);
+    }
     let Some(scope) = action.legacy_scope() else {
-        // Owner-only host actions: no scope grants them, so a wildcard
-        // admin token can't either.
-        if action == Action::PolicyManage && authority.is_owner() {
+        // Owner-only host actions: no scope or role grants them, so a
+        // wildcard admin token can't either.
+        if matches!(action, Action::PolicyManage | Action::TokenManage) && authority.is_owner() {
             return Decision::allow(Reason::Owner);
         }
         return Decision::deny(Reason::NoPermit);
     };
-    if !scope.satisfied_by(authority.scopes()) {
+    let granted = if scope.satisfied_by(authority.scopes()) {
+        Reason::Scope {
+            scope: scope.name(),
+        }
+    } else if let Some(role) = authority
+        .roles()
+        .iter()
+        .find(|r| r.permits(action, resource))
+    {
+        Reason::Role {
+            role: role.name.clone(),
+        }
+    } else if authority
+        .roles()
+        .iter()
+        .any(|r| r.actions().contains(action))
+    {
+        // A role grants the action, but not on this resource.
+        return Decision::deny(Reason::NoPermit);
+    } else {
         return Decision::deny(Reason::MissingScope {
             scope: scope.name(),
         });
-    }
+    };
     if let Some(rule) = constraint_rule(action, resource)
         && let Some(cx) = authority.constraint(rule.key)
         && !rule.allows(cx)
@@ -804,9 +913,7 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
     }
     let (categories, device_id) = sensitive_requirement(action, resource);
     if categories.is_empty() {
-        return Decision::allow(Reason::Scope {
-            scope: scope.name(),
-        });
+        return Decision::allow(granted);
     }
     let owner = authority.is_owner();
     if !owner {
@@ -814,7 +921,11 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
             let granted = authority
                 .sensitive_grants()
                 .iter()
-                .any(|g| g.covers(category, device_id));
+                .any(|g| g.covers(category, device_id))
+                || authority
+                    .roles()
+                    .iter()
+                    .any(|r| r.sensitive.contains(&category));
             if !granted {
                 return Decision::deny(Reason::MissingSensitive { category });
             }
@@ -830,7 +941,10 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
     Decision {
         allow: true,
         reason: Reason::Sensitive {
-            scope: scope.name(),
+            scope: match granted {
+                Reason::Role { .. } => ROLE_LABEL,
+                _ => scope.name(),
+            },
             categories,
             owner,
         },
@@ -841,6 +955,25 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
             require_confirmation: false,
         },
     }
+}
+
+/// [`Reason::Denied`] when a deny entry refuses `action` on `resource`:
+/// the token's own deny list first, then its roles'.
+fn denied_by(authority: &Authority, action: Action, resource: &Resource) -> Option<Reason> {
+    if authority
+        .deny_rules()
+        .iter()
+        .any(|d| d.matches(action, resource))
+    {
+        return Some(Reason::Denied { role: None });
+    }
+    authority
+        .roles()
+        .iter()
+        .find(|r| r.denies(action, resource))
+        .map(|r| Reason::Denied {
+            role: Some(r.name.clone()),
+        })
 }
 
 /// The sensitive categories `action` on `resource` needs a grant for,

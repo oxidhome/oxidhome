@@ -52,7 +52,7 @@ use connectrpc::{
 };
 use oxidhome_proto::connect::oxidhome::v1::{
     DevicesServiceExt, EventsServiceExt, HealthServiceExt, InstancesServiceExt, LogsServiceExt,
-    PluginsServiceExt,
+    PluginsServiceExt, RolesServiceExt, TokensServiceExt,
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     Button as ProtoButton, ButtonKind as ProtoButtonKind, CheckRequest, CheckResponse,
@@ -73,9 +73,15 @@ use oxidhome_proto::proto::oxidhome::v1::{
     event as proto_event, execute_command_error, execute_command_response, log_value,
     tail_events_response, value,
 };
+use oxidhome_proto::proto::oxidhome::v1::{
+    CreateRoleRequest, CreateRoleResponse, CreateTokenRequest, CreateTokenResponse,
+    DeleteRoleRequest, DeleteRoleResponse, ListRolesRequest, ListRolesResponse, ListTokensRequest,
+    ListTokensResponse, Role as ProtoRole, RoleDefinition, Selector as ProtoSelector,
+    Token as ProtoToken, UpdateRoleRequest, UpdateRoleResponse,
+};
 
 use crate::Engine;
-use crate::auth::{Action, InvocationContext, Resource};
+use crate::auth::{Action, InvocationContext, Resource, ResourceKind, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::capabilities::ButtonEvent as WitButtonEvent;
 use crate::host_impl::plugin::oxidhome::plugin::devices::Command;
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event as WitEvent, EventPayload};
@@ -90,6 +96,9 @@ use super::auth::{
 };
 use super::bytes::BytesGate;
 use super::scopes::{ScopeDenied, require};
+
+/// The device pre-check: a per-device decision always follows.
+const DEVICE_PRE_CHECK: Resource = Resource::pre_check(ResourceKind::Device);
 
 /// `HealthService` implementation. Anonymous; reads only the
 /// in-memory event-log mirror health (H3) and device-state flush
@@ -354,16 +363,27 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         _request: ServiceRequest<'_, ListDevicesRequest>,
     ) -> ServiceResult<impl Encodable<ListDevicesResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::DeviceList, &Resource::devices())?;
+        // Pre-check, then one decision per device: a role narrowed to
+        // device categories (H6 slice 3) lists only its devices.
+        require_connect(&ctx, Action::DeviceList, &DEVICE_PRE_CHECK)?;
+        let invocation = ctx.extensions().get::<InvocationContext>();
         let devices = self
             .engine
             .devices()
             .list()
             .into_iter()
-            .map(|meta| {
+            .filter_map(|meta| {
                 // One read, so `category` and `sensitive` agree.
                 let class = self.engine.devices().class_of_meta(&meta);
-                Device {
+                let listed = invocation.is_some_and(|i| {
+                    authorize(
+                        i,
+                        Action::DeviceList,
+                        &Resource::device(meta.id.as_str(), class),
+                    )
+                    .allow
+                });
+                listed.then(|| Device {
                     device_id: meta.id.clone(),
                     owner_instance: meta.owner_instance.clone(),
                     name: meta.info.name.clone(),
@@ -374,7 +394,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
                         .map(|c| c.as_str().to_owned())
                         .collect(),
                     ..Default::default()
-                }
+                })
             })
             .collect();
         Response::ok(ListDevicesResponse {
@@ -388,11 +408,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, ExecuteCommandRequest>,
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
-        // Collection pre-check before the request is copied, then
-        // H6: `device.command` on the addressed device — the token's
-        // per-device allowlist, shared with REST and MCP — before the
-        // lookup so a refused token can't probe ids.
-        require_connect(&ctx, Action::DeviceCommand, &Resource::devices())?;
+        // Pre-check before the request is copied, then H6:
+        // `device.command` on the addressed device — the token's
+        // per-device allowlist, role and deny list, shared with REST
+        // and MCP — before the lookup so a refused token can't probe
+        // ids.
+        require_connect(&ctx, Action::DeviceCommand, &DEVICE_PRE_CHECK)?;
         let req = request.to_owned_message();
         let decision = require_connect(
             &ctx,
@@ -428,17 +449,17 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .get(&owner)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
 
-        // H6 slice 2: rate limit and `warn` row before a sensitive
-        // command runs.
-        self.engine
+        // H6 slice 2: a sensitive command takes its rate-limit charge
+        // now; its `warn` row is written when it is dispatched.
+        let charge = self
+            .engine
             .sensitive()
-            .discharge_blocking(
+            .reserve(
                 &invocation,
                 Action::DeviceCommand,
                 &req.device_id,
                 &decision,
             )
-            .await
             .map_err(|e| obligation_err(&ctx, &e))?;
         let gate = BytesGate::new(&invocation, &self.engine);
 
@@ -462,12 +483,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             None => invocation,
         };
         let report = handle
-            .execute_command_admitted(
-                invocation,
-                req.device_id.clone(),
-                cmd,
-                decision.obligations.sensitive,
-            )
+            .execute_command_admitted(invocation, req.device_id.clone(), cmd, charge)
             .await;
         // F4 + H5: every routed command is an RPC success carrying
         // its explicit outcome. Record the command id and outcome on
@@ -484,11 +500,11 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         ctx: RequestContext,
         request: ServiceRequest<'_, GetDeviceStateRequest>,
     ) -> ServiceResult<impl Encodable<GetDeviceStateResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::DeviceRead, &Resource::devices())?;
+        require_connect(&ctx, Action::DeviceRead, &DEVICE_PRE_CHECK)?;
         let device_id = request.to_owned_message().device_id;
         // Host-minted ids are short; don't copy a huge one under the
-        // projection lock. (No constraint narrows `device.read`, so the
-        // target check below can't deny once the collection passed.)
+        // projection lock. The target check below decides for the
+        // device (a role narrowed to categories, a deny list).
         if device_id.len() > MAX_DEVICE_ID_LEN {
             return Err(rpc_err(
                 &ctx,
@@ -505,6 +521,16 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .engine
             .device_state()
             .snapshot_device_with_revision(&device_id);
+        // The device may have been re-registered since the check: the
+        // snapshot answers to its current class.
+        let current = self.engine.devices().resource(&device_id);
+        let allowed = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .is_some_and(|i| authorize(i, Action::DeviceRead, &current).allow);
+        if !allowed {
+            require_connect(&ctx, Action::DeviceRead, &current)?;
+        }
         entries.sort_by(|a, b| a.capability.cmp(&b.capability));
         Response::ok(GetDeviceStateResponse {
             state: device_snapshot_to_proto(device_id, &entries, &epoch, revision, &gate).into(),
@@ -884,7 +910,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StartPluginRequest>,
     ) -> ServiceResult<impl Encodable<StartPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::InstanceStart, &Resource::instances())?;
+        require_connect(
+            &ctx,
+            Action::InstanceStart,
+            &Resource::pre_check(ResourceKind::Instance),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -974,7 +1004,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, StopPluginRequest>,
     ) -> ServiceResult<impl Encodable<StopPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::InstanceStop, &Resource::instances())?;
+        require_connect(
+            &ctx,
+            Action::InstanceStop,
+            &Resource::pre_check(ResourceKind::Instance),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -1020,7 +1054,11 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         ctx: RequestContext,
         request: ServiceRequest<'_, UninstallPluginRequest>,
     ) -> ServiceResult<impl Encodable<UninstallPluginResponse> + Send + use<'a>> {
-        require_connect(&ctx, Action::PluginUninstall, &Resource::plugins())?;
+        require_connect(
+            &ctx,
+            Action::PluginUninstall,
+            &Resource::pre_check(ResourceKind::Plugin),
+        )?;
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -1468,6 +1506,263 @@ fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
     }
 }
 
+/// H6 slice 3: `TokensService`, mirroring `POST` / `GET /api/v1/tokens`.
+/// Both RPCs need `token.manage`: the owner token only.
+struct OxidHomeTokens {
+    engine: Engine,
+}
+
+/// H6 slice 3: `RolesService`, mirroring `/api/v1/roles`. Every RPC
+/// needs `policy.manage`: the owner token only.
+struct OxidHomeRoles {
+    engine: Engine,
+}
+
+fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
+    let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
+    super::token_admin::SelectorSpec {
+        actions: s.actions,
+        category: none_if_empty(s.category),
+        devices: none_if_empty(s.devices),
+    }
+}
+
+fn role_spec(d: Option<RoleDefinition>) -> super::token_admin::RoleSpec {
+    let d = d.unwrap_or_default();
+    super::token_admin::RoleSpec {
+        grants: d.grants.into_iter().map(selector_spec).collect(),
+        sensitive: d.sensitive,
+        deny: d.deny.into_iter().map(selector_spec).collect(),
+    }
+}
+
+fn proto_role(s: super::token_admin::RoleSummary) -> ProtoRole {
+    ProtoRole {
+        role_id: s.role_id,
+        name: s.name,
+        grants: s.grants,
+        sensitive: s.sensitive,
+        deny: s.deny,
+        tokens: s.tokens,
+        created_ms: s.created_ms,
+        updated_ms: s.updated_ms,
+        definition_valid: s.definition_valid,
+        ..Default::default()
+    }
+}
+
+/// Run blocking token / role administration off the runtime and map
+/// its error to the Connect code.
+async fn connect_admin<T: Send + 'static>(
+    ctx: &RequestContext,
+    f: impl FnOnce() -> Result<T, super::token_admin::AdminError> + Send + 'static,
+) -> Result<T, ConnectError> {
+    use super::token_admin::AdminError;
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| rpc_err(ctx, ConnectError::internal(e.to_string())))?
+        .map_err(|err| {
+            rpc_err(
+                ctx,
+                match err {
+                    AdminError::Invalid(msg) => ConnectError::invalid_argument(msg),
+                    AdminError::NotFound(name) => {
+                        ConnectError::not_found(format!("no role named `{name}`"))
+                    }
+                    AdminError::Exists(msg) => ConnectError::already_exists(msg),
+                    AdminError::Conflict(msg) => ConnectError::failed_precondition(msg),
+                    AdminError::Store(msg) => {
+                        tracing::error!(target: "api.tokens", error = %msg, "token / role store failed");
+                        ConnectError::internal("the token / role store failed")
+                    }
+                },
+            )
+        })
+}
+
+fn connect_audited(call_id: Option<&str>) -> super::token_admin::Audited<'_> {
+    super::token_admin::Audited {
+        surface: "connect",
+        actor_kind: "api",
+        call_id,
+    }
+}
+
+fn call_id_of(ctx: &RequestContext) -> Option<String> {
+    ctx.extensions()
+        .get::<InvocationContext>()
+        .map(|i| i.call_id().to_owned())
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
+    async fn list_roles<'a>(
+        &'a self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListRolesRequest>,
+    ) -> ServiceResult<impl Encodable<ListRolesResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let tokens = self.engine.auth_tokens();
+        let roles =
+            connect_admin(&ctx, move || super::token_admin::role_summaries(&tokens)).await?;
+        Response::ok(ListRolesResponse {
+            roles: roles.into_iter().map(proto_role).collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn create_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateRoleRequest>,
+    ) -> ServiceResult<impl Encodable<CreateRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let new = super::token_admin::NewRole {
+            name: req.name,
+            spec: role_spec(req.definition.into_option()),
+        };
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::create_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &new,
+            )
+        })
+        .await?;
+        Response::ok(CreateRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn update_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, UpdateRoleRequest>,
+    ) -> ServiceResult<impl Encodable<UpdateRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        // A replacement needs a definition: an unset one must not
+        // clear the role (`{}` does that explicitly).
+        if req.definition.is_unset() {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::invalid_argument("`definition` is required"),
+            ));
+        }
+        let spec = role_spec(req.definition.into_option());
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let name = req.name;
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::update_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &name,
+                &spec,
+            )
+        })
+        .await?;
+        Response::ok(UpdateRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn delete_role<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, DeleteRoleRequest>,
+    ) -> ServiceResult<impl Encodable<DeleteRoleResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
+        let call_id = call_id_of(&ctx);
+        let role = connect_admin(&ctx, move || {
+            super::token_admin::delete_role(
+                &tokens,
+                &audit,
+                connect_audited(call_id.as_deref()),
+                &req.name,
+                req.force,
+            )
+        })
+        .await?;
+        Response::ok(DeleteRoleResponse {
+            role: proto_role(role).into(),
+            ..Default::default()
+        })
+    }
+}
+
+fn proto_token(s: super::token_admin::TokenSummary) -> ProtoToken {
+    ProtoToken {
+        token_id: s.token_id,
+        label: s.label,
+        owner: s.owner,
+        revoked: s.revoked,
+        roles: s.roles,
+        scopes: s.scopes,
+        sensitive: s.sensitive,
+        deny: s.deny,
+        created_ms: s.created_ms,
+        last_used_ms: s.last_used_ms,
+        policy_valid: s.policy_valid,
+        ..Default::default()
+    }
+}
+
+impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
+    async fn create_token<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, CreateTokenRequest>,
+    ) -> ServiceResult<impl Encodable<CreateTokenResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
+        let req = request.to_owned_message();
+        let mint = super::token_admin::MintRequest {
+            label: req.label,
+            roles: req.roles,
+            scopes: req.scopes,
+            sensitive: req.sensitive,
+            deny: req.deny.into_iter().map(selector_spec).collect(),
+        };
+        let tokens = self.engine.auth_tokens();
+        let audit = self.engine.audit_log();
+        let call_id = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .map(|i| i.call_id().to_owned());
+        let minted = connect_admin(&ctx, move || {
+            super::token_admin::mint(&tokens, &audit, "connect", "api", call_id.as_deref(), &mint)
+        })
+        .await?;
+        Response::ok(CreateTokenResponse {
+            secret: minted.secret,
+            token: proto_token(minted.summary).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_tokens<'a>(
+        &'a self,
+        ctx: RequestContext,
+        _request: ServiceRequest<'_, ListTokensRequest>,
+    ) -> ServiceResult<impl Encodable<ListTokensResponse> + Send + use<'a>> {
+        require_connect(&ctx, Action::TokenManage, &Resource::Host)?;
+        let tokens = self.engine.auth_tokens();
+        let list = connect_admin(&ctx, move || super::token_admin::summaries(&tokens)).await?;
+        Response::ok(ListTokensResponse {
+            tokens: list.into_iter().map(proto_token).collect(),
+            ..Default::default()
+        })
+    }
+}
+
 /// Build the Connect router with every `OxidHome` service registered.
 /// The caller mounts it on the axum app via
 /// [`connectrpc::Router::into_axum_service`].
@@ -1487,6 +1782,14 @@ pub fn router(engine: Engine) -> ConnectRouter {
     })
     .register(router);
     let router = Arc::new(OxidHomePlugins {
+        engine: engine.clone(),
+    })
+    .register(router);
+    let router = Arc::new(OxidHomeTokens {
+        engine: engine.clone(),
+    })
+    .register(router);
+    let router = Arc::new(OxidHomeRoles {
         engine: engine.clone(),
     })
     .register(router);
@@ -1594,7 +1897,7 @@ async fn connect_auth_middleware(
     let outcome_slot = HandlerOutcomeSlot::default();
     let (token_id, actor_kind, invocation) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
-            let actor = actor_from_record(&rec);
+            let actor = actor_from_record(&rec, &state.tokens);
             // Round-3 P1 on PR #147: same reasoning as
             // [`crate::api::auth::require_token`] — a
             // constraint-bearing token has no meaning on

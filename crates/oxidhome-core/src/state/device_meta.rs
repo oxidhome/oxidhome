@@ -138,6 +138,33 @@ pub fn is_device_id(id: &str) -> bool {
     })
 }
 
+/// `true` when `pattern` is a device id or a `prefix*` of one (a
+/// non-empty prefix shorter than an id): the device patterns a grant
+/// or deny may name. Anything else would match no host-minted id.
+#[must_use]
+pub fn is_device_pattern(pattern: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => {
+            !prefix.is_empty()
+                && prefix.len() < "dev-0123456789abcdef".len()
+                && could_prefix_device_id(prefix)
+        }
+        None => is_device_id(pattern),
+    }
+}
+
+/// `true` when `prefix` could start a `dev-<16 lowercase hex>` id.
+fn could_prefix_device_id(prefix: &str) -> bool {
+    let template = "dev-";
+    if prefix.len() <= template.len() {
+        return template.starts_with(prefix);
+    }
+    prefix.starts_with(template)
+        && prefix[template.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 impl DeviceMetaStore {
     /// A store with no database: the floor lives for the process only.
     /// For registries built outside an engine (tests).

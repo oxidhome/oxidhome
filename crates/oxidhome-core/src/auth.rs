@@ -39,6 +39,7 @@ pub mod authorize;
 pub mod category;
 pub mod invocation;
 pub mod policy;
+pub mod role;
 pub mod sensitive;
 
 pub use authorize::{
@@ -52,6 +53,7 @@ pub use policy::{
     DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
     parse_policy,
 };
+pub use role::{ActionSet, DenyRule, RoleDef, RoleGrant};
 
 /// What kind of caller this `Actor` represents. Drives where the
 /// audit log attributes the action and which scope policy the
@@ -113,6 +115,11 @@ struct ActorInner {
     // `recover-admin-token`), read from `auth_token.owner`. Never set
     // from a label or from caller input.
     owner: bool,
+    // H6 slice 3: the token's owner-defined roles, resolved from
+    // `auth_role` for this request (a deleted role is absent), and its
+    // deny list. Empty for plugins and scope-only tokens.
+    roles: Vec<Arc<role::RoleDef>>,
+    deny: Vec<role::DenyRule>,
 }
 
 impl Actor {
@@ -134,6 +141,8 @@ impl Actor {
                 constraints: HashMap::new(),
                 sensitive: Vec::new(),
                 owner: false,
+                roles: Vec::new(),
+                deny: Vec::new(),
             }),
         }
     }
@@ -173,13 +182,18 @@ impl Actor {
                 constraints,
                 sensitive: Vec::new(),
                 owner: false,
+                roles: Vec::new(),
+                deny: Vec::new(),
             }),
         }
     }
 
     /// Construct an external `Actor` from a verified token's whole
-    /// policy: scopes, 14.4 constraints and sensitive grants. `owner`
-    /// is the token's host-recorded owner flag (`auth_token.owner`).
+    /// policy: scopes, 14.4 constraints, sensitive grants and deny
+    /// list. `owner` is the token's host-recorded owner flag
+    /// (`auth_token.owner`). The policy's role ids are not resolved
+    /// here: attach their definitions with [`Self::with_roles`], or
+    /// they grant nothing.
     #[must_use]
     pub fn from_token_policy(
         token_id: impl Into<String>,
@@ -194,6 +208,8 @@ impl Actor {
                 constraints: policy.constraints,
                 sensitive: policy.sensitive,
                 owner,
+                roles: Vec::new(),
+                deny: policy.deny,
             }),
         }
     }
@@ -211,6 +227,26 @@ impl Actor {
                 constraints: self.inner.constraints.clone(),
                 sensitive: grants,
                 owner: self.inner.owner,
+                roles: self.inner.roles.clone(),
+                deny: self.inner.deny.clone(),
+            }),
+        }
+    }
+
+    /// A copy of this actor holding `roles`, the current definitions
+    /// of its policy's role ids (H6 slice 3).
+    #[must_use]
+    pub fn with_roles(&self, roles: Vec<Arc<role::RoleDef>>) -> Self {
+        Self {
+            inner: Arc::new(ActorInner {
+                kind: self.inner.kind,
+                id: self.inner.id.clone(),
+                scopes: self.inner.scopes.clone(),
+                constraints: self.inner.constraints.clone(),
+                sensitive: self.inner.sensitive.clone(),
+                owner: self.inner.owner,
+                roles,
+                deny: self.inner.deny.clone(),
             }),
         }
     }
@@ -219,6 +255,18 @@ impl Actor {
     #[must_use]
     pub fn sensitive_grants(&self) -> &[policy::SensitiveGrant] {
         &self.inner.sensitive
+    }
+
+    /// Resolved owner-defined roles (H6 slice 3).
+    #[must_use]
+    pub fn roles(&self) -> &[Arc<role::RoleDef>] {
+        &self.inner.roles
+    }
+
+    /// The deny list (H6 slice 3).
+    #[must_use]
+    pub fn deny_rules(&self) -> &[role::DenyRule] {
+        &self.inner.deny
     }
 
     /// `true` when this actor's token is the host-recorded owner.

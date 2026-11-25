@@ -577,7 +577,8 @@ impl Kind<'_> {
     /// (H6 slice 2).
     fn resource(&self, engine: &Engine) -> AuthResource {
         match self {
-            Kind::DevicesList => AuthResource::devices(),
+            // Filtered per device by `devices_list`.
+            Kind::DevicesList => AuthResource::pre_check(crate::auth::ResourceKind::Device),
             Kind::DevicesDetail(id) => engine.devices().resource(id),
             // The detail read is checked against the plugin collection:
             // `plugin.read` on `oxidhome://plugins/{id}` has always been
@@ -788,8 +789,8 @@ async fn read_inner(
         return (family, ReadOutcome::Denied { required });
     }
     let outcome = match kind {
-        Kind::DevicesList => devices_list(&engine),
-        Kind::DevicesDetail(id) => devices_detail(&engine, id),
+        Kind::DevicesList => devices_list(&engine, ctx),
+        Kind::DevicesDetail(id) => devices_detail(&engine, ctx, action, id),
         Kind::PluginsList => plugins_list(&engine),
         Kind::PluginsDetail(id) => plugins_detail(&engine, id),
         // Events + logs hit `SQLite`, so parse the query
@@ -927,16 +928,27 @@ struct DeviceListBody {
     devices: Vec<DeviceListEntry>,
 }
 
-fn devices_list(engine: &Engine) -> ReadOutcome {
+fn devices_list(engine: &Engine, ctx: &InvocationContext) -> ReadOutcome {
+    // One decision per device after the pre-check: a role narrowed to
+    // device categories (H6 slice 3) lists only its devices.
     let devices: Vec<DeviceListEntry> = engine
         .devices()
         .list()
         .into_iter()
-        .map(|meta| DeviceListEntry {
-            device_id: meta.id.clone(),
-            owner_instance: meta.owner_instance.clone(),
-            name: meta.info.name.clone(),
-            class: engine.devices().class_of_meta(&meta).into(),
+        .filter_map(|meta| {
+            let class = engine.devices().class_of_meta(&meta);
+            authorize(
+                ctx,
+                Action::DeviceList,
+                &AuthResource::device(meta.id.as_str(), class),
+            )
+            .allow
+            .then(|| DeviceListEntry {
+                device_id: meta.id.clone(),
+                owner_instance: meta.owner_instance.clone(),
+                name: meta.info.name.clone(),
+                class: class.into(),
+            })
         })
         .collect();
     encode(&DeviceListBody { devices }, "devices list")
@@ -960,10 +972,21 @@ struct DeviceDetail {
     class: crate::api::server::WireDeviceClass,
 }
 
-fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
+/// `oxidhome://devices/{id}`. The class answered is re-authorized: the
+/// registration may have changed since the caller's check.
+fn devices_detail(
+    engine: &Engine,
+    ctx: &InvocationContext,
+    action: Action,
+    id: &str,
+) -> ReadOutcome {
     let Some(meta) = engine.devices().get_any(&id.to_string()) else {
         return ReadOutcome::NotFound(format!("device {id} is not registered with the host"));
     };
+    let class = engine.devices().class_of_meta(&meta);
+    if let Err(required) = authorize(ctx, action, &AuthResource::device(id, class)).into_result() {
+        return ReadOutcome::Denied { required };
+    }
     let info = &meta.info;
     let detail = DeviceDetail {
         device_id: meta.id.clone(),
@@ -976,7 +999,7 @@ fn devices_detail(engine: &Engine, id: &str) -> ReadOutcome {
             .iter()
             .map(crate::runtime::capability_name)
             .collect(),
-        class: engine.devices().class_of_meta(&meta).into(),
+        class: class.into(),
     };
     encode(&detail, "device detail")
 }
