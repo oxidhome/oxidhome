@@ -1369,7 +1369,11 @@ async fn plugins_list_aggregates_running_instances() {
     assert_eq!(plugins[0]["plugin_id"], "example.simulated-switch");
     assert_eq!(plugins[0]["instance_count"], 2);
     // Not installed: no grant to show.
-    assert!(plugins[0]["network"].is_null(), "{body:?}");
+    assert_eq!(
+        plugins[0].get("network"),
+        Some(&serde_json::Value::Null),
+        "{body:?}"
+    );
 
     a.stop().await.expect("stop a");
     b.stop().await.expect("stop b");

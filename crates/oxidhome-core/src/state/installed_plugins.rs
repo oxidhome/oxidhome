@@ -2195,8 +2195,9 @@ pub struct OfflinePlugin {
     pub plugin_id: String,
     /// Its host-minted installation UUID.
     pub installation_uuid: String,
-    /// The manifest version and network rules, or why the daemon
-    /// would quarantine the installation at its next start.
+    /// The manifest version and network rules, or why the daemon can't
+    /// run the installation (it quarantines it, or tombstones the row
+    /// when the package is gone).
     pub status: Result<(String, NetworkGrants), String>,
 }
 
@@ -2229,7 +2230,11 @@ pub fn list_installations_offline(
         for entry in std::fs::read_dir(plugins_root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir()
-                || entry.file_name().to_string_lossy().starts_with(".staging-")
+                || entry
+                    .file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with(".staging-")
             {
                 continue;
             }

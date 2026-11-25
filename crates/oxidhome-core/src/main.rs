@@ -393,7 +393,9 @@ async fn run_subcommand() -> Option<anyhow::Result<()>> {
             Some("role") => run_role(),
             Some("device") => run_device(),
             Some("tls-pin") => run_tls_pin(),
-            Some("plugin") => run_plugin(),
+            // `oxidhome plugin` alone still starts the daemon with a dev
+            // plugin directory named `plugin`.
+            Some("plugin") if std::env::args_os().nth(2).is_some() => run_plugin(),
             _ => return None,
         },
     )
@@ -1004,7 +1006,7 @@ fn run_plugin() -> anyhow::Result<()> {
         .as_slice()
     {
         ["list"] => {}
-        [] | ["-h" | "--help"] => {
+        ["-h" | "--help"] => {
             println!("{PLUGIN_USAGE}");
             return Ok(());
         }
@@ -1063,7 +1065,7 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
             Err(why) => {
                 let _ = writeln!(
                     out,
-                    "{}\tquarantined\tinstallation={}\t{}",
+                    "{}\tunavailable\tinstallation={}\t{}",
                     printable(&plugin.plugin_id),
                     printable(&plugin.installation_uuid),
                     printable(why)
@@ -1531,7 +1533,7 @@ mod tests {
              \trequested\ttcp://192.168.0.0/16:554\n\
              \tgranted\ttcp://192.168.1.20:554\n\
              \teffective\ttcp://192.168.1.20:554\n\
-             net.example.old\tquarantined\tinstallation=inst-2\t\
+             net.example.old\tunavailable\tinstallation=inst-2\t\
              contents changed since install; reinstall\n"
         );
     }
