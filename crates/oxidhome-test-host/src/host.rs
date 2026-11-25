@@ -208,6 +208,26 @@ impl TestHost {
         self
     }
 
+    /// Resolve plugins' name lookups (sockets and HTTP) from `entries`
+    /// instead of the machine's resolver, so tests can use any name and
+    /// get the same answer everywhere. A name not listed is unresolvable;
+    /// a name listed twice gets both entries' addresses. The network
+    /// policy still checks every answer (a public name answering with a
+    /// LAN address is refused). Call before loading plugins; replaces
+    /// any earlier table.
+    #[must_use]
+    pub fn with_dns_overrides<N: Into<String>>(
+        mut self,
+        entries: impl IntoIterator<Item = (N, Vec<std::net::IpAddr>)>,
+    ) -> Self {
+        self.engine = self.engine.clone().with_dns_overrides_for_tests(
+            entries
+                .into_iter()
+                .map(|(name, addrs)| (name.into(), addrs)),
+        );
+        self
+    }
+
     /// The underlying production engine, for assertions the harness
     /// doesn't wrap (device-state projection, event bus subscriptions,
     /// blob store, …).

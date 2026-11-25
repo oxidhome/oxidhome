@@ -595,10 +595,15 @@ impl PluginState {
     /// built from the effective (granted) `network` rules. Rebuilds the
     /// WASI context with TCP / UDP enabled and every socket address
     /// checked by the policy, and `https://` requests verified by `tls`.
+    /// `dns` is the engine's resolver test seam (`None` in production).
     /// Call before instantiation, after
     /// [`Self::with_granted_capabilities`] and [`Self::with_audit_log`].
     #[must_use]
-    pub(crate) fn with_network_access(mut self, tls: Arc<super::network::TlsClient>) -> Self {
+    pub(crate) fn with_network_access(
+        mut self,
+        tls: Arc<super::network::TlsClient>,
+        dns: Option<Arc<super::network::DnsOverrides>>,
+    ) -> Self {
         let policy = Arc::new(
             super::network::NetworkPolicy::new(
                 self.instance_id.as_str(),
@@ -606,7 +611,8 @@ impl PluginState {
                 self.audit_log.clone(),
                 self.clock.clone(),
             )
-            .for_installation(Arc::clone(&self.installation_uuid)),
+            .for_installation(Arc::clone(&self.installation_uuid))
+            .with_dns(dns),
         );
         self.wasi = build_wasi(
             &self.instance_id,

@@ -100,6 +100,7 @@ pub mod __buffa {
         reg.register_json_any(super::__LIST_PLUGINS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__PLUGIN_JSON_ANY);
+        reg.register_json_any(super::__NETWORK_GRANTS_JSON_ANY);
         reg.register_json_any(super::__INSTALL_PLUGIN_REQUEST_JSON_ANY);
         reg.register_json_any(super::__INSTALL_PLUGIN_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__START_PLUGIN_REQUEST_JSON_ANY);
@@ -298,6 +299,10 @@ pub use self::__buffa::view::ListPluginsResponseOwnedView;
 pub use self::__buffa::view::PluginView;
 #[doc(inline)]
 pub use self::__buffa::view::PluginOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::NetworkGrantsView;
+#[doc(inline)]
+pub use self::__buffa::view::NetworkGrantsOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::InstallPluginRequestView;
 #[doc(inline)]

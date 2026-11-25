@@ -344,7 +344,7 @@ fn store(tokens: &TokenStore, token_id: &str, policy: &TokenPolicy) -> anyhow::R
     }
 }
 
-/// The stores the offline `token` / `device` / `tls-pin` commands touch, opened
+/// The stores the offline `token` / `device` / `tls-pin` / `plugin` commands touch, opened
 /// straight on the database: no engine, so listing tokens or raising
 /// a category doesn't run engine startup (device-state revision bump,
 /// pending-command resolution) while the daemon is stopped.
@@ -357,6 +357,9 @@ pub struct OfflineStores {
     pub devices: crate::state::DeviceMetaStore,
     /// The `network_tls_pin` table (Phase 8.2).
     pub tls_pins: crate::state::TlsPinStore,
+    /// The database itself, for read-only listings that have no store
+    /// of their own (`oxidhome plugin list`).
+    pub db: std::sync::Arc<crate::state::Db>,
 }
 
 /// Run `op` against the stores of the database under `state_dir`,
@@ -402,7 +405,9 @@ pub fn with_offline_stores<T>(
         audit: crate::state::AuditLog::new(std::sync::Arc::clone(&db)),
         devices: crate::state::DeviceMetaStore::open(std::sync::Arc::clone(&db))
             .context("reading device_meta")?,
-        tls_pins: crate::state::TlsPinStore::open(db).context("reading TLS pins")?,
+        tls_pins: crate::state::TlsPinStore::open(std::sync::Arc::clone(&db))
+            .context("reading TLS pins")?,
+        db,
     };
     op(&stores)
 }

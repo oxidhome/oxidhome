@@ -137,6 +137,61 @@ pub struct InstalledPlugin {
     /// `content_digest` check catches any post-install
     /// mutation of that manifest.
     pub singleton: bool,
+    /// Phase 8.5: the manifest's requested `[capabilities] network`
+    /// rules, captured with [`Self::singleton`] at install and scan
+    /// (same rehydration and digest guard). Shown next to the grant
+    /// in plugin listings ([`Self::network_grants`]); enforcement
+    /// recomputes the effective rules from the manifest it loads.
+    pub requested_network: Arc<[NetworkRule]>,
+}
+
+/// Phase 8.5: an installed plugin's network rules as operator
+/// listings show them (REST, Connect, MCP and the offline CLI).
+/// Rules render in manifest syntax (`tcp://192.168.1.0/24:554`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NetworkGrants {
+    /// What the manifest asks for.
+    pub requested: Vec<NetworkRule>,
+    /// What the operator's persisted grant holds (equal to
+    /// `requested` unless the grant was narrowed).
+    pub granted: Vec<NetworkRule>,
+    /// What instances actually get: the grant narrowed by containment
+    /// against the request ([`effective_network_rules`]). A granted
+    /// rule that only partly overlaps the request is absent here.
+    pub effective: Vec<NetworkRule>,
+}
+
+impl NetworkGrants {
+    /// The listing for `requested` rules under `granted` ones.
+    #[must_use]
+    pub fn new(requested: &[NetworkRule], granted: &[NetworkRule]) -> Self {
+        Self {
+            requested: requested.to_vec(),
+            granted: granted.to_vec(),
+            effective: effective_network_rules(requested, granted),
+        }
+    }
+
+    /// The three lists in manifest syntax: `(requested, granted,
+    /// effective)`.
+    #[must_use]
+    pub fn to_strings(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let render = |rules: &[NetworkRule]| rules.iter().map(ToString::to_string).collect();
+        (
+            render(&self.requested),
+            render(&self.granted),
+            render(&self.effective),
+        )
+    }
+}
+
+impl InstalledPlugin {
+    /// This installation's network rules: requested, granted and
+    /// effective.
+    #[must_use]
+    pub fn network_grants(&self) -> NetworkGrants {
+        NetworkGrants::new(&self.requested_network, &self.granted_capabilities.network)
+    }
 }
 
 /// C5 review F3 + round-4 F2 + Phase 13 round-3 F2: compute a
@@ -1518,6 +1573,7 @@ impl InstalledPluginRegistry {
                     granted_capabilities: Arc::clone(&grant_arc),
                     content_digest: Arc::clone(&digest),
                     singleton: manifest.runtime.singleton,
+                    requested_network: Arc::from(manifest.capabilities.network.as_slice()),
                 });
                 (uuid, grant_arc, digest)
             };
@@ -1531,6 +1587,7 @@ impl InstalledPluginRegistry {
                     granted_capabilities,
                     content_digest: content_digest_arc,
                     singleton: manifest.runtime.singleton,
+                    requested_network: Arc::from(manifest.capabilities.network.as_slice()),
                 },
             );
         }
@@ -1948,6 +2005,7 @@ impl InstalledPluginRegistry {
             granted_capabilities: Arc::new(staged_manifest.capabilities.clone()),
             content_digest: Arc::from(staged_digest),
             singleton: staged_manifest.runtime.singleton,
+            requested_network: Arc::from(staged_manifest.capabilities.network.as_slice()),
         };
         if let Some(db) = &self.db
             && let Err(err) = insert_installation_row(db, &row)
@@ -2126,6 +2184,97 @@ impl InstalledPluginRegistry {
         );
         Ok(installation_uuid)
     }
+}
+
+// ── Offline listing (Phase 8.5) ─────────────────────────────────────
+
+/// One installation as the offline `oxidhome plugin list` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflinePlugin {
+    /// The installation's plugin id.
+    pub plugin_id: String,
+    /// Its host-minted installation UUID.
+    pub installation_uuid: String,
+    /// The manifest version and network rules, or why the daemon
+    /// would quarantine the installation at its next start.
+    pub status: Result<(String, NetworkGrants), String>,
+}
+
+/// List the live installations under `plugins_root` with their network
+/// rules, read-only: unlike [`InstalledPluginRegistry::scan`] this
+/// mints, backfills and tombstones nothing, so it is safe for an
+/// operator listing. A row whose grant or digest is unusable, whose
+/// package is missing or unreadable, or whose contents changed since
+/// install is listed with the reason instead. Sorted by plugin id.
+///
+/// # Errors
+///
+/// Reading `plugin_installation` or enumerating `plugins_root` failed.
+pub fn list_installations_offline(
+    plugins_root: &Path,
+    db: &Db,
+) -> anyhow::Result<Vec<OfflinePlugin>> {
+    let LiveInstallationLoad {
+        live,
+        quarantined_uuids,
+    } = load_live_installations(db)?;
+    // Manifest id → (digest, manifest) for every readable package; the
+    // directory name needn't match the id (scan keys on the manifest).
+    let mut packages: HashMap<String, Result<(String, PluginManifest), String>> = HashMap::new();
+    if plugins_root.exists() {
+        for entry in std::fs::read_dir(plugins_root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Ok((digest, manifest)) = recompute_digest_and_manifest(&entry.path()) {
+                let id = manifest.plugin.id.clone();
+                // Two packages claiming one id: scan quarantines both.
+                let value = if packages.contains_key(&id) {
+                    Err("more than one package directory claims this plugin id".to_owned())
+                } else {
+                    Ok((digest, manifest))
+                };
+                packages.insert(id, value);
+            }
+        }
+    }
+    let mut out: Vec<OfflinePlugin> = live
+        .into_iter()
+        .map(|(plugin_id, row)| {
+            let status = match packages.remove(&plugin_id) {
+                None => Err("no readable package on disk".to_owned()),
+                Some(Err(why)) => Err(why),
+                Some(Ok((digest, _))) if digest != *row.content_digest => {
+                    Err("contents changed since install; reinstall".to_owned())
+                }
+                Some(Ok((_, manifest))) => Ok((
+                    manifest.plugin.version.to_string(),
+                    NetworkGrants::new(
+                        &manifest.capabilities.network,
+                        &row.granted_capabilities.network,
+                    ),
+                )),
+            };
+            OfflinePlugin {
+                plugin_id,
+                installation_uuid: row.installation_uuid.to_string(),
+                status,
+            }
+        })
+        .collect();
+    out.extend(
+        quarantined_uuids
+            .into_iter()
+            .map(|(plugin_id, uuid)| OfflinePlugin {
+                plugin_id,
+                installation_uuid: uuid.to_string(),
+                status: Err("grant or content digest missing or malformed; reinstall".to_owned()),
+            }),
+    );
+    out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+    Ok(out)
 }
 
 // ── SQL helpers (C1b + C5) ──────────────────────────────────────────
@@ -3973,6 +4122,7 @@ wasm = "plugin.wasm"
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
             singleton: false,
+            requested_network: Arc::from([]),
         };
         insert_installation_row(&db, &ghost).unwrap();
         let ghost_uuid = Arc::clone(&ghost.installation_uuid);
@@ -4065,6 +4215,7 @@ wasm = "plugin.wasm"
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
             singleton: false,
+            requested_network: Arc::from([]),
         };
         insert_installation_row(&db, &ghost).unwrap();
 
@@ -4974,6 +5125,7 @@ config-schema = "ui/config.schema.json"
             granted_capabilities: Arc::new(CapabilitiesSection::default()),
             content_digest: Arc::from("0".repeat(64)),
             singleton: false,
+            requested_network: Arc::from([]),
         };
         insert_installation_row(&db, &ghost).unwrap();
         let ghost_uuid = Arc::clone(&ghost.installation_uuid);

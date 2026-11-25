@@ -43,6 +43,9 @@
 //!   [<port>]]` / `tls-pin reset --all` (Phase 8.2)** — offline: list or
 //!   forget the certificates streaming instances trusted on first use for
 //!   LAN devices; the next request to a reset device pins again.
+//! - **`plugin list` (Phase 8.5)** — offline: the installed plugins
+//!   with their network rules (requested, granted, effective), read
+//!   without touching the registry.
 //! - **`backup <out-dir>` (M3)** — writes a consistent snapshot
 //!   of the database, the blob files it indexes and the installed
 //!   plugin packages to a new directory with a checksummed
@@ -390,6 +393,7 @@ async fn run_subcommand() -> Option<anyhow::Result<()>> {
             Some("role") => run_role(),
             Some("device") => run_device(),
             Some("tls-pin") => run_tls_pin(),
+            Some("plugin") => run_plugin(),
             _ => return None,
         },
     )
@@ -988,6 +992,70 @@ fn run_tls_pin() -> anyhow::Result<()> {
     Ok(())
 }
 
+const PLUGIN_USAGE: &str = "usage: oxidhome plugin list";
+
+/// Phase 8.5: `oxidhome plugin list`. Offline and read-only.
+fn run_plugin() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["list"] => {}
+        [] | ["-h" | "--help"] => {
+            println!("{PLUGIN_USAGE}");
+            return Ok(());
+        }
+        _ => anyhow::bail!("{PLUGIN_USAGE}"),
+    }
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let plugins = with_offline_stores(&state_dir, |stores| {
+        oxidhome_core::state::list_installations_offline(&state_dir.join("plugins"), &stores.db)
+    })?;
+    print!("{}", format_plugin_list(&plugins));
+    Ok(())
+}
+
+/// `oxidhome plugin list` output: a tab-separated line per plugin, then
+/// one indented line per network rule, tagged `requested`, `granted` or
+/// `effective`.
+fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for plugin in plugins {
+        match &plugin.status {
+            Ok((version, network)) => {
+                let _ = writeln!(
+                    out,
+                    "{}\t{version}\tinstallation={}",
+                    plugin.plugin_id, plugin.installation_uuid
+                );
+                let (requested, granted, effective) = network.to_strings();
+                for (tag, rules) in [
+                    ("requested", requested),
+                    ("granted", granted),
+                    ("effective", effective),
+                ] {
+                    for rule in rules {
+                        let _ = writeln!(out, "\t{tag}\t{rule}");
+                    }
+                }
+            }
+            Err(why) => {
+                let _ = writeln!(
+                    out,
+                    "{}\tquarantined\tinstallation={}\t{why}",
+                    plugin.plugin_id, plugin.installation_uuid
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Stderr-only tracing for the offline / one-shot subcommands.
 fn init_cli_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -1415,5 +1483,38 @@ mod tests {
         assert!(reset);
         assert_eq!(filter.scope(), "*");
         assert!(parse_tls_pin_args(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn plugin_list_shows_each_rule_under_its_plugin() {
+        use oxidhome_core::state::{NetworkGrants, OfflinePlugin};
+        let rule = |r: &str| r.parse::<oxidhome_manifest::NetworkRule>().unwrap();
+        let plugins = [
+            OfflinePlugin {
+                plugin_id: "net.example.cam".into(),
+                installation_uuid: "inst-1".into(),
+                status: Ok((
+                    "1.2.0".into(),
+                    NetworkGrants::new(
+                        &[rule("tcp://192.168.0.0/16:554")],
+                        &[rule("tcp://192.168.1.20:554")],
+                    ),
+                )),
+            },
+            OfflinePlugin {
+                plugin_id: "net.example.old".into(),
+                installation_uuid: "inst-2".into(),
+                status: Err("contents changed since install; reinstall".into()),
+            },
+        ];
+        assert_eq!(
+            format_plugin_list(&plugins),
+            "net.example.cam\t1.2.0\tinstallation=inst-1\n\
+             \trequested\ttcp://192.168.0.0/16:554\n\
+             \tgranted\ttcp://192.168.1.20:554\n\
+             \teffective\ttcp://192.168.1.20:554\n\
+             net.example.old\tquarantined\tinstallation=inst-2\t\
+             contents changed since install; reinstall\n"
+        );
     }
 }

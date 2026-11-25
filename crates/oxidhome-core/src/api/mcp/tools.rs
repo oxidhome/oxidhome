@@ -143,8 +143,11 @@ pub(super) fn list_tools() -> Vec<Tool> {
             "List all plugins currently known to the host — both installed \
              (via `plugins install`) and running-only (dev-time argv-driven \
              starts with no `plugin_installation` row). Each entry carries \
-             `plugin_id`, `installed`, `version` (when installed), and \
-             `instance_count`. Read-only; gated on `plugins:list`. Same wire \
+             `plugin_id`, `installed`, `version` (when installed), \
+             `instance_count`, and `network` (when installed): the rules the \
+             manifest `requested`, the operator `granted`, and the `effective` \
+             rules instances get (the grant narrowed by containment). \
+             Read-only; gated on `plugins:list`. Same wire \
              shape as `oxidhome://plugins` — a client that reads the resource \
              and one that calls this tool see identical row bodies.",
             Arc::new(plugins_list_schema()),
@@ -162,8 +165,10 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `version`, `singleton`, `content_digest` (SHA-256 of the \
              installed contents), `installation_uuid` (host-minted per-install \
              identity — a reinstall of the same `plugin_id` produces a \
-             different UUID), and the list of currently-running instances \
-             with their state. `content_digest` + `installation_uuid` are \
+             different UUID), `network` (`requested` / `granted` / \
+             `effective` rules, as in `plugins.list`), and the list of \
+             currently-running instances with their state. \
+             `content_digest`, `installation_uuid` and `network` are \
              `None` for a dev-time argv-driven start with no installation \
              row. Read-only; gated on `plugins:list`. Same wire shape as \
              `oxidhome://plugins/{plugin_id}`. Returns `INVALID_PARAMS` if \

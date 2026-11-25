@@ -64,6 +64,24 @@ message Plugin {
   // How many supervised instances of this plugin are currently
   // registered. Zero for installed-but-stopped rows.
   uint32 instance_count = 4;
+  // The installation's network rules (Phase 8.5), present when
+  // `installed = true` (empty lists for a plugin without network
+  // rules). Same shape as the JSON side's `network` object.
+  optional NetworkGrants network = 5;
+}
+
+// A plugin's `[capabilities] network` rules, in manifest syntax
+// (`tcp://192.168.1.0/24:554`, `https://*.example.com`).
+message NetworkGrants {
+  // What the manifest asks for.
+  repeated string requested = 1;
+  // What the operator's persisted grant holds; equal to `requested`
+  // unless the grant was narrowed.
+  repeated string granted = 2;
+  // What instances actually get: the grant narrowed by containment
+  // against the request. A granted rule only partly inside the
+  // request is absent here.
+  repeated string effective = 3;
 }
 
 message InstallPluginRequest {

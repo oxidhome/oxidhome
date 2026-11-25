@@ -146,6 +146,8 @@ pub(crate) struct NetworkPolicy {
     clock: crate::clock::Clock,
     pub(crate) lookups: Arc<tokio::sync::Semaphore>,
     pub(crate) http_requests: Arc<tokio::sync::Semaphore>,
+    /// Test seam: answers name lookups instead of the platform resolver.
+    pub(crate) dns: Option<Arc<super::DnsOverrides>>,
 }
 
 impl std::fmt::Debug for NetworkPolicy {
@@ -510,6 +512,7 @@ impl NetworkPolicy {
             clock,
             lookups: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
             http_requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP)),
+            dns: None,
         }
     }
 
@@ -675,6 +678,13 @@ impl NetworkPolicy {
     #[must_use]
     pub(crate) fn for_installation(mut self, installation_uuid: Arc<str>) -> Self {
         self.installation_uuid = installation_uuid;
+        self
+    }
+
+    /// Resolve names from `dns` instead of the platform resolver (the
+    /// engine's test seam; `None` keeps the platform resolver).
+    pub(crate) fn with_dns(mut self, dns: Option<Arc<super::DnsOverrides>>) -> Self {
+        self.dns = dns;
         self
     }
 

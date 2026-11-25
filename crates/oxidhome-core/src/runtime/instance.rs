@@ -999,7 +999,7 @@ impl PluginInstance {
         // Phase 8: streaming worlds get sockets, checked against the
         // effective `network` rules set just above.
         let state = if super::network::is_streaming(manifest_world) {
-            state.with_network_access(engine.tls())
+            state.with_network_access(engine.tls(), engine.dns_overrides())
         } else {
             state
         };
