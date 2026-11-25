@@ -2200,6 +2200,10 @@ pub enum NetworkGrantError {
          the request"
     )]
     Widens(NetworkRule),
+    /// A rule whose host isn't an IP, a CIDR or a plain DNS name. API:
+    /// `400`.
+    #[error("rule `{0}` names a host that is not an IP address, CIDR or DNS name")]
+    BadHost(NetworkRule),
     /// More rules than a manifest may hold. API: `400`.
     #[error("a network grant holds at most {max} rules, got {got}")]
     TooMany {
@@ -2286,6 +2290,9 @@ pub fn narrowed_network_grant(
     }
     let mut out: Vec<NetworkRule> = Vec::with_capacity(rules.len());
     for rule in rules {
+        if !is_plain_host(&rule.host) {
+            return Err(NetworkGrantError::BadHost(rule.clone()));
+        }
         if !requested.iter().any(|r| network_rule_covers(r, rule)) {
             return Err(NetworkGrantError::Widens(rule.clone()));
         }
@@ -2294,6 +2301,25 @@ pub fn narrowed_network_grant(
         }
     }
     Ok(out)
+}
+
+/// Whether a granted rule's host is an IP literal, a CIDR, or a DNS
+/// name of letters, digits, `-` and `.` (after an optional `*.`). The
+/// manifest parser takes more (anything the runtime would refuse at
+/// lookup); a grant refuses it, so nothing like `token=…@host` is
+/// stored or written to the audit ledger.
+fn is_plain_host(host: &oxidhome_manifest::HostMatch) -> bool {
+    use oxidhome_manifest::HostMatch;
+    let name = |n: &str| {
+        !n.is_empty()
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    };
+    match host {
+        HostMatch::Cidr(_) => true,
+        HostMatch::Exact(h) => h.parse::<std::net::IpAddr>().is_ok() || name(h),
+        HostMatch::SuffixWildcard(suffix) => name(suffix),
+    }
 }
 
 /// Store `network` as the grant of the live installation
@@ -3241,6 +3267,12 @@ mod tests {
             narrowed_network_grant(&requested, Some(&[rule("udp://192.168.1.20:554")])),
             Err(NetworkGrantError::Widens(_))
         ));
+        let wide = [rule("https://*.example.com")];
+        assert!(matches!(
+            narrowed_network_grant(&wide, Some(&[rule("https://token=x@api.example.com")])),
+            Err(NetworkGrantError::BadHost(_))
+        ));
+        assert!(narrowed_network_grant(&wide, Some(&[rule("https://api.example.com")])).is_ok());
         let max = oxidhome_manifest::validate::MAX_NETWORK_RULES;
         assert!(matches!(
             narrowed_network_grant(&requested, Some(&vec![camera; max + 1])),

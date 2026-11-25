@@ -1304,7 +1304,7 @@ impl OxidHomePlugins {
         .map_err(|e| {
             let err = match &e {
                 E::NotInstalled(_) => ConnectError::not_found(e.to_string()),
-                E::Widens(_) | E::TooMany { .. } => ConnectError::invalid_argument(e.to_string()),
+                E::Widens(_) | E::BadHost(_) | E::TooMany { .. } => ConnectError::invalid_argument(e.to_string()),
                 E::Unavailable(..) | E::Store(_) => {
                     tracing::error!(target: "api.plugins", error = %e, "network grant change failed");
                     ConnectError::internal("network grant change failed")

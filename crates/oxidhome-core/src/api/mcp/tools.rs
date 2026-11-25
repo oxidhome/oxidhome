@@ -2764,7 +2764,9 @@ async fn network_grant_call(
             structured: Some(json!({"kind": "not_installed", "plugin_id": plugin_id})),
             domain_kind: None,
         },
-        Err(e @ (E::Widens(_) | E::TooMany { .. })) => ToolOutcome::InvalidParams(e.to_string()),
+        Err(e @ (E::Widens(_) | E::BadHost(_) | E::TooMany { .. })) => {
+            ToolOutcome::InvalidParams(e.to_string())
+        }
         Err(e @ (E::Unavailable(..) | E::Store(_))) => {
             tracing::error!(target: "mcp.tool.network_grant", error = %e, "network grant change failed");
             ToolOutcome::Internal("network grant change failed; see server logs".into())

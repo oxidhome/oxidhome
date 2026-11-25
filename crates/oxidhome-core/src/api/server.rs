@@ -894,6 +894,7 @@ impl IntoResponse for NetworkGrantApiError {
             )
                 .into_response(),
             Self::Grant(e @ E::Widens(_)) => bad("widens_request", e.to_string()),
+            Self::Grant(e @ E::BadHost(_)) => bad("bad_request", e.to_string()),
             Self::Grant(e @ E::TooMany { .. }) => bad("too_many_rules", e.to_string()),
             Self::Grant(e @ (E::Unavailable(..) | E::Store(_))) => {
                 tracing::error!(target: "api.plugins", error = %e, "network grant change failed");

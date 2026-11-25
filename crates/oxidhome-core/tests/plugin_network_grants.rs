@@ -935,18 +935,12 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_grant_change_restarts_running_instances_with_their_config() {
-    const PROBE: &str = "example.net-probe";
-    let server = LineServer::start();
-    let allowed = format!("tcp://127.0.0.1:{}", server.port);
-    // Another port the request covers, so the grant can move off the
-    // server's.
-    let elsewhere = format!("tcp://127.0.0.1:{}", server.port.wrapping_add(1).max(1));
-    let manifest = format!(
+/// A net-probe manifest requesting `rules`.
+fn probe_manifest(id: &str, allowed: &str, elsewhere: &str) -> String {
+    format!(
         r#"manifest_version = 1
 [plugin]
-id = "{PROBE}"
+id = "{id}"
 name = "Net Probe"
 version = "0.1.0"
 world = "streaming-plugin"
@@ -960,7 +954,18 @@ network = ["{allowed}", "{elsewhere}"]
 type = "string"
 default = ""
 "#
-    );
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_change_restarts_running_instances_with_their_config() {
+    const PROBE: &str = "example.net-probe";
+    let server = LineServer::start();
+    let allowed = format!("tcp://127.0.0.1:{}", server.port);
+    // Another port the request covers, so the grant can move off the
+    // server's.
+    let elsewhere = format!("tcp://127.0.0.1:{}", server.port.wrapping_add(1).max(1));
+    let manifest = probe_manifest(PROBE, &allowed, &elsewhere);
     let wasm = support::build_example("net-probe", "net_probe.wasm");
     let source = support::stage_plugin("net-grants-probe", &wasm, "net_probe.wasm", &manifest);
     let state = support::tempdir("net-grants-restart");
@@ -1039,6 +1044,18 @@ default = ""
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["restarted"], json!([]), "reordered: {body}");
 
+    // A restart that fails (the package changed on disk) keeps the
+    // stored grant and names the instance in `not_restarted`.
+    let installed = engine.installed_plugins().get(PROBE).expect("installed");
+    let manifest_path = installed.path.join("manifest.toml");
+    let text = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(&manifest_path, text.replace("0.1.0", "0.1.1")).unwrap();
+    let (status, body) =
+        api_status(&router, &owner, "PUT", &uri, json!({"rules": [elsewhere]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["restarted"], json!([]), "{body}");
+    assert_eq!(body["not_restarted"][0]["instance_id"], "probe", "{body}");
+    assert_eq!(body["network"]["granted"], json!([elsewhere]), "{body}");
     let _ = oxidhome_core::runtime::stop_and_wait_reaped(
         engine.instances().list(),
         Duration::from_secs(10),
