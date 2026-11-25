@@ -361,11 +361,15 @@ fn old_style_broadcast(net: &IpNet) -> Option<IpAddr> {
 /// IPv4 network lies in, which BSD kernels (macOS) also treat as
 /// broadcast addresses on that interface. Like XNU, the classful mask
 /// is narrowed to the network's own, so a supernet's classful network
-/// is the network itself.
+/// is the network itself. None for a `/32`, which XNU leaves out of its
+/// broadcast test.
 fn classful_broadcasts(net: &IpNet) -> [Option<IpAddr>; 2] {
     let IpNet::V4(v4) = net else {
         return [None, None];
     };
+    if v4.prefix_len() == 32 {
+        return [None, None];
+    }
     let prefix = match v4.network().octets()[0] {
         0..=127 => 8,
         128..=191 => 16,
@@ -1804,6 +1808,13 @@ mod tests {
             policy(&["udp://192.168.0.255:9999"])
                 .check_discovery_send(sa("192.168.0.255:9999"), Some(&supernet)),
             Ok(false)
+        );
+        // A /32 alias is no broadcast domain of its own.
+        let alias = ifaces(&["192.168.1.128/25", "192.168.1.42/32"]);
+        assert_eq!(
+            policy(&["udp://192.168.1.128/25:9999"])
+                .check_discovery_send(sa("192.168.1.255:9999"), Some(&alias)),
+            Ok(true)
         );
         // A /31's first address counts (BSD exempts only a /32).
         let p2p_first = ifaces(&["10.0.0.2/31"]);

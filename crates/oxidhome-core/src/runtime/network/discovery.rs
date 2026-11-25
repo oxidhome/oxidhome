@@ -33,6 +33,8 @@ pub(crate) const MAX_RECEIVE: usize = 32;
 const MAX_DATAGRAM: usize = 65_535;
 /// Largest UDP payload over IPv4 (65535 minus the IP and UDP headers).
 const MAX_SEND: usize = 65_507;
+/// The largest IPv6 UDP payload (no jumbograms).
+const MAX_SEND_V6: usize = 65_527;
 /// Refused datagrams one `receive` discards before it returns, so a flood
 /// from a refused sender can't hold the call.
 const MAX_DISCARDS: usize = 256;
@@ -133,10 +135,14 @@ fn list_interfaces() -> std::io::Result<Vec<LocalInterface>> {
             let (ip, prefix, broadcast) = match &iface.addr {
                 if_addrs::IfAddr::V4(v4) => {
                     // A non-contiguous mask has no CIDR: refuse to guess
-                    // which addresses its broadcast reaches.
+                    // which addresses its broadcast reaches. (Not on
+                    // Windows, which has no such masks and where
+                    // `if-addrs` can pair a host mask with the on-link
+                    // prefix.)
                     let mask = u32::from(v4.netmask);
-                    if mask.leading_ones() != mask.count_ones()
-                        || mask.leading_ones() != u32::from(v4.prefixlen)
+                    if cfg!(not(windows))
+                        && (mask.leading_ones() != mask.count_ones()
+                            || mask.leading_ones() != u32::from(v4.prefixlen))
                     {
                         return Some(Err(std::io::Error::other(format!(
                             "{}: non-contiguous netmask {}",
@@ -409,7 +415,7 @@ impl host_network::HostDiscoverySocket for PluginState {
         if addr.is_ipv6() != ipv6 || addr.port() == 0 || mapped {
             return Err(ErrorCode::InvalidArgument);
         }
-        if data.len() > MAX_SEND {
+        if data.len() > if ipv6 { MAX_SEND_V6 } else { MAX_SEND } {
             return Err(ErrorCode::DatagramTooLarge);
         }
         // Listed per send (IPv4 only: IPv6 has no broadcast), so the
