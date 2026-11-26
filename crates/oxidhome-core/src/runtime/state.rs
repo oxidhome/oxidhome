@@ -525,6 +525,11 @@ impl EventRefusal {
         self.denies(crate::auth::Action::EventSubscribe, &resource, upstream)
     }
 
+    /// The deny lists' [`generation`](crate::state::PluginDenyStore::generation).
+    pub(crate) fn generation(&self) -> u64 {
+        self.denies.generation()
+    }
+
     /// `true` when a list refuses reading `ev`'s bytes (`blob.read`
     /// of its device, or of its source's blobs), as `read-events`
     /// decides for the same row.

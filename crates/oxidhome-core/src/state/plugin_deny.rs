@@ -16,6 +16,7 @@
 //! parses denies the plugin every plugin action (fail closed).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rusqlite::params;
@@ -59,6 +60,9 @@ pub struct PluginDenyStore {
     /// Serializes writers through commit → publish, so `rows` is held
     /// only to read and to publish, never across a `SQLite` commit.
     writer: Mutex<()>,
+    /// Bumped on every change, under the `rows` write lock
+    /// ([`Self::generation`]).
+    generation: AtomicU64,
 }
 
 impl Default for PluginDenyStore {
@@ -66,6 +70,10 @@ impl Default for PluginDenyStore {
         Self::detached()
     }
 }
+
+/// Most items in each list of a stored deny entry, as an admin change
+/// accepts.
+const MAX_SELECTOR_LIST: usize = crate::api::token_admin::MAX_LIST;
 
 /// The stored form of a list: a JSON array of deny entries.
 fn encode(rules: &[DenyRule]) -> Vec<u8> {
@@ -78,7 +86,9 @@ fn encode(rules: &[DenyRule]) -> Vec<u8> {
 #[must_use]
 pub fn decode_plugin_deny(definition: &[u8]) -> Option<Vec<DenyRule>> {
     let wire: Vec<crate::auth::role::SelectorWire> = serde_json::from_slice(definition).ok()?;
-    if wire.len() > MAX_PLUGIN_DENY_ENTRIES {
+    // The admin surfaces' limits, so a stored list is never wider
+    // than one they accept.
+    if wire.len() > MAX_PLUGIN_DENY_ENTRIES || !wire.iter().all(|w| w.within(MAX_SELECTOR_LIST)) {
         return None;
     }
     wire.into_iter()
@@ -108,6 +118,7 @@ impl PluginDenyStore {
             db: None,
             rows: RwLock::new(HashMap::new()),
             writer: Mutex::new(()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -120,7 +131,16 @@ impl PluginDenyStore {
         let rows = db.read(|conn| -> Result<_, rusqlite::Error> {
             let mut stmt = conn.prepare("SELECT plugin_id, definition FROM plugin_deny")?;
             let iter = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                // Any storage class: a value that isn't the JSON text
+                // this module writes fails closed below, rather than
+                // stopping the store from opening (or being reset).
+                let definition = match r.get_ref(1)? {
+                    rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
+                        b.to_vec()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok((r.get::<_, String>(0)?, definition))
             })?;
             let mut out = HashMap::new();
             for row in iter {
@@ -144,6 +164,7 @@ impl PluginDenyStore {
             db: Some(db),
             rows: RwLock::new(rows),
             writer: Mutex::new(()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -172,6 +193,14 @@ impl PluginDenyStore {
         plugins
             .into_iter()
             .find(|id| rows.get(*id).is_some_and(|list| list.iter().any(&refuses)))
+    }
+
+    /// Changes so far. Two decisions that must agree on one policy
+    /// (an entry's visibility and its bytes) compare it before and
+    /// after: a change in between means they may have read two.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// `true` when no plugin has a deny list: the decision's fast path.
@@ -292,6 +321,7 @@ impl PluginDenyStore {
             })?;
         }
         let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if rules.is_empty() {
             rows.remove(plugin_id);
         } else {
@@ -359,6 +389,25 @@ mod tests {
         ));
     }
 
+    /// The generation moves with every stored change and only then,
+    /// so decisions bracketing it see a change made between them.
+    #[test]
+    fn the_generation_moves_with_each_change() {
+        let store = PluginDenyStore::detached();
+        let g = store.generation();
+        assert!(
+            store
+                .set("com.example.x", vec![rule(); MAX_PLUGIN_DENY_ENTRIES + 1])
+                .is_err()
+        );
+        assert_eq!(store.generation(), g, "a refused change");
+        store.set("com.example.x", vec![rule()]).expect("set");
+        assert!(store.generation() > g);
+        let g = store.generation();
+        store.set("com.example.x", Vec::new()).expect("reset");
+        assert!(store.generation() > g);
+    }
+
     #[test]
     fn a_row_that_does_not_parse_denies_everything() {
         let db = Arc::new(Db::open_in_memory().expect("db"));
@@ -372,6 +421,32 @@ mod tests {
         let store = PluginDenyStore::open(db).expect("open");
         let list = store.get("com.example.x").expect("fail closed");
         assert_eq!(list[0].actions, PLUGIN_ACTIONS);
+        // Text, a list wider than an admin change takes, and a
+        // non-text value all fail closed too.
+        let many: Vec<String> = (0..=MAX_SELECTOR_LIST)
+            .map(|i| format!("com.example.p{i}/svc"))
+            .collect();
+        let wide = serde_json::json!([{"actions": ["service.call"], "services": many}]).to_string();
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        db.write(|conn| {
+            conn.execute(
+                "INSERT INTO plugin_deny (plugin_id, definition, updated_ms) VALUES \
+                 ('com.example.a', ?1, 0), ('com.example.b', ?2, 0), ('com.example.c', 7, 0)",
+                params![wide.clone(), wide.into_bytes()],
+            )
+        })
+        .expect("insert");
+        let store = PluginDenyStore::open(Arc::clone(&db)).expect("open");
+        for id in ["com.example.a", "com.example.b", "com.example.c"] {
+            assert_eq!(store.get(id).expect(id)[0].actions, PLUGIN_ACTIONS, "{id}");
+        }
+        store.set("com.example.a", Vec::new()).expect("reset");
+        assert!(store.get("com.example.a").is_none());
+        assert_eq!(
+            PluginDenyStore::open(db).expect("reopen").len(),
+            2,
+            "the reset stuck"
+        );
         assert_eq!(
             decode_plugin_deny(&encode(&[rule()])).as_deref(),
             Some(&[rule()][..])

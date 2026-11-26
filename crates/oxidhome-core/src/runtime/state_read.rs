@@ -98,7 +98,8 @@ fn maybe_visible(
 
 /// A `list-state` entry's [`Visibility`] for `plugin`, or `None` when
 /// it is left out; decided from `classes` (no registry lock), so it
-/// runs under the store's lock.
+/// runs under the store's lock. Without `bytes`, only whether it is
+/// left out is decided (`Withheld` stands for any visibility).
 fn decide(
     ctx: &InvocationContext,
     plugin: &PluginPrincipal<'_>,
@@ -106,6 +107,7 @@ fn decide(
     grants: &oxidhome_manifest::CapabilitiesSection,
     classes: &crate::state::devices::ClassSnapshot,
     entry: &DeviceState,
+    bytes: bool,
 ) -> Option<Visibility> {
     if !maybe_visible(
         plugin.instance_id,
@@ -122,6 +124,7 @@ fn decide(
         classes.class_of(&entry.device_id),
         classes.instance_is_camera(&entry.owner_instance),
         entry,
+        bytes,
     )
     .ok()
 }
@@ -130,7 +133,13 @@ fn decide(
 /// device of `class`), or the label of the refusal. `camera_source`:
 /// the entry's owner instance has registered a camera, so its bytes
 /// count as camera bytes whatever the device (as for a token's direct
-/// read, `api::bytes`).
+/// read, `api::bytes`). Without `bytes`, the bytes aren't decided
+/// (`Withheld`).
+///
+/// The two decisions read one policy: a deny list changed between
+/// them (one refusing the entry replacing one refusing its bytes, say)
+/// could let each pass, so they are made again, and the entry refused
+/// when the lists keep changing.
 fn visibility(
     ctx: &InvocationContext,
     plugin: &PluginPrincipal<'_>,
@@ -138,10 +147,30 @@ fn visibility(
     class: DeviceClass,
     camera_source: bool,
     entry: &DeviceState,
+    bytes: bool,
 ) -> Result<Visibility, &'static str> {
     if is_own(plugin.instance_id, installation_uuid, entry) {
         return Ok(Visibility::Full);
     }
+    for _ in 0..SNAPSHOT_TRIES {
+        let policy = plugin.denies.generation();
+        let vis = visibility_once(ctx, plugin, class, camera_source, entry, bytes);
+        if plugin.denies.generation() == policy {
+            return vis;
+        }
+    }
+    Err("plugin-deny")
+}
+
+/// [`visibility`] of a foreign entry, its policy read once or twice.
+fn visibility_once(
+    ctx: &InvocationContext,
+    plugin: &PluginPrincipal<'_>,
+    class: DeviceClass,
+    camera_source: bool,
+    entry: &DeviceState,
+    bytes: bool,
+) -> Result<Visibility, &'static str> {
     let resource = Resource::state(
         entry.device_id.as_str(),
         class,
@@ -153,10 +182,11 @@ fn visibility(
         return Err(read.reason.audit_label().unwrap_or("reads_state"));
     }
     // Only an entry with bytes needs the second decision.
-    if !entry
-        .fields
-        .iter()
-        .any(|kv| matches!(kv.value, Value::BytesVal(_)))
+    if !bytes
+        || !entry
+            .fields
+            .iter()
+            .any(|kv| matches!(kv.value, Value::BytesVal(_)))
     {
         return Ok(Visibility::Withheld);
     }
@@ -490,6 +520,7 @@ impl host_state::Host for PluginState {
                     class,
                     self.devices.instance_is_camera(&e.owner_instance),
                     e,
+                    true,
                 ) {
                     Ok(vis) => Some(to_wit(e, vis)),
                     Err(label) => {
@@ -561,7 +592,8 @@ impl host_state::Host for PluginState {
         let mut tries = 0;
         let (page, classes) = loop {
             let classes = self.devices.class_snapshot();
-            let decide = |e: &DeviceState| decide(ctx, plugin, &install, &grants, &classes, e);
+            let decide =
+                |e: &DeviceState| decide(ctx, plugin, &install, &grants, &classes, e, false);
             let page = self.device_state.snapshot_page_capped(
                 after.as_deref(),
                 limit,
@@ -595,7 +627,7 @@ impl host_state::Host for PluginState {
             .iter()
             .flatten()
             .filter_map(|e| {
-                decide(ctx, plugin, &install, &grants, &classes, e).map(|vis| to_wit(e, vis))
+                decide(ctx, plugin, &install, &grants, &classes, e, true).map(|vis| to_wit(e, vis))
             })
             .collect();
         Ok(StatePage {
@@ -653,7 +685,7 @@ mod tests {
             denies: &denies,
         };
         let ctx = InvocationContext::host_origin(me);
-        let v = visibility(&ctx, &plugin, install, DeviceClass::other(), false, e).ok();
+        let v = visibility(&ctx, &plugin, install, DeviceClass::other(), false, e, true).ok();
         // The scan's first pass never hides what the decision shows.
         assert!(v.is_none() || maybe_visible(me, install, grants, e));
         v
@@ -731,11 +763,11 @@ mod tests {
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
         let class = DeviceClass::other();
         assert_eq!(
-            visibility(&ctx, &plugin, "inst-p.me", class, false, &e),
+            visibility(&ctx, &plugin, "inst-p.me", class, false, &e, true),
             Ok(Visibility::Full)
         );
         assert_eq!(
-            visibility(&ctx, &plugin, "inst-p.me", class, true, &e),
+            visibility(&ctx, &plugin, "inst-p.me", class, true, &e, true),
             Ok(Visibility::Withheld)
         );
     }

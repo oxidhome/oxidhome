@@ -221,8 +221,10 @@ fn read_page(
 /// [`read_page`] with `access`'s classes read before the scan (the
 /// registry's locks aren't taken while it holds the database
 /// connection) and still current after it: a camera registered
-/// meanwhile may have published a row the scan saw. Otherwise the page
-/// is read again; `None` when devices kept changing.
+/// meanwhile may have published a row the scan saw. The deny lists
+/// must not change during it either, so that a row's visibility and
+/// its bytes are decided under one policy. Otherwise the page is read
+/// again; `None` when devices or lists kept changing.
 fn read_stable(
     log: &EventLog,
     after_id: u64,
@@ -232,9 +234,10 @@ fn read_stable(
     access: &mut HistoryAccess,
 ) -> Option<Result<Result<ScanPage, CursorExpired>, EventLogError>> {
     for _ in 0..SNAPSHOT_TRIES {
+        let policy = access.refusal.generation();
         access.classes = devices.class_snapshot();
         let page = read_page(log, after_id, limit, filters, access);
-        if devices.is_current(&access.classes) {
+        if devices.is_current(&access.classes) && access.refusal.generation() == policy {
             return Some(page);
         }
     }
@@ -403,7 +406,7 @@ impl PluginState {
         let page = match read {
             Ok(None) => {
                 return Err(WitError::Unavailable(
-                    "devices changed throughout the history read; try again".into(),
+                    "devices or deny lists changed throughout the history read; try again".into(),
                 ));
             }
             Ok(Some(Ok(Ok(page)))) => page,

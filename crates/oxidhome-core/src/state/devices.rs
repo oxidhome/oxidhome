@@ -276,8 +276,8 @@ impl DeviceRegistry {
     /// over, since a device registered meanwhile isn't in it.
     #[must_use]
     pub fn class_snapshot(&self) -> Arc<ClassSnapshot> {
-        let generation = self.generation();
         let mut cached = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = self.generation();
         if let Some(snapshot) = cached.as_ref().filter(|s| s.generation == generation) {
             return Arc::clone(snapshot);
         }
@@ -293,7 +293,11 @@ impl DeviceRegistry {
             cameras,
             generation,
         });
-        *cached = Some(Arc::clone(&snapshot));
+        // One already stale stays out of the cache (it is still right
+        // for this caller, whose `is_current` check will say so).
+        if self.generation() == generation {
+            *cached = Some(Arc::clone(&snapshot));
+        }
         snapshot
     }
 
@@ -346,12 +350,24 @@ impl DeviceRegistry {
         self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
     fn write(&self) -> RwLockWriteGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>> {
-        let guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        // Under the lock: a snapshot that read the old generation then
-        // waits for this writer, so it is stale only if it is marked so.
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Mark a change to the map, holding its write lock: a snapshot
+    /// that read the old generation then waits for this writer, so it
+    /// is stale only if it is marked so. Only real changes count, so a
+    /// failed call can't keep invalidating readers' snapshots.
+    fn bump(&self, _held: &RwLockWriteGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>>) {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        guard
+    }
+
+    /// Drop `id`'s entry, if any.
+    fn remove_entry(&self, id: &DeviceId) {
+        let mut guard = self.write();
+        if guard.remove(id).is_some() {
+            self.bump(&guard);
+        }
     }
 
     /// Register a device on behalf of `owner_instance`. Returns the
@@ -392,7 +408,7 @@ impl DeviceRegistry {
             tracing::error!(target: "auth.device_meta", device_id = %id, ?err, "floor not recorded; device not registered");
             // A re-registration must not leave the previous entry
             // commandable under its old class.
-            self.write().remove(&id);
+            self.remove_entry(&id);
             return id;
         }
         let meta = Arc::new(DeviceMeta {
@@ -400,7 +416,9 @@ impl DeviceRegistry {
             owner_instance,
             info,
         });
-        self.write().insert(id.clone(), meta);
+        let mut guard = self.write();
+        guard.insert(id.clone(), meta);
+        self.bump(&guard);
         id
     }
 
@@ -450,7 +468,7 @@ impl DeviceRegistry {
             // Fail closed: a re-registration that can't record its
             // floor drops the earlier entry rather than leave it
             // commandable under its old class.
-            self.write().remove(&id);
+            self.remove_entry(&id);
             return Err(err);
         }
         let mut guard = self.write();
@@ -475,6 +493,7 @@ impl DeviceRegistry {
             info,
         });
         guard.insert(id.clone(), meta);
+        self.bump(&guard);
         Ok(id)
     }
 
@@ -531,9 +550,11 @@ impl DeviceRegistry {
                     // floor can't be recorded drops the device rather
                     // than leave it commandable under its old class.
                     guard.remove(id);
+                    self.bump(&guard);
                     return Err(err);
                 }
                 guard.insert(id.clone(), new);
+                self.bump(&guard);
                 Ok(())
             }
             _ => Err(WitError::NotFound(format!("device {id} not registered"))),
@@ -547,6 +568,7 @@ impl DeviceRegistry {
         match guard.get(id) {
             Some(meta) if meta.owner_instance == owner_instance => {
                 guard.remove(id);
+                self.bump(&guard);
                 Ok(())
             }
             _ => Err(WitError::NotFound(format!("device {id} not registered"))),
@@ -606,7 +628,11 @@ impl DeviceRegistry {
         let mut guard = self.write();
         let before = guard.len();
         guard.retain(|_, m| m.owner_instance != instance_id);
-        before - guard.len()
+        let removed = before - guard.len();
+        if removed > 0 {
+            self.bump(&guard);
+        }
+        removed
     }
 }
 
@@ -888,6 +914,10 @@ mod tests {
         let first = reg.class_snapshot();
         assert!(reg.is_current(&first));
         assert!(Arc::ptr_eq(&first, &reg.class_snapshot()), "shared");
+
+        assert!(reg.remove("inst", &"dev-0000000000000000".into()).is_err());
+        assert_eq!(reg.remove_by_owner("inst"), 0);
+        assert!(reg.is_current(&first), "a failed change changes nothing");
 
         let id = reg.register("u", "inst".into(), empty_info());
         assert!(!reg.is_current(&first), "a registration");

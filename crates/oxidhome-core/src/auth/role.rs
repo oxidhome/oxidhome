@@ -476,6 +476,14 @@ impl SelectorWire {
         })
     }
 
+    /// `true` when no list in the entry has more than `max` items.
+    pub(crate) fn within(&self, max: usize) -> bool {
+        self.actions.len() <= max
+            && [&self.category, &self.devices, &self.services]
+                .into_iter()
+                .all(|l| l.as_ref().is_none_or(|l| l.len() <= max))
+    }
+
     /// A stored plugin deny entry: [`Self::into_deny`], restricted to
     /// [`crate::auth::plugin::PLUGIN_ACTIONS`].
     pub(crate) fn into_plugin_deny(self) -> Option<DenyRule> {

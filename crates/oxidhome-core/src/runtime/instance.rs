@@ -1407,13 +1407,26 @@ impl PluginInstance {
             }
             let data = self.store.data();
             // A deny list set since the event was collected (while an
-            // earlier `on-event` ran) applies to it.
-            if refusal.refuses(&ev, upstream.iter()) {
-                continue;
+            // earlier `on-event` ran) applies to it; one refusing
+            // `blob.read` of its bytes withholds them, as `read-events`
+            // does. Both under one policy: when the lists change in
+            // between, decide again (and drop it if they keep changing).
+            let mut verdict = None;
+            for _ in 0..3 {
+                let policy = refusal.generation();
+                let refused = refusal.refuses(&ev, upstream.iter());
+                let withhold = !refused
+                    && super::event_read::has_bytes(&ev)
+                    && refusal.refuses_bytes(&ev, upstream.iter());
+                if refusal.generation() == policy {
+                    verdict = Some((refused, withhold));
+                    break;
+                }
             }
-            // A list refusing `blob.read` of its bytes withholds them,
-            // as `read-events` does.
-            if super::event_read::has_bytes(&ev) && refusal.refuses_bytes(&ev, upstream.iter()) {
+            let Some((false, withhold)) = verdict else {
+                continue;
+            };
+            if withhold {
                 super::event_read::withhold_bytes(&mut ev.payload);
             }
             let span = info_span!(
