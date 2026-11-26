@@ -528,9 +528,10 @@ impl Request {
     /// response head has arrived; read the body with the returned
     /// [`BodyReader`]. [`Request::max_body`] doesn't apply.
     ///
-    /// A request body is still sent whole first: when the server answers
-    /// with a `1xx` / `2xx` before it has read it all, this returns once
-    /// the upload is done (or fails with it).
+    /// A request body is still sent first: when the server answers with
+    /// a `1xx` / `2xx` before it has read it all, this keeps sending and
+    /// returns once the upload has ended (finished, or cut short by the
+    /// server).
     ///
     /// The response holds one of the instance's concurrent HTTP requests
     /// until it is dropped.
@@ -1137,8 +1138,8 @@ impl std::fmt::Debug for Request {
             .field("total_timeout", &self.total_timeout)
             .field("max_body", &self.max_body)
             .field("max_redirects", &self.max_redirects)
-            .field("connection_options", &self.connection_options)
-            .finish()
+            // Not `connection_options`: they come from a header value.
+            .finish_non_exhaustive()
     }
 }
 
@@ -1365,9 +1366,10 @@ fn plain_authority(authority: &str) -> bool {
     };
     let host_ok = !host.is_empty()
         && (authority.starts_with('[')
-            // RFC 3986 `reg-name`: unreserved, sub-delims and `%`.
+            // RFC 3986 `reg-name` without percent-encoding (`http`
+            // refuses `%` there): unreserved and sub-delims.
             || host.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || b"-._~%!$&'()*+,;=".contains(&b)
+                b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b)
             }));
     let port_ok = port.is_none_or(|p| {
         (1..=5).contains(&p.len())
@@ -1437,6 +1439,7 @@ mod tests {
             "http://[nope]/",
             "http://h:1:2/",
             "http://cam|era/",
+            "http://cam%20era/",
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }
@@ -1574,11 +1577,12 @@ mod tests {
             .header("Content-Length", "3")
             .header("TE", "trailers")
             .header("X-Before", "1")
-            .header("Connection", "X-Before, x-after")
+            .header("Connection", "X-Before, x-after, token=s3cret")
             .header("X-After", "2")
             .header("Authorization", "Basic x");
         let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["authorization"]);
+        assert!(!format!("{request:?}").contains("s3cret"));
     }
 
     #[test]
