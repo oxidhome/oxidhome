@@ -979,7 +979,7 @@ pub(super) async fn finalize_audit(
 /// same record → actor projection.
 pub(super) fn actor_from_record(rec: &TokenRecord, tokens: &TokenStore) -> Actor {
     // Phase 14.4a: `scope_json` now decodes into a
-    // [`TokenPolicy`] — either the legacy `["scope"]` array or
+    // [`TokenPolicy`] — either the bare `["scope"]` array or
     // the extended `{scopes, constraints}` object. Parse
     // failure ⇒ deny-all actor (empty scopes + empty
     // constraints), same rationale as pre-14.4: an operator
@@ -1032,7 +1032,7 @@ pub(super) fn actor_from_record(rec: &TokenRecord, tokens: &TokenStore) -> Actor
     actor.with_roles(roles)
 }
 
-/// Legacy scope-array parser retained as a thin shim over
+/// Bare scope-array parser retained as a thin shim over
 /// [`crate::auth::parse_policy`] for the tests that pin it
 /// directly. Prefer `parse_policy` — the shim discards
 /// [`TokenPolicy::constraints`].
@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_from_record_legacy_shape_has_no_constraints() {
+    fn actor_from_record_scope_list_shape_has_no_constraints() {
         let rec = TokenRecord {
             id: "tok-legacy".into(),
             label: "legacy".into(),
@@ -1273,6 +1273,25 @@ mod tests {
                 key: "device.send_command",
                 field: "plugins",
             },
+        ));
+
+        // Both fields on `device.send_command`: `devices` is
+        // enforced, `plugins` still refuses the token.
+        let mut both_fields = std::collections::HashMap::new();
+        both_fields.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: Some(vec!["dev-a1b2c3d4*".into()]),
+                plugins: Some(vec!["acme.*".into()]),
+            },
+        );
+        let both_actor = Actor::api_with_policy("tok-both-fields", vec!["*".into()], both_fields);
+        assert!(matches!(
+            first_constraint_refusal(&both_actor, enforced_device),
+            Some(ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            }),
         ));
 
         // Audit sentinels surface the offending key + field

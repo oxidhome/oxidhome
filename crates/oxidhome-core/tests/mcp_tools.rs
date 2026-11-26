@@ -2750,7 +2750,7 @@ async fn plugins_install_audit_taxonomy_stays_clean() {
 
 /// Mint a bearer carrying an extended `TokenPolicy` envelope
 /// with the constraint blob under test. `scope_json` in the
-/// store accepts either shape (legacy scope array or the
+/// store accepts either shape (bare scope array or the
 /// `{scopes, constraints}` object) — this helper always
 /// writes the extended shape so 14.4a's parse path runs.
 fn mint_bearer_with_constraint(engine: &Engine, id: &str, constraints_json: &str) -> String {
@@ -3835,7 +3835,7 @@ async fn tool_denials_record_scope_and_constraint_sentinels() {
 /// The `plugins.show` allowlist narrows the `plugins.show` tool only:
 /// the `oxidhome://plugins/{id}` resource read has always been gated by
 /// the flat `plugins:list` scope, and still is. Pins the resource the
-/// production handler authorizes, which the parity table can't see.
+/// production handler authorizes.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
     let engine = Engine::new().expect("engine");

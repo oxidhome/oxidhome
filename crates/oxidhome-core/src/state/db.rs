@@ -157,7 +157,9 @@ const INITIAL_SCHEMA: &str = "
     -- fail the write. `blob_usage` mirrors `kv_usage`: the quota check
     -- is in `blobs::write`, the triggers only keep the count.
     -- `blob_usage_update` covers in-place `size_bytes` changes; the
-    -- write path replaces rows with DELETE + INSERT today.
+    -- write path replaces rows with DELETE + INSERT today. The `mime`
+    -- CHECK is `blobs::MAX_BLOB_MIME_BYTES` (checked first in
+    -- `blobs::write` for a clean error); `octet_length` counts bytes.
     CREATE TABLE blob (
         installation_uuid TEXT NOT NULL,
         instance_id       TEXT NOT NULL,
@@ -165,7 +167,7 @@ const INITIAL_SCHEMA: &str = "
         id                TEXT NOT NULL,
         size_bytes        INTEGER NOT NULL,
         created_ms        INTEGER NOT NULL,
-        mime              TEXT,
+        mime              TEXT CHECK (mime IS NULL OR octet_length(mime) <= 256),
         PRIMARY KEY (installation_uuid, instance_id, name)
     ) WITHOUT ROWID;
 

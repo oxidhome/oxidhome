@@ -2,7 +2,7 @@
 //!
 //! A `simulated-switch` device raised to `lock` by the operator stands
 //! in for a lock (the raise is itself under test): the wildcard scope
-//! no longer reaches it, an explicit grant does (rate limited, with a
+//! doesn't reach it, an explicit grant does (rate limited, with a
 //! `warn` audit row), a grant narrowed to another device doesn't leak,
 //! and the bootstrap owner token keeps everything.
 
