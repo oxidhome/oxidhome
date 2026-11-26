@@ -8,8 +8,9 @@
 //!
 //! `allow = no deny on the chain ∧ permit(acting plugin) ∧ permit(root)`
 //!
-//! - **Denies.** The owner's deny list for the acting plugin and for
-//!   every plugin that made a `call-service` hop on the way to it
+//! - **Denies.** The owner's global deny list (`*`, every plugin),
+//!   the list for the acting plugin and the list for every plugin
+//!   that made a `call-service` hop on the way to it
 //!   ([`crate::auth::DelegationHop::caller_plugin`]). A plugin that
 //!   may not touch the alarm can't launder the call through a second
 //!   plugin. A deny matches as a token's does ([`DenyRule::matches`]);
@@ -132,7 +133,8 @@ pub fn denied_by<'a>(
         })
 }
 
-/// The acting plugin's list, then each caller's on the chain.
+/// The global list, the acting plugin's, then each caller's on the
+/// chain.
 fn chain_denied(
     ctx: &InvocationContext,
     plugin: &PluginPrincipal<'_>,

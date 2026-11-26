@@ -1022,8 +1022,9 @@ const PLUGIN_USAGE: &str = "usage: oxidhome plugin list
          plugin whose service call reaches another, may not do. Each
          entry is <action,...|*>[@<category,...>|{<service,...>}] with
          actions from service.call, state.read, blob.read and
-         event.subscribe. --reset removes the list. The daemon must be
-         stopped; it loads the list when it next starts.";
+         event.subscribe. <plugin_id> * is the global list, which
+         applies to every plugin. --reset removes the list. The daemon
+         must be stopped; it loads the list when it next starts.";
 
 /// What `oxidhome plugin` was asked to do.
 #[derive(Debug, PartialEq, Eq)]

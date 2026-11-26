@@ -6,9 +6,11 @@
 //! [`crate::auth::PLUGIN_ACTIONS`]. [`crate::auth::authorize_plugin`]
 //! applies the list of the acting plugin and of every plugin that made
 //! a hop on the way to it, whatever the plugin's manifest grants. The
-//! list is keyed by plugin id, not installation: it outlives an
-//! uninstall, so a reinstall can't shed it, and it can be set before
-//! the plugin is installed.
+//! list is keyed by plugin id, not installation, so it can be set
+//! before the plugin is installed; uninstalling the plugin deletes it,
+//! so a reinstall starts with none. One more list, keyed
+//! [`GLOBAL_PLUGIN_DENY`] (`*`), applies to every plugin, alongside
+//! each plugin's own.
 //!
 //! The table is small and loaded into memory at open; reads (every
 //! plugin decision) never touch `SQLite`, and a change applies to the
@@ -25,6 +27,16 @@ use super::db::Db;
 use super::event_log::now_unix_ms;
 use crate::auth::{DenyRule, PLUGIN_ACTIONS};
 
+/// The key of the global list, which applies to every plugin.
+pub const GLOBAL_PLUGIN_DENY: &str = "*";
+
+/// `true` for a key a deny list may have: a plugin id, or
+/// [`GLOBAL_PLUGIN_DENY`].
+#[must_use]
+pub fn is_deny_key(key: &str) -> bool {
+    key == GLOBAL_PLUGIN_DENY || oxidhome_manifest::is_plugin_id(key)
+}
+
 /// Most deny entries one plugin's list may hold.
 pub const MAX_PLUGIN_DENY_ENTRIES: usize = 32;
 
@@ -34,8 +46,8 @@ pub const MAX_PLUGIN_DENY_LISTS: usize = 1024;
 /// Why a deny list change was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PluginDenyError {
-    /// Not a plugin id.
-    #[error("`{0}` is not a plugin id (reverse-DNS, e.g. `com.example.lights`)")]
+    /// Not a plugin id (nor `*`).
+    #[error("`{0}` is not a plugin id (reverse-DNS, e.g. `com.example.lights`) or `*`")]
     BadPluginId(String),
     /// Too many entries.
     #[error("a plugin deny list holds at most {MAX_PLUGIN_DENY_ENTRIES} entries")]
@@ -180,7 +192,8 @@ impl PluginDenyStore {
         })
     }
 
-    /// The deny list of `plugin_id`, if the owner set one.
+    /// The deny list of `plugin_id` (or the global one, `*`), if the
+    /// owner set one.
     #[must_use]
     pub fn get(&self, plugin_id: &str) -> Option<PluginDenyList> {
         self.rows
@@ -190,9 +203,11 @@ impl PluginDenyStore {
             .cloned()
     }
 
-    /// The first of `plugins` whose list has an entry `refuses`
-    /// accepts, all read under one lock, so a decision never mixes two
-    /// states of the lists.
+    /// The first list with an entry `refuses` accepts: the global
+    /// list ([`GLOBAL_PLUGIN_DENY`]), then each of `plugins`'. All read
+    /// under one lock, so a decision never mixes two states of the
+    /// lists. `plugins` names at least the acting plugin, so the global
+    /// list always counts.
     pub fn first_refusing<'a>(
         &self,
         plugins: impl IntoIterator<Item = &'a str>,
@@ -202,8 +217,8 @@ impl PluginDenyStore {
         if rows.is_empty() {
             return None;
         }
-        plugins
-            .into_iter()
+        std::iter::once(GLOBAL_PLUGIN_DENY)
+            .chain(plugins)
             .find(|id| rows.get(*id).is_some_and(|list| list.iter().any(&refuses)))
     }
 
@@ -290,7 +305,7 @@ impl PluginDenyStore {
         rules: &[DenyRule],
         exists: bool,
     ) -> Result<(), PluginDenyError> {
-        if !oxidhome_manifest::is_plugin_id(plugin_id) {
+        if !is_deny_key(plugin_id) {
             return Err(PluginDenyError::BadPluginId(plugin_id.to_owned()));
         }
         if rules.len() > MAX_PLUGIN_DENY_ENTRIES {
@@ -398,6 +413,35 @@ mod tests {
                 vec![rule(); MAX_PLUGIN_DENY_ENTRIES + 1]
             ),
             Err(PluginDenyError::TooManyEntries)
+        ));
+    }
+
+    /// The global list refuses for every plugin, ahead of the
+    /// plugin's own, and survives a reopen like any other.
+    #[test]
+    fn the_global_list_applies_to_every_plugin() {
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        let store = PluginDenyStore::open(Arc::clone(&db)).expect("open");
+        let refuses = |d: &DenyRule| d.actions.contains(Action::StateRead);
+        assert_eq!(store.first_refusing(["com.example.a"], refuses), None);
+        store.set("com.example.a", vec![rule()]).expect("set");
+        assert_eq!(
+            store.first_refusing(["com.example.a"], refuses),
+            Some("com.example.a")
+        );
+        store.set(GLOBAL_PLUGIN_DENY, vec![rule()]).expect("set");
+        let store = PluginDenyStore::open(db).expect("reopen");
+        assert_eq!(
+            store.first_refusing(["com.example.a"], refuses),
+            Some(GLOBAL_PLUGIN_DENY)
+        );
+        assert_eq!(
+            store.first_refusing(["com.example.b"], refuses),
+            Some(GLOBAL_PLUGIN_DENY)
+        );
+        assert!(matches!(
+            store.set("**", vec![rule()]),
+            Err(PluginDenyError::BadPluginId(_))
         ));
     }
 

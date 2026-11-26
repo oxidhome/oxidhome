@@ -1035,7 +1035,8 @@ impl IntoResponse for PluginDenyApiError {
 }
 
 /// `GET /api/v1/plugins/{plugin_id}/deny` — the owner's deny list over
-/// the plugin (`deny` empty when none). `policy.manage`.
+/// the plugin (`deny` empty when none); `plugin_id` `*` is the global
+/// list over every plugin. `policy.manage`.
 ///
 /// # Errors
 /// - `400` not a plugin id.
@@ -1061,7 +1062,9 @@ async fn get_plugin_deny(
 /// plugin whose call reaches another, may not do (`service.call`,
 /// `state.read`, `blob.read`, `event.subscribe`), whatever its manifest
 /// grants. The plugin need not be installed; running instances apply
-/// it at once. `policy.manage`: the owner only.
+/// it at once; uninstalling the plugin deletes the list. `plugin_id`
+/// `*` sets the global list, which applies to every plugin.
+/// `policy.manage`: the owner only.
 ///
 /// # Errors
 /// - `400` a bad body, plugin id or entry (an action a plugin doesn't

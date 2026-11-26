@@ -11,7 +11,8 @@
 //! fenced off).
 //!
 //! A list is keyed by plugin id and may name a plugin that isn't
-//! installed. It applies to the next decision of every running
+//! installed; uninstalling the plugin deletes it. The key `*` is the
+//! global list, which applies to every plugin. A list applies to the next decision of every running
 //! instance: no restart.
 
 use serde::Serialize;
@@ -20,6 +21,7 @@ use super::bootstrap::{audited, audited_call};
 use super::network_admin::GrantActor;
 use super::token_admin::{AdminError, SelectorSpec};
 use crate::auth::DenyRule;
+use crate::state::plugin_deny::is_deny_key;
 use crate::state::{AuditLog, PluginDenyError, PluginDenyStore};
 
 /// Audit `path` of a deny list change:
@@ -123,7 +125,7 @@ pub fn plugin_deny(
     store: &PluginDenyStore,
     plugin_id: String,
 ) -> Result<PluginDenyView, PluginDenyAdminError> {
-    if !oxidhome_manifest::is_plugin_id(&plugin_id) {
+    if !is_deny_key(&plugin_id) {
         return Err(PluginDenyError::BadPluginId(plugin_id).into());
     }
     let rules = store.get(&plugin_id);
@@ -148,7 +150,7 @@ pub async fn change_plugin_deny(
     specs: Option<Vec<SelectorSpec>>,
 ) -> Result<PluginDenyView, PluginDenyAdminError> {
     let rules = plugin_deny_rules(specs.as_deref().unwrap_or_default())?;
-    if !oxidhome_manifest::is_plugin_id(&plugin_id) {
+    if !is_deny_key(&plugin_id) {
         return Err(PluginDenyError::BadPluginId(plugin_id).into());
     }
     // Its own task: a client going away can't cut the write short
@@ -220,7 +222,7 @@ pub fn set_plugin_deny_offline(
     specs: Option<&[SelectorSpec]>,
 ) -> anyhow::Result<PluginDenyView> {
     let rules = plugin_deny_rules(specs.unwrap_or_default())?;
-    if !oxidhome_manifest::is_plugin_id(plugin_id) {
+    if !is_deny_key(plugin_id) {
         return Err(PluginDenyError::BadPluginId(plugin_id.to_owned()).into());
     }
     let by = GrantActor {

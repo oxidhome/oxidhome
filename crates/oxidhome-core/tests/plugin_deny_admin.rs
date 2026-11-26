@@ -241,6 +241,46 @@ async fn the_owner_sets_and_resets_a_deny_list_over_rest() {
     );
 }
 
+/// The global list (`*`) is set, read and reset like a plugin's, and
+/// the engine applies it to every plugin.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_sets_the_global_deny_list_over_rest() {
+    let f = fixture("plugin-deny-global");
+    let uri = "/api/v1/plugins/*/deny";
+    let body = json!({"deny": lock_reads()});
+    let (status, _) = api_status(&f.router, &f.wildcard, "PUT", uri, body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, got) = api_status(&f.router, &f.owner, "PUT", uri, body).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got, json!({"plugin_id": "*", "deny": lock_reads()}));
+    let shown = api_json(&f.router, &f.owner, "GET", uri, Body::empty()).await;
+    assert_eq!(shown["deny"], lock_reads());
+    let lock = oxidhome_core::auth::Resource::device(
+        "dev-a1b2c3d4e5f60718",
+        oxidhome_core::auth::DeviceClass::of(oxidhome_core::auth::DeviceCategory::Lock),
+    );
+    let refused = oxidhome_core::auth::denied_by(
+        &f.engine.plugin_denies(),
+        ["com.example.any"],
+        oxidhome_core::auth::Action::StateRead,
+        &lock,
+    );
+    assert_eq!(
+        refused,
+        Some(oxidhome_core::auth::Reason::PluginDenied { plugin: "*".into() })
+    );
+    let (status, got) = api_status(&f.router, &f.owner, "DELETE", uri, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(f.engine.plugin_denies().get("*").is_none());
+    let paths = deny_audit_paths(&f.engine);
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(paths[0].starts_with("api.plugin.deny.set/*/"), "{paths:?}");
+    assert!(
+        paths[1].starts_with("api.plugin.deny.reset/*/"),
+        "{paths:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_owner_sets_and_resets_a_deny_list_over_connect() {
     let f = fixture("plugin-deny-connect");

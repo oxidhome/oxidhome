@@ -721,7 +721,8 @@ pub trait PluginsService: Send + Sync + 'static {
         >,
     > + Send;
     /// A plugin's deny list (H6 slice 5), empty when the owner set none.
-    /// `policy.manage`. Same shape as `GET /api/v1/plugins/{plugin_id}/deny`.
+    /// `plugin_id` `*` names the global list, which applies to every
+    /// plugin. `policy.manage`. Same shape as `GET /api/v1/plugins/{plugin_id}/deny`.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -747,8 +748,9 @@ pub trait PluginsService: Send + Sync + 'static {
     /// Replace a plugin's deny list: what the plugin, or any plugin whose
     /// call reaches another, may not do (`service.call`, `state.read`,
     /// `blob.read`, `event.subscribe`), whatever its manifest grants. The
-    /// plugin need not be installed; running instances apply it at once.
-    /// An empty list is refused (a misspelled field decodes as one):
+    /// plugin need not be installed; running instances apply it at once;
+    /// uninstalling the plugin deletes its list. `plugin_id` `*` sets the
+    /// global list, which applies to every plugin. An empty list is refused (a misspelled field decodes as one):
     /// `ResetPluginDeny` removes a list. `policy.manage`. Same shape as
     /// `PUT /api/v1/plugins/{plugin_id}/deny`.
     ///

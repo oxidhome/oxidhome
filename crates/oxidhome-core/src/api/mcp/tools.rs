@@ -326,8 +326,9 @@ pub(super) fn list_tools() -> Vec<Tool> {
              Entries take the token deny shape (`actions` from `service.call`, \
              `state.read`, `blob.read`, `event.subscribe`, or `*` for all four; \
              optionally narrowed by `category`, `devices` or `services`). The plugin \
-             need not be installed; running instances apply it at once. An empty list \
-             removes it. Returns the list. Owner only (`policy.manage`); audited with \
+             need not be installed; running instances apply it at once; uninstalling it \
+             deletes the list. `plugin_id` `*` is the global list, which applies to every \
+             plugin. An empty list removes it. Returns the list. Owner only (`policy.manage`); audited with \
              the old and new list.",
             Arc::new(plugins_set_deny_schema()),
         )
@@ -2842,7 +2843,7 @@ fn plugins_set_deny_schema() -> serde_json::Map<String, JsonValue> {
             "plugin_id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Plugin id (reverse-DNS) whose deny list to set; need not be installed.",
+                "description": "Plugin id (reverse-DNS) whose deny list to set, or `*` for the global list over every plugin; need not be installed.",
             },
             "deny": {
                 "type": "array",
@@ -2877,7 +2878,7 @@ fn plugins_reset_deny_schema() -> serde_json::Map<String, JsonValue> {
             "plugin_id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Plugin id whose deny list to remove.",
+                "description": "Plugin id whose deny list to remove, or `*` for the global list.",
             }
         }
     });
