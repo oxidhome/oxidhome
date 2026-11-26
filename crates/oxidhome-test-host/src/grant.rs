@@ -151,7 +151,7 @@ mod tests {
                 sensitive: Vec::new(),
             }],
             reads_event_bytes: true,
-            sensitive_event_bytes: Vec::new(),
+            sensitive_event_bytes: vec!["camera".into()],
         }
     }
 
@@ -177,6 +177,10 @@ mod tests {
         let excess = grant_excess(&req, &wider);
         assert_eq!(excess.len(), 1, "{excess:?}");
         assert!(excess[0].contains("reads_state[0]"));
+        // So must a sensitive category on it.
+        let mut camera = req.clone();
+        camera.reads_state[0].sensitive = vec!["camera".into()];
+        assert_eq!(grant_excess(&req, &camera).len(), 1);
         let mut none = req.clone();
         none.reads_state.clear();
         assert_eq!(grant_excess(&req, &none), Vec::<String>::new());
@@ -203,7 +207,7 @@ mod tests {
         let req = CapabilitiesSection::default();
         let wide = requested();
         let excess = grant_excess(&req, &wide);
-        assert_eq!(excess.len(), 10, "{excess:?}");
+        assert_eq!(excess.len(), 11, "{excess:?}");
     }
 
     #[test]

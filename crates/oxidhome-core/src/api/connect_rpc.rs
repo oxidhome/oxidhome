@@ -2232,42 +2232,110 @@ pub fn axum_service(engine: Engine) -> axum::Router {
 /// positional array (`["/dir", ["camera"]]` as an `InstallPlugin`
 /// approving camera, `[["state.read"]]` as a deny entry), so a JSON
 /// request that isn't an object, or holds an array inside an array, is
-/// refused `invalid_argument`. An interceptor, so it sees the body
-/// read under the service's limits and unframed, on every transport.
+/// refused `invalid_argument`, as is one the check can't finish (bad
+/// JSON, nesting past `serde_json`'s depth limit). An interceptor, so it
+/// sees the body read under the service's limits and unframed, on every
+/// transport; a streaming pass that keeps nothing it reads.
 struct JsonObjectsOnly;
 
 impl JsonObjectsOnly {
     fn check(ctx: &RequestContext, payload: &connectrpc::Payload) -> Result<(), ConnectError> {
-        if payload.format() != connectrpc::CodecFormat::Json {
+        // An empty body is the empty message.
+        if payload.format() != connectrpc::CodecFormat::Json
+            || payload.bytes().iter().all(u8::is_ascii_whitespace)
+        {
             return Ok(());
         }
-        let refuse = || {
-            rpc_err(
-                ctx,
-                ConnectError::invalid_argument(
-                    "a JSON request must be an object, with no positional (array) messages",
-                ),
-            )
-        };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload.bytes()) else {
-            // Not JSON: the decoder answers it.
+        if json_message_shaped(payload.bytes()) {
             return Ok(());
-        };
-        if !value.is_object() || has_nested_array(&value) {
-            return Err(refuse());
         }
-        Ok(())
+        Err(rpc_err(
+            ctx,
+            ConnectError::invalid_argument(
+                "a JSON request must be an object, with no positional (array) messages",
+            ),
+        ))
     }
 }
 
-/// `true` when an array holds an array, anywhere in `value`.
-fn has_nested_array(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Array(items) => {
-            items.iter().any(|v| v.is_array() || has_nested_array(v))
+/// `bytes` is a JSON object with no array directly in an array.
+fn json_message_shaped(bytes: &[u8]) -> bool {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    serde::de::DeserializeSeed::deserialize(JsonShape::Root, &mut de)
+        .and_then(|()| de.end())
+        .is_ok()
+}
+
+/// Where a JSON value sits, for [`JsonObjectsOnly`].
+#[derive(Clone, Copy)]
+enum JsonShape {
+    /// The message: an object.
+    Root,
+    /// A field's value.
+    Value,
+    /// An array's element: not an array.
+    Element,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for JsonShape {
+    type Value = ();
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for JsonShape {
+    type Value = ();
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Root => "an object",
+            Self::Value | Self::Element => "a JSON value, no array in an array",
+        })
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            map.next_value_seed(Self::Value)?;
         }
-        serde_json::Value::Object(map) => map.values().any(has_nested_array),
-        _ => false,
+        Ok(())
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if !matches!(self, Self::Value) {
+            return Err(serde::de::Error::invalid_type(
+                serde::de::Unexpected::Seq,
+                &self,
+            ));
+        }
+        while seq.next_element_seed(Self::Element)?.is_some() {}
+        Ok(())
+    }
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Bool(v))
+    }
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Signed(v))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Unsigned(v))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Float(v))
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Other("a string"))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        self.scalar(serde::de::Unexpected::Unit)
+    }
+}
+
+impl JsonShape {
+    /// A scalar is fine anywhere but the root.
+    fn scalar<E: serde::de::Error>(self, what: serde::de::Unexpected<'_>) -> Result<(), E> {
+        if matches!(self, Self::Root) {
+            Err(E::invalid_type(what, &self))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2629,5 +2697,40 @@ mod command_report_tests {
         let full = state_value(command_report_to_proto(report(), true));
         assert_eq!(full, Some(value::Kind::BytesVal(vec![1, 2, 3])));
         assert_ne!(narrow, full);
+    }
+}
+
+#[cfg(test)]
+mod json_shape_tests {
+    use super::*;
+
+    /// H6 slice 5b: what the Connect JSON shape check lets through.
+    #[test]
+    fn json_messages_are_objects_without_positional_messages() {
+        for ok in [
+            &b"{}"[..],
+            br#"{"sourceDir": "/d", "approveSensitive": ["camera"]}"#,
+            br#"{"deny": [{"actions": ["state.read"]}], "n": 1, "f": 1.5, "b": true, "z": null}"#,
+            br#"{"a": {"b": {"c": [1, "x", {"d": []}]}}}"#,
+        ] {
+            assert!(json_message_shaped(ok), "{}", String::from_utf8_lossy(ok));
+        }
+        let deep = format!("{{\"a\": {}0{}}}", "{\"b\": ".repeat(200), "}".repeat(200));
+        for bad in [
+            &br#"["/d", ["camera"]]"#[..],
+            br#"{"deny": [["state.read"]]}"#,
+            b"[0, 0, 0]",
+            b"1",
+            b"\"s\"",
+            b"{\"a\": 1",
+            b"{} {}",
+            deep.as_bytes(),
+        ] {
+            assert!(
+                !json_message_shaped(bad),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 }
