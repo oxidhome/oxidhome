@@ -1406,7 +1406,7 @@ async fn events_resource_reports_pruned_cursor() {
 }
 
 /// H6 slice 2: a camera instance's blobs are camera bytes. The
-/// wildcard scope (and plain `blobs:read`) no longer reaches them; a
+/// wildcard scope (and plain `blobs:read`) doesn't reach them; a
 /// token with an explicit `camera` grant does, and the read leaves a
 /// `warn` audit row.
 #[tokio::test(flavor = "current_thread")]

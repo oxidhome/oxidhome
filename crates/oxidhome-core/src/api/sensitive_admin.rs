@@ -17,7 +17,7 @@
 //!
 //! [`sensitive_access_report`] is the startup check: it names every
 //! live non-owner token whose `*`, `devices:command` or `blobs:read`
-//! scope no longer reaches the sensitive categories it used to.
+//! scope spans sensitive devices that no grant of its own covers.
 
 use std::path::Path;
 
@@ -42,19 +42,21 @@ const MAX_DEVICE_PATTERN_LEN: usize = 64;
 /// Most device patterns one grant may carry.
 const MAX_DEVICE_PATTERNS: usize = 64;
 
-/// One live token whose scopes lost sensitive reach in slice 2.
+/// One live token whose broad scopes span sensitive categories it
+/// holds no grant for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SensitiveGap {
     /// Token id.
     pub token_id: String,
     /// Token label.
     pub label: String,
-    /// Categories its scopes used to reach and no grant now covers on
-    /// every device.
+    /// Categories its scopes span and no grant covers on every device
+    /// they reach.
     pub missing: SensitiveSet,
 }
 
-/// Which sensitive categories `scopes` reached before slice 2.
+/// Which sensitive categories `scopes` would reach if a scope alone
+/// were enough.
 fn reached_by(scopes: &[String]) -> SensitiveSet {
     let has = |s: &str| scopes.iter().any(|x| x == "*" || x == s);
     let mut set = SensitiveSet::empty();
@@ -87,7 +89,7 @@ pub fn sensitive_gaps<S: std::hash::BuildHasher>(
         .filter(|r| r.revoked_ms.is_none() && !r.owner)
         .filter_map(|r| {
             let policy = parse_policy(&r.scope_json)?;
-            // The devices a command could reach before: the token's
+            // The devices its commands can reach: the token's
             // `device.send_command` allowlist, if it has one.
             let command_devices = policy
                 .constraints
@@ -152,10 +154,10 @@ fn in_id_space(pattern: &str) -> &str {
     }
 }
 
-/// Startup check (H6 slice 2, Q8): log at `warn` every live non-owner
-/// token whose `*` / `devices:command` / `blobs:read` scope no longer
-/// reaches a lock, opener, alarm or camera bytes, and how to restore
-/// it. Returns what it logged.
+/// Startup check: log at `warn` every live non-owner token whose
+/// `*` / `devices:command` / `blobs:read` scope spans locks, openers,
+/// alarms or camera bytes without a sensitive grant for them, and how
+/// to grant one. Returns what it logged.
 pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
     let records = match tokens.list() {
         Ok(r) => r,
@@ -192,8 +194,8 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             token_id = %gap.token_id,
             label = %gap.label,
             missing = %gap.missing.to_csv(),
-            "token's scopes no longer reach sensitive categories (lock, opener, alarm commands and \
-             camera bytes need an explicit grant); restore with \
+            "token has broad scopes but no grant for these sensitive categories, so it can't \
+             command locks, openers or alarms or read camera bytes; grant one with \
              `oxidhome token grant-sensitive <token-id> <category>`",
         );
     }
@@ -631,8 +633,8 @@ mod tests {
         assert!(gaps[0].missing.contains(SensitiveCategory::Lock));
     }
 
-    /// A token that could only command some devices is fully restored
-    /// by a grant naming those devices.
+    /// A token that can only command some devices is fully covered by
+    /// a grant naming those devices.
     #[test]
     fn a_grant_matching_the_command_allowlist_closes_the_gap() {
         let (tokens, audit) = stores();
@@ -720,7 +722,7 @@ mod tests {
             .expect("opener still missing");
         assert!(!gap.missing.contains(SensitiveCategory::Lock), "{gap:?}");
 
-        // An empty allowlist reached no device at all.
+        // An empty allowlist reaches no device at all.
         let none = tokens
             .create(
                 "none",

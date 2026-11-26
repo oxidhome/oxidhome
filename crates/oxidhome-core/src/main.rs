@@ -239,7 +239,7 @@ async fn run_mode() -> anyhow::Result<()> {
     // the secret is on disk before its row is committed).
     reconcile_admin_token_files(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
     ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), &state_dir)?;
-    // H6 slice 2 (Q8): warn about tokens that lost sensitive reach.
+    // Warn about broad tokens without grants for sensitive categories.
     sensitive_access_report(&engine.auth_tokens());
 
     // Optional dev-time plugin start. Preserves the Phase-6 demo
