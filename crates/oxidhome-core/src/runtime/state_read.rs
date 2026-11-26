@@ -693,6 +693,7 @@ mod tests {
             capabilities: caps.iter().map(|c| (*c).into()).collect(),
             devices: devices.iter().map(|d| (*d).into()).collect(),
             bytes,
+            sensitive: Vec::new(),
         }
     }
 
@@ -708,6 +709,7 @@ mod tests {
             reads_state: grants,
             subscribes_events: false,
             reads_event_bytes: false,
+            camera_event_bytes: false,
             denies: &denies,
         };
         let ctx = InvocationContext::host_origin(me);
@@ -782,6 +784,7 @@ mod tests {
             reads_state: &grants,
             subscribes_events: false,
             reads_event_bytes: false,
+            camera_event_bytes: false,
             denies: &denies,
         };
         let e = entry("other", "p.other", "dev-1", "switch");

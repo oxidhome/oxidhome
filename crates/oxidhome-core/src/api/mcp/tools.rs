@@ -249,7 +249,9 @@ pub(super) fn list_tools() -> Vec<Tool> {
              token holding this scope can effectively load arbitrary `.wasm` onto the \
              host. `source_dir` MUST already exist on the daemon-local filesystem; \
              the MCP endpoint is loopback-only, so this mirrors REST's trust model \
-             for the same operation.",
+             for the same operation. A manifest requesting a sensitive grant (camera \
+             bytes) installs only when `approve_sensitive` lists every category it \
+             requests, which is owner only (`policy.manage`).",
             Arc::new(plugins_install_schema()),
         )
         .with_title("Install plugin")
@@ -3386,6 +3388,11 @@ fn plugins_install_schema() -> serde_json::Map<String, JsonValue> {
                 "type": "string",
                 "minLength": 1,
                 "description": "Absolute path (daemon-local, no `..` components) to the staged plugin directory. Must contain a `manifest.toml` naming the canonical `plugin_id`; the tool recursively copies the whole directory into `<state_dir>/plugins/<plugin_id>/`.",
+            },
+            "approve_sensitive": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Sensitive categories approved for the plugin's grants (only `camera` exists for plugins). A manifest requesting one not listed is refused (`sensitive_not_approved`, naming them) and nothing is installed. Approving any is owner only (`policy.manage`).",
             }
         }
     });
@@ -3399,6 +3406,8 @@ fn plugins_install_schema() -> serde_json::Map<String, JsonValue> {
 #[serde(deny_unknown_fields)]
 struct PluginsInstallArgs {
     source_dir: String,
+    #[serde(default)]
+    approve_sensitive: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -3406,6 +3415,7 @@ struct PluginsInstallBody {
     plugin_id: String,
     version: String,
     installed_path: String,
+    sensitive: Vec<String>,
 }
 
 // Linear top-to-bottom decision flow (parse → absolute
@@ -3450,6 +3460,19 @@ async fn plugins_install_call(
         ));
     }
 
+    // H6 slice 5b: approving a sensitive grant is the owner's.
+    if let Err(e) = crate::api::sensitive_admin::check_sensitive_approval(&args.approve_sensitive) {
+        return ToolOutcome::InvalidParams(e);
+    }
+    if !args.approve_sensitive.is_empty()
+        && let Err(required) = authorize(invocation, Action::PolicyManage, &Resource::Host)
+            .into_result()
+            .map(drop)
+    {
+        return ToolOutcome::Denied { required };
+    }
+    let approved = args.approve_sensitive;
+
     // Phase 14.4d: the gate authorizes `plugin.install` on the
     // manifest-derived plugin id, which applies the token's
     // `plugins.install` constraint if it carries one. It runs
@@ -3466,15 +3489,19 @@ async fn plugins_install_call(
     // FS + SQL work.
     let installed_registry = engine.installed_plugins();
     let join = tokio::task::spawn_blocking(move || {
-        installed_registry.install_gated(&source, |plugin_id| {
-            authorize(
-                &gate_ctx,
-                Action::PluginInstall,
-                &Resource::plugin(plugin_id),
-            )
-            .into_result()
-            .map(drop)
-        })
+        installed_registry.install_gated(
+            &source,
+            |plugin_id| {
+                authorize(
+                    &gate_ctx,
+                    Action::PluginInstall,
+                    &Resource::plugin(plugin_id),
+                )
+                .into_result()
+                .map(drop)
+            },
+            &approved,
+        )
     })
     .await;
 
@@ -3558,6 +3585,23 @@ async fn plugins_install_call(
                 domain_kind: None,
             };
         }
+        Err(crate::state::InstallError::SensitiveNotApproved {
+            plugin_id,
+            categories,
+        }) => {
+            return ToolOutcome::ExecErr {
+                message: format!(
+                    "plugin `{plugin_id}` requests sensitive grants that were not approved: {}",
+                    categories.join(", ")
+                ),
+                structured: Some(json!({
+                    "kind": "sensitive_not_approved",
+                    "plugin_id": plugin_id,
+                    "categories": categories,
+                })),
+                domain_kind: None,
+            };
+        }
         Err(crate::state::InstallError::NoPluginsRoot) => {
             return ToolOutcome::ExecErr {
                 message: "install requires a state-dir-backed engine".into(),
@@ -3585,6 +3629,7 @@ async fn plugins_install_call(
 
     let body = PluginsInstallBody {
         plugin_id: installed.plugin_id.to_string(),
+        sensitive: installed.sensitive_grants(),
         version: installed.version,
         installed_path: installed.path.display().to_string(),
     };

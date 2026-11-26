@@ -210,7 +210,43 @@ pub struct CapabilitiesSection {
     /// flag. The effective value is requested ∧ granted.
     #[serde(default)]
     pub reads_event_bytes: bool,
+    /// H6 slice 5: the sensitive categories of event bytes the plugin
+    /// may receive, live (`on-event`) and from history
+    /// (`read-events`, on top of `reads_event_bytes`). Only
+    /// `"camera"` exists for bytes: a camera device's `bytes-val`
+    /// fields, and every `bytes-val` from an instance that has
+    /// registered a camera. No other grant covers them, so without
+    /// it they become a withheld marker. Needs `subscribes_events`.
+    /// Shown separately at install and granted only when the owner
+    /// approves it. The effective list is requested ∩ granted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_event_bytes: Vec<String>,
 }
+
+impl CapabilitiesSection {
+    /// Every sensitive category this section requests
+    /// (`reads_state[].sensitive`, `sensitive_event_bytes`), sorted and
+    /// without duplicates: what the owner approves at install.
+    #[must_use]
+    pub fn sensitive_requests(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .reads_state
+            .iter()
+            .flat_map(|g| g.sensitive.iter())
+            .chain(self.sensitive_event_bytes.iter())
+            .cloned()
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// The sensitive categories a plugin's *read* grants can name
+/// (`reads_state[].sensitive`, `sensitive_event_bytes`): reading a
+/// lock's state isn't sensitive, its commands are, and plugins send
+/// no device commands.
+pub const SENSITIVE_READ_CATEGORIES: &[&str] = &["camera"];
 
 /// H2: one selector inside `[capabilities] reads_state`.
 ///
@@ -220,6 +256,7 @@ pub struct CapabilitiesSection {
 /// capabilities = ["switch"]                  # capability keys, or ["*"]
 /// devices      = ["*"]                       # device ids, or ["*"] (default)
 /// bytes        = false                       # see `bytes-val` fields (default false)
+/// sensitive    = []                          # ["camera"]: camera bytes too (needs bytes)
 /// ```
 ///
 /// An entry is readable when some grant matches its owner plugin,
@@ -245,6 +282,14 @@ pub struct StateGrant {
     /// Whether `bytes-val` fields are returned as is.
     #[serde(default)]
     pub bytes: bool,
+    /// H6 slice 5: sensitive categories of bytes this entry also
+    /// covers (only `"camera"`: a camera device's bytes, or any bytes
+    /// of an instance that has registered a camera). Needs
+    /// `bytes = true`. Without it, `"*"` selectors never release
+    /// camera bytes. Shown separately at install and granted only
+    /// when the owner approves it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive: Vec<String>,
 }
 
 fn any_list() -> Vec<String> {

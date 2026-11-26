@@ -298,6 +298,17 @@ pub struct Plugin {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
     pub network: ::buffa::MessageField<NetworkGrants, ::buffa::Inline<NetworkGrants>>,
+    /// The sensitive categories the installation's grant holds (H6 slice
+    /// 5b), approved by the owner at install. Empty for a plugin without
+    /// any, and for the running-but-not-installed case.
+    ///
+    /// Field 6: `sensitive`
+    #[serde(
+        rename = "sensitive",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -310,6 +321,7 @@ impl ::core::fmt::Debug for Plugin {
             .field("version", &self.version)
             .field("instance_count", &self.instance_count)
             .field("network", &self.network)
+            .field("sensitive", &self.sensitive)
             .finish()
     }
 }
@@ -373,6 +385,9 @@ impl ::buffa::Message for Plugin {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -402,6 +417,9 @@ impl ::buffa::Message for Plugin {
                 buf,
             );
             self.network.write_to(__cache, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -458,6 +476,17 @@ impl ::buffa::Message for Plugin {
                     ctx,
                 )?;
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.sensitive.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -471,6 +500,7 @@ impl ::buffa::Message for Plugin {
         self.version = ::core::option::Option::None;
         self.instance_count = 0u32;
         self.network = ::buffa::MessageField::none();
+        self.sensitive.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -717,6 +747,20 @@ pub struct InstallPluginRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub source_dir: ::buffa::alloc::string::String,
+    /// The sensitive categories the owner approves for the plugin's
+    /// grants (H6 slice 5b; only `camera` exists for plugins today). A
+    /// manifest requesting one not listed is refused with
+    /// `permission_denied` naming the categories, and nothing is
+    /// installed. Approving any needs `policy.manage`.
+    ///
+    /// Field 2: `approve_sensitive`
+    #[serde(
+        rename = "approveSensitive",
+        alias = "approve_sensitive",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub approve_sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -725,6 +769,7 @@ impl ::core::fmt::Debug for InstallPluginRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("InstallPluginRequest")
             .field("source_dir", &self.source_dir)
+            .field("approve_sensitive", &self.approve_sensitive)
             .finish()
     }
 }
@@ -758,6 +803,9 @@ impl ::buffa::Message for InstallPluginRequest {
         if !self.source_dir.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.source_dir) as u64;
         }
+        for v in &self.approve_sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -770,6 +818,9 @@ impl ::buffa::Message for InstallPluginRequest {
         use ::buffa::Enumeration as _;
         if !self.source_dir.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.source_dir, buf);
+        }
+        for v in &self.approve_sensitive {
+            ::buffa::types::put_string_field(2u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -791,6 +842,17 @@ impl ::buffa::Message for InstallPluginRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.source_dir, buf)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.approve_sensitive.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -800,6 +862,7 @@ impl ::buffa::Message for InstallPluginRequest {
     }
     fn clear(&mut self) {
         self.source_dir.clear();
+        self.approve_sensitive.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -863,6 +926,15 @@ pub struct InstallPluginResponse {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub installed_path: ::buffa::alloc::string::String,
+    /// The sensitive categories the plugin's grant holds.
+    ///
+    /// Field 4: `sensitive`
+    #[serde(
+        rename = "sensitive",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -873,6 +945,7 @@ impl ::core::fmt::Debug for InstallPluginResponse {
             .field("plugin_id", &self.plugin_id)
             .field("version", &self.version)
             .field("installed_path", &self.installed_path)
+            .field("sensitive", &self.sensitive)
             .finish()
     }
 }
@@ -914,6 +987,9 @@ impl ::buffa::Message for InstallPluginResponse {
                 += 1u64
                     + ::buffa::types::string_encoded_len(&self.installed_path) as u64;
         }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -932,6 +1008,9 @@ impl ::buffa::Message for InstallPluginResponse {
         }
         if !self.installed_path.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.installed_path, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -967,6 +1046,17 @@ impl ::buffa::Message for InstallPluginResponse {
                 )?;
                 ::buffa::types::merge_string(&mut self.installed_path, buf)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.sensitive.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -978,6 +1068,7 @@ impl ::buffa::Message for InstallPluginResponse {
         self.plugin_id.clear();
         self.version.clear();
         self.installed_path.clear();
+        self.sensitive.clear();
         self.__buffa_unknown_fields.clear();
     }
 }

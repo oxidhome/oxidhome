@@ -192,6 +192,14 @@ impl InstalledPlugin {
     pub fn network_grants(&self) -> NetworkGrants {
         NetworkGrants::new(&self.requested_network, &self.granted_capabilities.network)
     }
+
+    /// The sensitive categories this installation's grant holds (H6
+    /// slice 5b): what the owner approved at install. A load narrows
+    /// them further to what the manifest still requests.
+    #[must_use]
+    pub fn sensitive_grants(&self) -> Vec<String> {
+        self.granted_capabilities.sensitive_requests()
+    }
 }
 
 /// C5 review F3 + round-4 F2 + Phase 13 round-3 F2: compute a
@@ -553,7 +561,9 @@ fn read_no_follow_within_bounded(
 /// the other set-shaped fields (`declares_devices`,
 /// `declares_services`) intersect on equality; quotas take the
 /// minimum (so does `script_sandboxes`); `subscribes_events` and
-/// `reads_event_bytes` are a boolean AND.
+/// `reads_event_bytes` are a boolean AND; `sensitive_event_bytes`
+/// and `reads_state` (whose entries carry their `sensitive`
+/// categories) intersect on equality.
 ///
 /// **`consumes_services` is NOT intersected here** (H10 round-4).
 /// The requested × granted cross-product grows O(N²) in narrowed
@@ -589,6 +599,10 @@ pub fn effective_capabilities(
         script_sandboxes: requested.script_sandboxes.min(granted.script_sandboxes),
         reads_state: intersect_by_eq(&requested.reads_state, &granted.reads_state),
         reads_event_bytes: requested.reads_event_bytes && granted.reads_event_bytes,
+        sensitive_event_bytes: intersect_by_eq(
+            &requested.sensitive_event_bytes,
+            &granted.sensitive_event_bytes,
+        ),
     }
 }
 
@@ -784,6 +798,20 @@ pub enum InstallError {
     /// internal error rather than an operator-fixable I/O issue.
     #[error("persisting installation identity: {0}")]
     Persistence(#[from] rusqlite::Error),
+    /// H6 slice 5b: the manifest requests sensitive grants the
+    /// install request did not approve. REST maps to `403` with the
+    /// categories, Connect to `permission_denied`. Nothing was
+    /// installed; resubmit approving them (`policy.manage`).
+    #[error(
+        "plugin {plugin_id} requests sensitive grants that were not approved: {}",
+        categories.join(", ")
+    )]
+    SensitiveNotApproved {
+        /// The plugin.
+        plugin_id: String,
+        /// The requested categories not approved.
+        categories: Vec<String>,
+    },
 }
 
 /// Phase 14.4d: crate-private wrapper around [`InstallError`]
@@ -1745,11 +1773,29 @@ impl InstalledPluginRegistry {
     // away from the FS steps would obscure the ordering guarantee
     // the C1b review F3 fixup depends on.
     pub fn install(&self, source_dir: &Path) -> Result<InstalledPlugin, InstallError> {
+        self.install_approved(source_dir, &[])
+    }
+
+    /// [`Self::install`] with the sensitive categories the owner
+    /// approved (H6 slice 5b). A manifest requesting a sensitive grant
+    /// (`reads_state[].sensitive`, `sensitive_event_bytes`) installs
+    /// only when every category it requests is approved
+    /// ([`InstallError::SensitiveNotApproved`] otherwise, before any
+    /// side effect); the grant then holds them as requested.
+    ///
+    /// # Errors
+    ///
+    /// See [`InstallError`].
+    pub fn install_approved(
+        &self,
+        source_dir: &Path,
+        approved_sensitive: &[String],
+    ) -> Result<InstalledPlugin, InstallError> {
         // Pre-14.4d shape: no gate, `InstallError` return type
         // — every existing caller (REST + Connect + tests)
         // stays untouched. `install_gated` is the
         // constraint-checking variant the MCP tool uses.
-        match self.install_gated(source_dir, |_| Ok(())) {
+        match self.install_gated(source_dir, |_| Ok(()), approved_sensitive) {
             Ok(installed) => Ok(installed),
             Err(GatedInstallError::Install(err)) => Err(err),
             // Unreachable: the no-op gate returns `Ok(())`.
@@ -1782,6 +1828,7 @@ impl InstalledPluginRegistry {
         &self,
         source_dir: &Path,
         id_gate: F,
+        approved_sensitive: &[String],
     ) -> Result<InstalledPlugin, GatedInstallError>
     where
         F: FnOnce(&str) -> Result<(), &'static str>,
@@ -1931,6 +1978,24 @@ impl InstalledPluginRegistry {
                     "staged manifest plugin.id {:?} disagrees with source plugin.id {:?}",
                     staged_manifest.plugin.id, plugin_id
                 ),
+            }
+            .into());
+        }
+
+        // H6 slice 5b: a sensitive grant the staged manifest requests
+        // (the one the grant is derived from) needs the owner's
+        // approval, or nothing is installed.
+        let unapproved: Vec<String> = staged_manifest
+            .capabilities
+            .sensitive_requests()
+            .into_iter()
+            .filter(|c| !approved_sensitive.contains(c))
+            .collect();
+        if !unapproved.is_empty() {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(InstallError::SensitiveNotApproved {
+                plugin_id,
+                categories: unapproved,
             }
             .into());
         }
@@ -2544,6 +2609,9 @@ pub struct OfflinePlugin {
     /// run the installation (it quarantines it, or tombstones the row
     /// when the package is gone).
     pub status: Result<(String, NetworkGrants), String>,
+    /// The sensitive categories the installation's grant holds (H6
+    /// slice 5b), as approved at install.
+    pub sensitive: Vec<String>,
 }
 
 /// List the live installations under `plugins_root` with their network
@@ -2588,6 +2656,7 @@ pub fn list_installations_offline(
                 plugin_id,
                 installation_uuid: row.installation_uuid.to_string(),
                 status,
+                sensitive: row.granted_capabilities.sensitive_requests(),
             }
         })
         .collect();
@@ -2598,6 +2667,7 @@ pub fn list_installations_offline(
                 plugin_id,
                 installation_uuid: uuid.to_string(),
                 status: Err("grant or content digest missing or malformed; reinstall".to_owned()),
+                sensitive: Vec::new(),
             }),
     );
     out.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));

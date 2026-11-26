@@ -505,6 +505,9 @@ pub(crate) struct EventRefusal {
     denies: Arc<crate::state::PluginDenyStore>,
     devices: Arc<DeviceRegistry>,
     plugin_id: String,
+    /// The plugin holds the `camera` grant for event bytes
+    /// (`sensitive_event_bytes`).
+    camera_bytes: bool,
 }
 
 impl EventRefusal {
@@ -534,23 +537,24 @@ impl EventRefusal {
             .wrapping_add(self.devices.generation())
     }
 
-    /// `true` when a list refuses reading `ev`'s bytes (`blob.read`
-    /// of its device, or of its source's blobs), as `read-events`
-    /// decides for the same row.
+    /// `true` when `ev`'s bytes (`blob.read` of its device, or of its
+    /// source's blobs) may not go out live: they are camera bytes and
+    /// the plugin lacks the `camera` grant
+    /// ([`crate::auth::live_event_bytes_permit`]), or a list refuses
+    /// them, as `read-events` decides for the same row.
     pub(crate) fn refuses_bytes<'a>(
         &'a self,
         ev: &crate::host_impl::plugin::oxidhome::plugin::events::Event,
         upstream: impl IntoIterator<Item = &'a String>,
     ) -> bool {
-        if self.denies.is_empty() {
-            return false;
-        }
         let resource = super::event_read::bytes_resource(
             ev,
             |d| self.devices.class_of(d),
             self.devices.instance_is_camera(&ev.origin_instance_id),
         );
-        self.denies(crate::auth::Action::BlobRead, &resource, upstream)
+        crate::auth::live_event_bytes_permit(self.camera_bytes, &resource).is_err()
+            || (!self.denies.is_empty()
+                && self.denies(crate::auth::Action::BlobRead, &resource, upstream))
     }
 
     /// `true` when this plugin's list, or one of `upstream`'s, refuses
@@ -753,8 +757,17 @@ impl PluginState {
             reads_state: &self.granted_capabilities.reads_state,
             subscribes_events: self.granted_capabilities.subscribes_events,
             reads_event_bytes: self.granted_capabilities.reads_event_bytes,
+            camera_event_bytes: self.camera_event_bytes(),
             denies: &self.plugin_denies,
         }
+    }
+
+    /// Whether the effective `sensitive_event_bytes` names `camera`.
+    pub(crate) fn camera_event_bytes(&self) -> bool {
+        self.granted_capabilities
+            .sensitive_event_bytes
+            .iter()
+            .any(|c| c == crate::auth::SensitiveCategory::Camera.as_str())
     }
 
     /// What decides whether this plugin's deny lists hide an event
@@ -765,6 +778,7 @@ impl PluginState {
             denies: Arc::clone(&self.plugin_denies),
             devices: Arc::clone(&self.devices),
             plugin_id: self.manifest.plugin.id.clone(),
+            camera_bytes: self.camera_event_bytes(),
         }
     }
 
@@ -2573,8 +2587,9 @@ mod tests {
         let denies = Arc::new(crate::state::PluginDenyStore::detached());
         let refusal = EventRefusal {
             denies: Arc::clone(&denies),
-            devices,
+            devices: Arc::clone(&devices),
             plugin_id: "p.me".into(),
+            camera_bytes: true,
         };
         // No device: the bytes are the source's blobs.
         let frame = |origin: &str| crate::host_impl::plugin::oxidhome::plugin::events::Event {
@@ -2617,6 +2632,18 @@ mod tests {
             !refusal.refuses(&frame("cam"), &upstream),
             "the event still goes"
         );
+
+        // H6 slice 5b: without the `camera` grant a camera source's
+        // bytes are withheld whatever the lists say; other bytes go.
+        denies.set("p.me", Vec::new()).expect("reset");
+        denies.set("p.caller", Vec::new()).expect("reset");
+        let ungranted = EventRefusal {
+            camera_bytes: false,
+            ..refusal
+        };
+        assert!(ungranted.refuses_bytes(&frame("cam"), &none), "camera");
+        assert!(!ungranted.refuses_bytes(&frame("lamp"), &none), "lamp");
+        assert!(!ungranted.refuses(&frame("cam"), &none), "event goes");
     }
 
     /// A storage op counts as in flight until its blocking closure

@@ -41,7 +41,7 @@ pub use config::{
 pub use extension::{ExtensionId, ExtensionIdError};
 pub use manifest::{
     CapabilitiesSection, PluginManifest, PluginSection, RestartPolicy, RuntimeSection,
-    ServiceGrant, StateGrant, UiPermissions, UiSection, World,
+    SENSITIVE_READ_CATEGORIES, ServiceGrant, StateGrant, UiPermissions, UiSection, World,
 };
 pub use network::{
     HostMatch, MAX_RULE_HOST_LEN, NetworkRule, NetworkRuleParseError, PortMatch, Proto,

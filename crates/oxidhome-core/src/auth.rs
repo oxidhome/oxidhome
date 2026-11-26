@@ -53,7 +53,7 @@ pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
 pub use plugin::{
     CONSUMES_SERVICES_GRANT, PLUGIN_ACTIONS, PluginPrincipal, READS_EVENT_BYTES_GRANT,
     READS_STATE_BYTES_GRANT, READS_STATE_GRANT, SUBSCRIBES_EVENTS_GRANT, authorize_plugin,
-    denied_by, event_bytes_permit, restrict_to_plugin_actions,
+    denied_by, event_bytes_permit, live_event_bytes_permit, restrict_to_plugin_actions,
 };
 pub use policy::{
     DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,

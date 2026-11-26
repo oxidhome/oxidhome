@@ -480,6 +480,27 @@ pub fn set_device_category(
 /// `method` of every row this module writes.
 pub const AUDIT_METHOD: &str = AUDIT_METHOD_LOCAL;
 
+/// Check the sensitive categories an install request approves (H6
+/// slice 5b): each must name a sensitive category, at most once per
+/// category.
+///
+/// # Errors
+///
+/// What is wrong, for a 4xx / `invalid_argument`.
+pub fn check_sensitive_approval(approved: &[String]) -> Result<(), String> {
+    for (i, name) in approved.iter().enumerate() {
+        if name.parse::<crate::auth::SensitiveCategory>().is_err() {
+            return Err(format!(
+                "approve_sensitive: `{name}` is not a sensitive category (lock, opener, alarm, camera)"
+            ));
+        }
+        if approved[..i].contains(name) {
+            return Err(format!("approve_sensitive: `{name}` is listed twice"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

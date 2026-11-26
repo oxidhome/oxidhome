@@ -102,6 +102,10 @@ message Plugin {
   // rules). Same lists as the JSON side's `network` object; ProtoJSON
   // omits an empty list, so a plugin without rules encodes as `{}`.
   optional NetworkGrants network = 5;
+  // The sensitive categories the installation's grant holds (H6 slice
+  // 5b), approved by the owner at install. Empty for a plugin without
+  // any, and for the running-but-not-installed case.
+  repeated string sensitive = 6;
 }
 
 // A plugin's `[capabilities] network` rules, in manifest syntax
@@ -128,6 +132,12 @@ message InstallPluginRequest {
   // `..` components; otherwise the call fails with
   // `invalid_argument`.
   string source_dir = 1;
+  // The sensitive categories the owner approves for the plugin's
+  // grants (H6 slice 5b; only `camera` exists for plugins today). A
+  // manifest requesting one not listed is refused with
+  // `permission_denied` naming the categories, and nothing is
+  // installed. Approving any needs `policy.manage`.
+  repeated string approve_sensitive = 2;
 }
 
 message InstallPluginResponse {
@@ -137,6 +147,8 @@ message InstallPluginResponse {
   // (`<state_dir>/plugins/<plugin_id>/`) — the daemon's canonical
   // location, useful for logs / CLI display.
   string installed_path = 3;
+  // The sensitive categories the plugin's grant holds.
+  repeated string sensitive = 4;
 }
 
 message StartPluginRequest {

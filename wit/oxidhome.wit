@@ -1434,7 +1434,11 @@ interface host-sandboxes {
 /// delivered or returned: an event of a device they refuse
 /// `event.subscribe` on is dropped, and its `bytes-val` fields are
 /// withheld (the marker below) where they refuse `blob.read`. Lists
-/// are checked again at each delivery.
+/// are checked again at each delivery. Camera bytes (a camera
+/// device's, or any from an instance that has registered a camera) are
+/// withheld, live and in history, unless the manifest requests
+/// `capabilities.sensitive_event_bytes = ["camera"]` and the owner
+/// approved it at install.
 interface host-events {
   use types.{subscription-id, error};
   use events.{event, event-filter};
@@ -1488,7 +1492,8 @@ interface host-events {
   /// `json-val` marker
   /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_event_bytes"}`
   /// unless the manifest requests `capabilities.reads_event_bytes`
-  /// and the operator's grant for the installation keeps it.
+  /// and the operator's grant for the installation keeps it (camera
+  /// bytes also need `sensitive_event_bytes`, see the interface).
   ///
   /// A page holds at most `limit` events (0 means 64; capped at 256)
   /// and about 1 MiB, and one call looks at a bounded number of rows,
@@ -1517,7 +1522,9 @@ interface host-config {
 /// for an unknown device) and `list-state` leaves those entries out. `bytes-val` fields are
 /// replaced by a `json-val` marker
 /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_state.bytes"}`
-/// unless the matching grant sets `bytes = true`; a plugin's own
+/// unless the matching grant sets `bytes = true` (camera bytes also
+/// need `sensitive = ["camera"]` on that grant, which the owner
+/// approves at install; no `*` selector covers them); a plugin's own
 /// entries are returned as written. The owner's deny lists (this
 /// plugin's, and those of the plugins whose calls led to the read)
 /// hide what they refuse `state.read` on and withhold bytes where they

@@ -22,9 +22,16 @@
 //!   |--------|----------|-------|
 //!   | `service.call` | [`Resource::Service`] | `consumes_services`: one requested and one granted selector match all five axes (H10) |
 //!   | `state.read` | [`Resource::State`] | `reads_state`: a selector matches the owner plugin, capability and device |
-//!   | `blob.read` | [`Resource::State`] | `reads_state` with `bytes = true` (the entry's `bytes-val` fields) |
-//!   | `blob.read` | [`Resource::Device`] or [`Resource::Blob`] (an event's `bytes-val` fields, [`event_bytes_permit`]) | `reads_event_bytes` |
+//!   | `blob.read` | [`Resource::State`] | `reads_state` with `bytes = true` (the entry's `bytes-val` fields); camera bytes also `sensitive = ["camera"]` on that grant |
+//!   | `blob.read` | [`Resource::Device`] or [`Resource::Blob`] (an event's `bytes-val` fields, [`event_bytes_permit`]) | `reads_event_bytes`; camera bytes also `sensitive_event_bytes = ["camera"]` |
 //!   | `event.subscribe` | any | `subscribes_events` |
+//!
+//!   Camera bytes are sensitive (H6 slice 5b): no `*` selector covers
+//!   them, only a grant that names `camera` (refused as
+//!   [`Reason::MissingSensitive`], label `sensitive:camera`). The
+//!   owner approves such grants at install. A plugin's own sensitive
+//!   grant carries no obligation; a token root's does, and a plugin
+//!   read can't meet it, so the bytes are withheld.
 //!
 //! - **The root's permit**, when the invocation is rooted at an
 //!   external principal: [`authorize`] on the token-facing equivalent
@@ -45,6 +52,7 @@ use std::borrow::Cow;
 use oxidhome_manifest::{ServiceGrant, StateGrant};
 
 use super::authorize::{Action, Decision, Reason, Resource, ResourceKind, authorize};
+use super::category::SensitiveCategory;
 use super::invocation::InvocationContext;
 use super::role::{ActionSet, DenyRule};
 use crate::state::PluginDenyStore;
@@ -90,6 +98,8 @@ pub struct PluginPrincipal<'a> {
     pub subscribes_events: bool,
     /// Effective `reads_event_bytes`.
     pub reads_event_bytes: bool,
+    /// Effective `sensitive_event_bytes` names `camera`.
+    pub camera_event_bytes: bool,
     /// The owner's deny lists, for this plugin and the chain's.
     pub denies: &'a PluginDenyStore,
 }
@@ -180,26 +190,45 @@ fn plugin_permit(
                 .then_some(CONSUMES_SERVICES_GRANT)
                 .ok_or(missing(CONSUMES_SERVICES_GRANT))
         }
-        (Action::StateRead | Action::BlobRead, Resource::State(s)) => {
-            let bytes = action == Action::BlobRead;
-            let grant = if bytes {
-                READS_STATE_BYTES_GRANT
+        (Action::StateRead, Resource::State(s)) => plugin
+            .reads_state
+            .iter()
+            .any(|g| g.matches(s.owner_plugin(), s.device().id(), s.capability()))
+            .then_some(READS_STATE_GRANT)
+            .ok_or(missing(READS_STATE_GRANT)),
+        (Action::BlobRead, Resource::State(s)) => {
+            let mut with_bytes = plugin.reads_state.iter().filter(|g| {
+                g.bytes && g.matches(s.owner_plugin(), s.device().id(), s.capability())
+            });
+            if !is_camera_bytes(resource) {
+                return with_bytes
+                    .next()
+                    .map(|_| READS_STATE_BYTES_GRANT)
+                    .ok_or(missing(READS_STATE_BYTES_GRANT));
+            }
+            let mut any = false;
+            for g in with_bytes {
+                if g.sensitive
+                    .iter()
+                    .any(|c| c == SensitiveCategory::Camera.as_str())
+                {
+                    return Ok(READS_STATE_BYTES_GRANT);
+                }
+                any = true;
+            }
+            Err(if any {
+                Reason::MissingSensitive {
+                    category: SensitiveCategory::Camera,
+                }
             } else {
-                READS_STATE_GRANT
-            };
-            plugin
-                .reads_state
-                .iter()
-                .any(|g| {
-                    (!bytes || g.bytes)
-                        && g.matches(s.owner_plugin(), s.device().id(), s.capability())
-                })
-                .then_some(grant)
-                .ok_or(missing(grant))
+                missing(READS_STATE_BYTES_GRANT)
+            })
         }
-        (Action::BlobRead, Resource::Device(_) | Resource::Blob(_)) => {
-            event_bytes_permit(plugin.reads_event_bytes, resource)
-        }
+        (Action::BlobRead, Resource::Device(_) | Resource::Blob(_)) => event_bytes_permit(
+            plugin.reads_event_bytes,
+            plugin.camera_event_bytes,
+            resource,
+        ),
         (Action::EventSubscribe, _) => plugin
             .subscribes_events
             .then_some(SUBSCRIBES_EVENTS_GRANT)
@@ -212,23 +241,56 @@ fn plugin_permit(
 }
 
 /// A plugin's permit to read the `bytes-val` fields of a recorded
-/// event, whose bytes are `resource`
-/// ([`crate::runtime`]'s `bytes_resource`: the event's device, or its
-/// source's blobs): `reads_event_bytes`. Owned inputs, so a history
-/// scan can decide it off the plugin's state.
+/// event, whose bytes are `resource` (the event's device, or its
+/// source's blobs): `reads_event_bytes`, and for camera bytes the
+/// `camera` sensitive grant (`camera_grant`, from
+/// `sensitive_event_bytes`). Plain inputs, so a history scan can
+/// decide it off the plugin's state.
 ///
 /// # Errors
 ///
-/// [`Reason::MissingPluginGrant`] labelled `reads_event_bytes`.
+/// [`Reason::MissingPluginGrant`] labelled `reads_event_bytes`, or
+/// [`Reason::MissingSensitive`] for camera bytes without the grant.
 pub fn event_bytes_permit(
     reads_event_bytes: bool,
-    _resource: &Resource,
+    camera_grant: bool,
+    resource: &Resource,
 ) -> Result<&'static str, Reason> {
-    reads_event_bytes
-        .then_some(READS_EVENT_BYTES_GRANT)
-        .ok_or(Reason::MissingPluginGrant {
+    if !reads_event_bytes {
+        return Err(Reason::MissingPluginGrant {
             grant: READS_EVENT_BYTES_GRANT,
-        })
+        });
+    }
+    live_event_bytes_permit(camera_grant, resource).map(|()| READS_EVENT_BYTES_GRANT)
+}
+
+/// Whether a plugin may receive the bytes `resource` of an event
+/// delivered live (`on-event`, which needs no `reads_event_bytes`):
+/// camera bytes need the `camera` sensitive grant (`camera_grant`).
+///
+/// # Errors
+///
+/// [`Reason::MissingSensitive`] for camera bytes without the grant.
+pub fn live_event_bytes_permit(camera_grant: bool, resource: &Resource) -> Result<(), Reason> {
+    if is_camera_bytes(resource) && !camera_grant {
+        return Err(Reason::MissingSensitive {
+            category: SensitiveCategory::Camera,
+        });
+    }
+    Ok(())
+}
+
+/// `true` when reading `resource`'s bytes reads camera bytes: a camera
+/// device's (or a camera-source instance's, whose class says so), or a
+/// camera-source instance's blobs. Only an explicit `camera` sensitive
+/// grant covers them; no `*` selector does.
+fn is_camera_bytes(resource: &Resource) -> bool {
+    match resource {
+        Resource::Device(d) => d.class().is_camera(),
+        Resource::State(s) => s.device().class().is_camera(),
+        Resource::Blob(b) => b.is_camera(),
+        _ => false,
+    }
 }
 
 /// What the root of an external invocation must hold for a plugin to
@@ -301,6 +363,7 @@ mod tests {
             reads_state: reads,
             subscribes_events: true,
             reads_event_bytes: false,
+            camera_event_bytes: false,
             denies,
         }
     }
@@ -443,6 +506,7 @@ mod tests {
             capabilities: vec!["*".into()],
             devices: vec!["*".into()],
             bytes,
+            sensitive: Vec::new(),
         }
     }
 
@@ -502,6 +566,7 @@ mod tests {
         let off = PluginPrincipal {
             subscribes_events: false,
             reads_event_bytes: false,
+            camera_event_bytes: false,
             ..p
         };
         assert_eq!(
@@ -572,6 +637,67 @@ mod tests {
         let narrow = ctx_for(&Actor::api("t", vec!["events:read".into()]));
         let d = authorize_plugin(&narrow, &with, Action::BlobRead, &lamp);
         assert_eq!(d.reason.audit_label(), Some("blobs:read"));
+    }
+
+    /// Camera bytes are sensitive for plugins too: no `*` grant
+    /// covers them, only one naming `camera`; the label is
+    /// `sensitive:camera`. Reading the entry itself isn't sensitive.
+    #[test]
+    fn camera_bytes_need_a_camera_grant() {
+        let denies = PluginDenyStore::detached();
+        let cam = Resource::state(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Camera),
+            "example.cam",
+            "camera",
+        );
+        let host = InvocationContext::host_origin("caller");
+        let wildcard = [read_all(true)];
+        let p = plugin(&denies, &[], &wildcard);
+        assert!(authorize_plugin(&host, &p, Action::StateRead, &cam).allow);
+        let d = authorize_plugin(&host, &p, Action::BlobRead, &cam);
+        assert_eq!(d.reason.audit_label(), Some("sensitive:camera"));
+        assert!(authorize_plugin(&host, &p, Action::BlobRead, &lock_state()).allow);
+        let granted = [
+            read_all(true),
+            StateGrant {
+                sensitive: vec!["camera".into()],
+                ..read_all(true)
+            },
+        ];
+        let p = plugin(&denies, &[], &granted);
+        let d = authorize_plugin(&host, &p, Action::BlobRead, &cam);
+        assert!(d.allow);
+        assert_eq!(d.obligations, crate::auth::Obligations::default());
+        // A token root's camera allow carries an obligation, which the
+        // caller can't meet; a token without the camera grant is
+        // refused.
+        let owner = ctx_for(&Actor::api("t", vec!["*".into()]));
+        let d = authorize_plugin(&owner, &p, Action::BlobRead, &cam);
+        assert_eq!(d.reason.audit_label(), Some("sensitive:camera"));
+
+        // Event bytes: `reads_event_bytes`, then the camera grant.
+        let cam_device = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Camera),
+        );
+        let cam_blob = Resource::blob("src", "", true);
+        let events = PluginPrincipal {
+            reads_event_bytes: true,
+            ..plugin(&denies, &[], &[])
+        };
+        for bytes in [&cam_device, &cam_blob] {
+            let d = authorize_plugin(&host, &events, Action::BlobRead, bytes);
+            assert_eq!(d.reason.audit_label(), Some("sensitive:camera"));
+            let with = PluginPrincipal {
+                camera_event_bytes: true,
+                ..events
+            };
+            assert!(authorize_plugin(&host, &with, Action::BlobRead, bytes).allow);
+            assert!(live_event_bytes_permit(false, bytes).is_err());
+            assert!(live_event_bytes_permit(true, bytes).is_ok());
+        }
+        assert!(live_event_bytes_permit(false, &Resource::blob("src", "", false)).is_ok());
     }
 
     #[test]

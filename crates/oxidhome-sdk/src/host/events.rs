@@ -11,6 +11,9 @@
 //! `[capabilities] subscribes_events = true`; raw `bytes-val` fields
 //! come back as a `json-val` marker unless the manifest also sets
 //! `reads_event_bytes = true` (and the operator's grant keeps it).
+//! Camera bytes, live and in history, also need
+//! `sensitive_event_bytes = ["camera"]`, which the owner approves at
+//! install.
 //!
 //! ## Resuming after a restart
 //!

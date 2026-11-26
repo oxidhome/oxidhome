@@ -202,6 +202,7 @@ pub async fn call_service_from_host(
         reads_state: &[],
         subscribes_events: false,
         reads_event_bytes: false,
+        camera_event_bytes: false,
         denies: &denies,
     };
     call_service(
@@ -952,6 +953,7 @@ mod tests {
             reads_state: &[],
             subscribes_events: false,
             reads_event_bytes: false,
+            camera_event_bytes: false,
             denies: &denies,
         };
         super::call_service(

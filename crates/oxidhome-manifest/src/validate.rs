@@ -104,6 +104,9 @@ pub enum ValidationError {
         max: usize,
     },
 
+    #[error("{field} is invalid: {reason}")]
+    InvalidSensitiveGrant { field: String, reason: String },
+
     #[error(
         "plugin.keywords has {count} entries; the cap is {max}. Trim the list — \
          beyond that it's harder to skim than the plugin's name and description."
@@ -520,6 +523,7 @@ pub fn check_capability_limits(
             });
         }
     }
+    check_sensitive_grants(caps, errors);
     for (index, grant) in caps.consumes_services.iter().enumerate() {
         if !is_service_local_id(&grant.service) {
             errors.push(ValidationError::InvalidServiceLocalId {
@@ -535,6 +539,55 @@ pub fn check_capability_limits(
             });
         }
     }
+}
+
+/// H6 slice 5: sensitive grants name only
+/// [`crate::manifest::SENSITIVE_READ_CATEGORIES`], once each, on a
+/// grant that can use them.
+fn check_sensitive_grants(
+    caps: &crate::manifest::CapabilitiesSection,
+    errors: &mut Vec<ValidationError>,
+) {
+    let check = |field: String, list: &[String], usable: Result<(), &str>, errors: &mut Vec<_>| {
+        if list.is_empty() {
+            return;
+        }
+        let reason = if let Some(bad) = list
+            .iter()
+            .find(|c| !crate::manifest::SENSITIVE_READ_CATEGORIES.contains(&c.as_str()))
+        {
+            format!("`{bad}` is not a sensitive category of bytes (only `camera`)")
+        } else if list.len() > crate::manifest::SENSITIVE_READ_CATEGORIES.len() {
+            "a category is listed twice".to_owned()
+        } else if let Err(why) = usable {
+            why.to_owned()
+        } else {
+            return;
+        };
+        errors.push(ValidationError::InvalidSensitiveGrant { field, reason });
+    };
+    for (index, grant) in caps.reads_state.iter().enumerate() {
+        check(
+            format!("capabilities.reads_state[{index}].sensitive"),
+            &grant.sensitive,
+            if grant.bytes {
+                Ok(())
+            } else {
+                Err("needs `bytes = true`")
+            },
+            errors,
+        );
+    }
+    check(
+        "capabilities.sensitive_event_bytes".to_owned(),
+        &caps.sensitive_event_bytes,
+        if caps.subscribes_events {
+            Ok(())
+        } else {
+            Err("needs `subscribes_events = true`")
+        },
+        errors,
+    );
 }
 
 /// Longest `plugin.id` a manifest may declare: the id is the plugin's
@@ -1128,6 +1181,55 @@ mod tests {
             config: BTreeMap::new(),
             ui: None,
         }
+    }
+
+    /// H6 slice 5: sensitive read grants name `camera` only, once,
+    /// on a grant that can use it, and are collected for install.
+    #[test]
+    fn sensitive_grants_are_validated_and_collected() {
+        let toml = r#"
+            manifest_version = 1
+            [plugin]
+            id = "example.nvr"
+            name = "n"
+            version = "0.1.0"
+            world = "plugin"
+            sdk_version = "0.1.0"
+            [runtime]
+            wasm = "x.wasm"
+            [capabilities]
+            subscribes_events = true
+            sensitive_event_bytes = ["camera"]
+            [[capabilities.reads_state]]
+            plugin = "*"
+            capabilities = ["*"]
+            bytes = true
+            sensitive = ["camera"]
+        "#;
+        let m: PluginManifest = toml::from_str(toml).expect("parse");
+        validate(&m).expect("valid");
+        assert_eq!(m.capabilities.sensitive_requests(), ["camera"]);
+        assert_eq!(
+            ok_manifest().capabilities.sensitive_requests(),
+            Vec::<String>::new()
+        );
+
+        let bad = |edit: fn(&mut CapabilitiesSection)| {
+            let mut m = m.clone();
+            edit(&mut m.capabilities);
+            validate(&m)
+                .expect_err("invalid")
+                .into_iter()
+                .filter(|e| matches!(e, ValidationError::InvalidSensitiveGrant { .. }))
+                .count()
+        };
+        assert_eq!(bad(|c| c.reads_state[0].bytes = false), 1);
+        assert_eq!(bad(|c| c.reads_state[0].sensitive = vec!["lock".into()]), 1);
+        assert_eq!(
+            bad(|c| c.sensitive_event_bytes = vec!["camera".into(), "camera".into()]),
+            1
+        );
+        assert_eq!(bad(|c| c.subscribes_events = false), 1);
     }
 
     #[test]

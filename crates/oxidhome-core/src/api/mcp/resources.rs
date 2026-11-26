@@ -1056,6 +1056,9 @@ pub(super) struct PluginListEntry {
     /// `None` for a running-but-not-installed plugin. Same shape as
     /// `GET /api/v1/plugins`.
     pub(super) network: Option<crate::state::NetworkGrants>,
+    /// H6 slice 5b: the sensitive categories the installation's grant
+    /// holds; `None` for a running-but-not-installed plugin.
+    pub(super) sensitive: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -1080,6 +1083,7 @@ pub(super) fn plugins_list_body(engine: &Engine) -> PluginListBody {
             plugin_id: id,
             installed: true,
             network: Some(installed.network_grants()),
+            sensitive: Some(installed.sensitive_grants()),
             version: Some(installed.version),
             instance_count: count,
         });
@@ -1091,6 +1095,7 @@ pub(super) fn plugins_list_body(engine: &Engine) -> PluginListBody {
             version: None,
             instance_count,
             network: None,
+            sensitive: None,
         });
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));

@@ -2164,6 +2164,10 @@ struct PluginSummary {
     /// lists for a plugin without network rules; `null` for the
     /// running-but-not-installed case.
     network: Option<crate::state::NetworkGrants>,
+    /// H6 slice 5b: the sensitive categories the installation's grant
+    /// holds (approved by the owner at install); `null` for the
+    /// running-but-not-installed case.
+    sensitive: Option<Vec<String>>,
 }
 
 /// `GET /api/v1/plugins` — list of every plugin known to the host:
@@ -2197,6 +2201,7 @@ async fn list_plugins(
             plugin_id: id,
             installed: true,
             network: Some(installed.network_grants()),
+            sensitive: Some(installed.sensitive_grants()),
             version: Some(installed.version),
             instance_count: count,
         });
@@ -2210,6 +2215,7 @@ async fn list_plugins(
             version: None,
             instance_count,
             network: None,
+            sensitive: None,
         });
     }
     plugins.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
@@ -2388,9 +2394,17 @@ impl IntoResponse for PluginSchemaError {
 /// already staged; the daemon copies it into
 /// `<state_dir>/plugins/<plugin_id>/`. A remote-fetch /
 /// multipart-upload variant is a follow-up that layers on top.
+///
+/// `approve_sensitive` (H6 slice 5b) lists the sensitive categories
+/// the owner approves for the plugin's grants (only `camera` exists
+/// for plugins today). A manifest requesting one not listed is refused
+/// with `403 {"error": "sensitive_not_approved", "categories": [...]}`
+/// and nothing is installed; approving any needs `policy.manage`.
 #[derive(Deserialize)]
 struct InstallBody {
     source_dir: std::path::PathBuf,
+    #[serde(default)]
+    approve_sensitive: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2398,6 +2412,8 @@ struct InstalledRow {
     plugin_id: String,
     version: String,
     installed_path: String,
+    /// The sensitive categories the plugin's grant holds.
+    sensitive: Vec<String>,
 }
 
 /// `POST /api/v1/plugins` — install. Reads
@@ -2416,6 +2432,13 @@ async fn install_plugin(
     Json(body): Json<InstallBody>,
 ) -> Result<Json<InstalledRow>, PluginLifecycleError> {
     require(&ctx, Action::PluginInstall, &Resource::Host)?;
+    if let Err(unknown) = super::sensitive_admin::check_sensitive_approval(&body.approve_sensitive)
+    {
+        return Err(PluginLifecycleError::BadInstall(unknown));
+    }
+    if !body.approve_sensitive.is_empty() {
+        require(&ctx, Action::PolicyManage, &Resource::Host)?;
+    }
     // The registry's install is sync (filesystem + manifest read
     // is fast enough not to need tokio::fs). Wrap in `spawn_blocking`
     // so a slow disk doesn't stall the axum runtime; a `cp -r` of a
@@ -2423,11 +2446,15 @@ async fn install_plugin(
     // but the API thread shouldn't own it either way.
     let installed_registry = state.engine.installed_plugins();
     let source = body.source_dir;
-    let installed = tokio::task::spawn_blocking(move || installed_registry.install(&source))
-        .await
-        .map_err(|err| PluginLifecycleError::Internal(err.into()))??;
+    let approved = body.approve_sensitive;
+    let installed = tokio::task::spawn_blocking(move || {
+        installed_registry.install_approved(&source, &approved)
+    })
+    .await
+    .map_err(|err| PluginLifecycleError::Internal(err.into()))??;
     Ok(Json(InstalledRow {
         plugin_id: installed.plugin_id.to_string(),
+        sensitive: installed.sensitive_grants(),
         version: installed.version,
         installed_path: installed.path.display().to_string(),
     }))
@@ -2681,6 +2708,12 @@ enum PluginLifecycleError {
     /// 400-class manifest / source-dir validation error from the
     /// install path.
     BadInstall(String),
+    /// H6 slice 5b: the manifest requests sensitive grants the
+    /// request didn't approve. 403 with the categories.
+    SensitiveNotApproved {
+        plugin_id: String,
+        categories: Vec<String>,
+    },
     /// Follow-up review H1: caller-supplied `instance_id` failed
     /// the FS-segment safety check (empty, path traversal,
     /// absolute path, contains a NUL). Rejected with 400 before
@@ -2724,6 +2757,13 @@ impl From<InstallError> for PluginLifecycleError {
             // the FS side effect was rolled back by
             // `InstalledPluginRegistry::install`.
             InstallError::Persistence(err) => Self::Internal(err.into()),
+            InstallError::SensitiveNotApproved {
+                plugin_id,
+                categories,
+            } => Self::SensitiveNotApproved {
+                plugin_id,
+                categories,
+            },
         }
     }
 }
@@ -2760,6 +2800,18 @@ impl IntoResponse for PluginLifecycleError {
             Self::BadInstall(reason) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(serde_json::json!({"error": "bad_install", "reason": reason})),
+            )
+                .into_response(),
+            Self::SensitiveNotApproved {
+                plugin_id,
+                categories,
+            } => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "sensitive_not_approved",
+                    "plugin_id": plugin_id,
+                    "categories": categories,
+                })),
             )
                 .into_response(),
             Self::BadInstanceId(id) => (

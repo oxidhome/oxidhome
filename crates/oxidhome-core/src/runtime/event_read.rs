@@ -261,6 +261,7 @@ struct HistoryAccess {
     classes: Arc<crate::state::devices::ClassSnapshot>,
     chain: Vec<String>,
     bytes: bool,
+    camera: bool,
     ctx: crate::auth::InvocationContext,
 }
 
@@ -289,7 +290,7 @@ impl RowAccess for HistoryAccess {
             |d| self.classes.class_of(d),
             self.classes.instance_is_camera(&event.origin_instance_id),
         );
-        if crate::auth::event_bytes_permit(self.bytes, &resource).is_err() {
+        if crate::auth::event_bytes_permit(self.bytes, self.camera, &resource).is_err() {
             return false;
         }
         if self.refusal.denies(
@@ -351,6 +352,7 @@ impl PluginState {
                 .map(|h| h.caller_plugin.clone())
                 .collect(),
             bytes: self.granted_capabilities.reads_event_bytes,
+            camera: self.camera_event_bytes(),
             ctx: ctx.clone(),
         }
     }

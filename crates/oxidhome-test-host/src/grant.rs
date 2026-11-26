@@ -76,6 +76,13 @@ pub fn grant_excess(requested: &CapabilitiesSection, granted: &CapabilitiesSecti
     if granted.reads_event_bytes && !requested.reads_event_bytes {
         excess.push("reads_event_bytes is not requested".to_owned());
     }
+    for category in &granted.sensitive_event_bytes {
+        if !requested.sensitive_event_bytes.contains(category) {
+            excess.push(format!(
+                "sensitive_event_bytes `{category}` is not requested"
+            ));
+        }
+    }
     for (index, grant) in granted.reads_state.iter().enumerate() {
         if !requested.reads_state.contains(grant) {
             excess.push(format!(
@@ -141,8 +148,10 @@ mod tests {
                 capabilities: vec!["switch".into()],
                 devices: vec!["*".into()],
                 bytes: false,
+                sensitive: Vec::new(),
             }],
             reads_event_bytes: true,
+            sensitive_event_bytes: Vec::new(),
         }
     }
 

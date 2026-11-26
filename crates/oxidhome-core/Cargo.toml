@@ -124,6 +124,10 @@ name = "plugin_deny_admin"
 path = "tests/plugin_deny_admin.rs"
 
 [[test]]
+name = "plugin_sensitive_install"
+path = "tests/plugin_sensitive_install.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 

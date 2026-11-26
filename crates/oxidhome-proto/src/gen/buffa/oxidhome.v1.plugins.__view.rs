@@ -537,6 +537,12 @@ pub struct PluginView<'a> {
     pub network: ::buffa::MessageFieldView<
         super::super::__buffa::view::NetworkGrantsView<'a>,
     >,
+    /// The sensitive categories the installation's grant holds (H6 slice
+    /// 5b), approved by the owner at install. Empty for a plugin without
+    /// any, and for the running-but-not-installed case.
+    ///
+    /// Field 6: `sensitive`
+    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for PluginView<'a> {
@@ -616,6 +622,17 @@ impl<'a> ::buffa::MessageView<'a> for PluginView<'a> {
                     }
                 }
             }
+            6u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.sensitive.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -651,6 +668,7 @@ impl<'a> ::buffa::MessageView<'a> for PluginView<'a> {
                 }
                 None => ::buffa::MessageField::none(),
             },
+            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -683,6 +701,9 @@ impl<'a> ::buffa::ViewEncode<'a> for PluginView<'a> {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -713,6 +734,9 @@ impl<'a> ::buffa::ViewEncode<'a> for PluginView<'a> {
                 buf,
             );
             self.network.write_to(__cache, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -755,6 +779,9 @@ impl<'__a> ::serde::Serialize for PluginView<'__a> {
             if let ::core::option::Option::Some(__v) = self.network.as_option() {
                 __map.serialize_entry("network", __v)?;
             }
+        }
+        if !self.sensitive.is_empty() {
+            __map.serialize_entry("sensitive", &*self.sensitive)?;
         }
         __map.end()
     }
@@ -888,6 +915,15 @@ impl PluginOwnedView {
         &self,
     ) -> &::buffa::MessageFieldView<super::super::__buffa::view::NetworkGrantsView<'_>> {
         &self.0.reborrow().network
+    }
+    /// The sensitive categories the installation's grant holds (H6 slice
+    /// 5b), approved by the owner at install. Empty for a plugin without
+    /// any, and for the running-but-not-installed case.
+    ///
+    /// Field 6: `sensitive`
+    #[must_use]
+    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().sensitive
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<PluginView<'static>>> for PluginOwnedView {
@@ -1254,6 +1290,14 @@ pub struct InstallPluginRequestView<'a> {
     ///
     /// Field 1: `source_dir`
     pub source_dir: &'a str,
+    /// The sensitive categories the owner approves for the plugin's
+    /// grants (H6 slice 5b; only `camera` exists for plugins today). A
+    /// manifest requesting one not listed is refused with
+    /// `permission_denied` naming the categories, and nothing is
+    /// installed. Approving any needs `policy.manage`.
+    ///
+    /// Field 2: `approve_sensitive`
+    pub approve_sensitive: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for InstallPluginRequestView<'a> {
@@ -1291,6 +1335,17 @@ impl<'a> ::buffa::MessageView<'a> for InstallPluginRequestView<'a> {
                 )?;
                 view.source_dir = ::buffa::types::borrow_str(&mut cur)?;
             }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.approve_sensitive.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1320,6 +1375,11 @@ impl<'a> ::buffa::MessageView<'a> for InstallPluginRequestView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::InstallPluginRequest {
             source_dir: self.source_dir.to_string(),
+            approve_sensitive: self
+                .approve_sensitive
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1334,6 +1394,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstallPluginRequestView<'a> {
         if !self.source_dir.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.source_dir) as u64;
         }
+        for v in &self.approve_sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1347,6 +1410,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstallPluginRequestView<'a> {
         use ::buffa::Enumeration as _;
         if !self.source_dir.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.source_dir, buf);
+        }
+        for v in &self.approve_sensitive {
+            ::buffa::types::put_string_field(2u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1371,6 +1437,9 @@ impl<'__a> ::serde::Serialize for InstallPluginRequestView<'__a> {
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
         if !::buffa::json_helpers::skip_if::is_empty_str(self.source_dir) {
             __map.serialize_entry("sourceDir", self.source_dir)?;
+        }
+        if !self.approve_sensitive.is_empty() {
+            __map.serialize_entry("approveSensitive", &*self.approve_sensitive)?;
         }
         __map.end()
     }
@@ -1481,6 +1550,17 @@ impl InstallPluginRequestOwnedView {
     pub fn source_dir(&self) -> &'_ str {
         self.0.reborrow().source_dir
     }
+    /// The sensitive categories the owner approves for the plugin's
+    /// grants (H6 slice 5b; only `camera` exists for plugins today). A
+    /// manifest requesting one not listed is refused with
+    /// `permission_denied` naming the categories, and nothing is
+    /// installed. Approving any needs `policy.manage`.
+    ///
+    /// Field 2: `approve_sensitive`
+    #[must_use]
+    pub fn approve_sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().approve_sensitive
+    }
 }
 impl ::core::convert::From<::buffa::OwnedView<InstallPluginRequestView<'static>>>
 for InstallPluginRequestOwnedView {
@@ -1524,6 +1604,10 @@ pub struct InstallPluginResponseView<'a> {
     ///
     /// Field 3: `installed_path`
     pub installed_path: &'a str,
+    /// The sensitive categories the plugin's grant holds.
+    ///
+    /// Field 4: `sensitive`
+    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for InstallPluginResponseView<'a> {
@@ -1575,6 +1659,17 @@ impl<'a> ::buffa::MessageView<'a> for InstallPluginResponseView<'a> {
                 )?;
                 view.installed_path = ::buffa::types::borrow_str(&mut cur)?;
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.sensitive.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -1606,6 +1701,7 @@ impl<'a> ::buffa::MessageView<'a> for InstallPluginResponseView<'a> {
             plugin_id: self.plugin_id.to_string(),
             version: self.version.to_string(),
             installed_path: self.installed_path.to_string(),
+            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1628,6 +1724,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstallPluginResponseView<'a> {
                 += 1u64
                     + ::buffa::types::string_encoded_len(&self.installed_path) as u64;
         }
+        for v in &self.sensitive {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1647,6 +1746,9 @@ impl<'a> ::buffa::ViewEncode<'a> for InstallPluginResponseView<'a> {
         }
         if !self.installed_path.is_empty() {
             ::buffa::types::put_string_field(3u32, &self.installed_path, buf);
+        }
+        for v in &self.sensitive {
+            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1677,6 +1779,9 @@ impl<'__a> ::serde::Serialize for InstallPluginResponseView<'__a> {
         }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.installed_path) {
             __map.serialize_entry("installedPath", self.installed_path)?;
+        }
+        if !self.sensitive.is_empty() {
+            __map.serialize_entry("sensitive", &*self.sensitive)?;
         }
         __map.end()
     }
@@ -1791,6 +1896,13 @@ impl InstallPluginResponseOwnedView {
     #[must_use]
     pub fn installed_path(&self) -> &'_ str {
         self.0.reborrow().installed_path
+    }
+    /// The sensitive categories the plugin's grant holds.
+    ///
+    /// Field 4: `sensitive`
+    #[must_use]
+    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().sensitive
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<InstallPluginResponseView<'static>>>

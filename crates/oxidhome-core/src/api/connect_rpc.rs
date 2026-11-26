@@ -949,6 +949,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             let id = installed.plugin_id.to_string();
             let count = by_plugin.remove(&id).unwrap_or(0);
             let (requested, granted, effective) = installed.network_grants().to_strings();
+            let sensitive = installed.sensitive_grants();
             plugins.push(ProtoPlugin {
                 plugin_id: id,
                 installed: true,
@@ -960,6 +961,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
                     effective,
                     ..Default::default()
                 }),
+                sensitive,
                 ..Default::default()
             });
         }
@@ -986,10 +988,16 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
     ) -> ServiceResult<impl Encodable<InstallPluginResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::PluginInstall, &Resource::Host)?;
         let req = request.to_owned_message();
+        super::sensitive_admin::check_sensitive_approval(&req.approve_sensitive)
+            .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e)))?;
+        if !req.approve_sensitive.is_empty() {
+            require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
+        }
         let installed_registry = self.engine.installed_plugins();
         let source_dir = std::path::PathBuf::from(req.source_dir);
+        let approved = req.approve_sensitive;
         let installed = tokio::task::spawn_blocking(move || {
-            installed_registry.install(&source_dir)
+            installed_registry.install_approved(&source_dir, &approved)
         })
         .await
         .map_err(|err| {
@@ -999,6 +1007,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         .map_err(|err| rpc_err(&ctx, install_error_to_connect(err)))?;
         Response::ok(InstallPluginResponse {
             plugin_id: installed.plugin_id.to_string(),
+            sensitive: installed.sensitive_grants(),
             version: installed.version,
             installed_path: installed.path.display().to_string(),
             ..Default::default()
@@ -1504,6 +1513,9 @@ fn install_error_to_connect(err: InstallError) -> ConnectError {
         InstallError::Persistence(err) => {
             tracing::error!(target: "api.plugins", error = %err, "install persistence error");
             ConnectError::internal("install persistence error")
+        }
+        err @ InstallError::SensitiveNotApproved { .. } => {
+            ConnectError::permission_denied(err.to_string())
         }
     }
 }

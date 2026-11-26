@@ -1011,8 +1011,8 @@ const PLUGIN_USAGE: &str = "usage: oxidhome plugin list
        oxidhome plugin grant <plugin_id> (<rule>... | --none | --reset)
        oxidhome plugin deny <plugin_id> (<entry>... | --reset)
 
-  list   installed plugins and their network rules (requested, granted,
-         effective)
+  list   installed plugins, their network rules (requested, granted,
+         effective) and the sensitive categories their grant holds
   grant  set a plugin's network grant: each rule (manifest syntax, e.g.
          tcp://192.168.1.20:554) must lie inside one the manifest
          requests. --none grants no network access, --reset grants what
@@ -1192,7 +1192,8 @@ fn printable(text: &str) -> String {
 
 /// `oxidhome plugin list` output: a tab-separated line per plugin, then
 /// one indented line per network rule, tagged `requested`, `granted` or
-/// `effective`. Control characters are escaped.
+/// `effective`, and one per sensitive category the grant holds, tagged
+/// `sensitive`. Control characters are escaped.
 fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1215,6 +1216,9 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
                     for rule in rules {
                         let _ = writeln!(out, "\t{tag}\t{}", printable(&rule));
                     }
+                }
+                for category in &plugin.sensitive {
+                    let _ = writeln!(out, "\tsensitive\t{}", printable(category));
                 }
             }
             Err(why) => {
@@ -1728,11 +1732,13 @@ mod tests {
                         &[rule("tcp://192.168.1.20:554")],
                     ),
                 )),
+                sensitive: vec!["camera".into()],
             },
             OfflinePlugin {
                 plugin_id: "net.example.old".into(),
                 installation_uuid: "inst-2".into(),
                 status: Err("contents changed since install; reinstall".into()),
+                sensitive: Vec::new(),
             },
         ];
         assert_eq!(
@@ -1741,6 +1747,7 @@ mod tests {
              \trequested\ttcp://192.168.0.0/16:554\n\
              \tgranted\ttcp://192.168.1.20:554\n\
              \teffective\ttcp://192.168.1.20:554\n\
+             \tsensitive\tcamera\n\
              net.example.old\tunavailable\tinstallation=inst-2\t\
              contents changed since install; reinstall\n"
         );
