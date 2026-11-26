@@ -23,13 +23,21 @@
 //! [`Plugin::tick`](crate::Plugin::tick) early when a socket the plugin
 //! keeps open between calls becomes readable: a connected `TcpStream`, or
 //! a `UdpSocket` that has connected, sent, or tried a receive (a
-//! non-blocking `recv_from` that answered `WouldBlock` counts). The
+//! non-blocking `recv_from` that answered `WouldBlock` counts), or a
+//! [`discovery::DiscoverySocket`]. The
 //! cadence can then be a slow fallback rather than a polling rate.
 //! Wakeups are coalesced (one tick however much arrived) and start at
 //! least 100 ms after the previous tick returned. Read what a tick finds,
 //! up to a bound per tick so a busy peer can't hold the call, and drop
 //! sockets that reached their end: a socket left readable (data still
 //! queued, or at its end) wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
+//!
+//! # Discovery
+//!
+//! [`discovery`] has a UDP socket that may send to broadcast and
+//! multicast destinations and join multicast groups, and
+//! [`discovery::local_networks`], the host's interface networks the
+//! grant covers, for sweeping the LAN without configuration.
 //!
 //! # HTTP
 //!
@@ -69,13 +77,20 @@
 //!   names resolve to.
 //! - Other private addresses, and every loopback and link-local one, need
 //!   an IP or CIDR rule inside that range (`tcp://127.0.0.1:1883`,
-//!   `udp://192.168.0.0/16:9999`). Broadcast and multicast are refused.
+//!   `udp://192.168.0.0/16:9999`).
+//! - Broadcast and multicast need a [`discovery::DiscoverySocket`]. The
+//!   limited broadcast and multicast groups need a `udp` rule naming the
+//!   address (`udp://255.255.255.255:9999`, `udp://224.0.0.251:5353`); a
+//!   subnet-directed broadcast needs a `udp` (or `any`) rule covering the
+//!   whole local network (`udp://192.168.1.0/24:9999`). `std::net`
+//!   sockets can't reach them.
 //! - Sockets may bind only to the unspecified address (`0.0.0.0:0` and
 //!   the like, any port); listening is refused.
 //! - Datagrams from senders the rules don't cover are dropped.
 //!
-//! The host also caps each instance at 64 live sockets, 4 concurrent
-//! name lookups and 16 concurrent HTTP requests.
+//! The host also caps each instance at 64 live sockets (discovery
+//! sockets included), 4 concurrent name lookups and 16 concurrent HTTP
+//! requests.
 
 /// Media pipeline types of the `streaming-plugin` world (`media-pipeline`,
 /// `media-source`, `output-sink`, …), returned from
@@ -91,6 +106,7 @@ pub mod wasi {
     pub use crate::bindings::wasi::{clocks, http, io, sockets};
 }
 
+pub mod discovery;
 pub mod http;
 
 /// What a `streaming-plugin` world plugin implements on top of

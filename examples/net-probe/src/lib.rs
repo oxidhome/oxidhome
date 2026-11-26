@@ -12,11 +12,12 @@
 //! plugin for a reply.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
 use oxidhome_sdk::bindings::oxidhome::plugin::types::Value;
 use oxidhome_sdk::host::{config, storage};
+use oxidhome_sdk::streaming::discovery::{self, DiscoverySocket};
 use oxidhome_sdk::streaming::wasi::http::outgoing_handler;
 use oxidhome_sdk::streaming::wasi::http::types::{
     Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
@@ -39,6 +40,7 @@ struct NetProbe {
     /// Sockets the `hold-*` operations keep open.
     udp: Vec<UdpSocket>,
     tcp: Vec<TcpStream>,
+    discovery: Vec<DiscoverySocket>,
     ticks: i64,
     received: i64,
 }
@@ -62,6 +64,10 @@ impl Plugin for NetProbe {
                 }),
                 Some(("hold-tcp", target)) => hold_tcp(target).map(|s| {
                     self.tcp.push(s);
+                    "held".to_owned()
+                }),
+                Some(("hold-disc", target)) => hold_disc(target).map(|s| {
+                    self.discovery.push(s);
                     "held".to_owned()
                 }),
                 _ => run(op),
@@ -89,6 +95,12 @@ impl Plugin for NetProbe {
                     break;
                 };
                 last = Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+                self.received += 1;
+            }
+        }
+        for socket in &self.discovery {
+            for datagram in socket.recv(discovery::MAX_RECV).unwrap_or_default() {
+                last = Some(String::from_utf8_lossy(&datagram.data).into_owned());
                 self.received += 1;
             }
         }
@@ -137,6 +149,52 @@ fn hold_udp(target: &str) -> Result<UdpSocket, String> {
     Ok(socket)
 }
 
+/// A discovery socket of `target`'s family on an ephemeral port.
+fn disc_socket(target: SocketAddr) -> Result<DiscoverySocket, String> {
+    if target.is_ipv4() {
+        DiscoverySocket::bind_v4(0)
+    } else {
+        DiscoverySocket::bind_v6(0)
+    }
+    .map_err(io_err)
+}
+
+fn parse_addr(target: &str) -> Result<SocketAddr, String> {
+    target
+        .parse()
+        .map_err(|_| format!("bad address `{target}`"))
+}
+
+/// Send `ping` to `target` from a discovery socket and keep it.
+fn hold_disc(target: &str) -> Result<DiscoverySocket, String> {
+    let target = parse_addr(target)?;
+    let socket = disc_socket(target)?;
+    socket.send_to(b"ping", target).map_err(io_err)?;
+    Ok(socket)
+}
+
+/// Send `ping` to `target` from a discovery socket and wait 2 s for a
+/// reply: `<reply>@<from>`.
+fn disc(target: &str) -> Result<String, String> {
+    let target = parse_addr(target)?;
+    let socket = disc_socket(target)?;
+    socket.send_to(b"ping", target).map_err(io_err)?;
+    // Wait on the socket's pollable, bounded by a timer.
+    let ready = socket.subscribe();
+    let timeout = oxidhome_sdk::streaming::wasi::clocks::monotonic_clock::subscribe_duration(
+        UDP_WAIT.as_nanos().try_into().unwrap_or(u64::MAX),
+    );
+    loop {
+        if let Some(d) = socket.recv(1).map_err(io_err)?.pop() {
+            return Ok(format!("{}@{}", String::from_utf8_lossy(&d.data), d.from));
+        }
+        if timeout.ready() {
+            return Err("no reply".into());
+        }
+        oxidhome_sdk::streaming::wasi::io::poll::poll(&[&ready, &timeout]);
+    }
+}
+
 /// Connect to `target`, send `ping\n`, and keep the non-blocking stream.
 fn hold_tcp(target: &str) -> Result<TcpStream, String> {
     let mut stream = TcpStream::connect(target).map_err(io_err)?;
@@ -176,6 +234,40 @@ fn run(op: &str) -> Result<String, String> {
         "httppoll" => http_get(arg, false)
             .map(|(status, _, body)| format!("{status}:{}", String::from_utf8_lossy(&body))),
         "bind" => UdpSocket::bind(arg).map(|_| "bound".into()).map_err(io_err),
+        "disc" => disc(arg),
+        "disc-send" => {
+            let target = parse_addr(arg)?;
+            let socket = disc_socket(target)?;
+            socket
+                .send_to(b"ping", target)
+                .map(|()| "sent".into())
+                .map_err(io_err)
+        }
+        "disc-bind" => {
+            let port: u16 = arg.parse().map_err(|_| format!("bad port `{arg}`"))?;
+            DiscoverySocket::bind_v4(port)
+                .map(|_| "bound".into())
+                .map_err(io_err)
+        }
+        "disc-join" => {
+            let group: std::net::IpAddr = arg.parse().map_err(|_| format!("bad group `{arg}`"))?;
+            let socket = if group.is_ipv4() {
+                DiscoverySocket::bind_v4(0)
+            } else {
+                DiscoverySocket::bind_v6(0)
+            }
+            .map_err(io_err)?;
+            socket
+                .join_multicast(group)
+                .map(|()| "joined".into())
+                .map_err(io_err)
+        }
+        // `nets -`: the local networks, comma-separated.
+        "nets" => Ok(discovery::local_networks()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")),
         "listen" => TcpListener::bind(arg)
             .map(|_| "listening".into())
             .map_err(io_err),

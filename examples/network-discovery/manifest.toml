@@ -5,7 +5,7 @@ id = "example.network-discovery"
 name = "Network Discovery"
 version = "0.1.0"
 authors = ["The OxidHome Contributors"]
-description = "Probes configured LAN addresses over UDP and publishes the replies (streaming-plugin world)."
+description = "Broadcasts a UDP probe on the LAN and publishes the replies (streaming-plugin world)."
 source = "https://github.com/oxidhome/oxidhome/tree/main/examples/network-discovery"
 license = "MIT OR Apache-2.0"
 keywords = ["example", "network", "discovery"]
@@ -20,19 +20,23 @@ wasm = "target/wasm32-wasip2/debug/network_discovery.wasm"
 tick_interval_ms = 60000
 
 [capabilities]
-# The addresses the plugin may probe, and hear back from. The host
-# refuses anything else, including broadcast and multicast. Edit to
-# match your network (and `targets` below); the installer grants these
-# rules explicitly.
-network = ["udp://192.168.1.0/24:9999"]
+# What the plugin may probe, and hear back from; the host refuses
+# anything else. Broadcast needs a `udp` rule naming 255.255.255.255 and
+# the port; the devices answer from their own addresses, which the
+# private range covers (and with it the broadcast address of each
+# 192.168.x network, for `local:9999` targets). Edit to match your
+# network; the installer grants these rules explicitly.
+network = ["udp://255.255.255.255:9999", "udp://192.168.0.0/16:9999"]
 # The reply count.
 storage_quota_kb = 4
 
 [config.targets]
-# Comma-separated `ip:port` unicast addresses to probe on start.
+# Comma-separated targets to probe on start: `ip:port` (unicast or
+# broadcast), or `local:<port>` for the broadcast address of each local
+# IPv4 network the grant covers.
 type = "string"
-default = ""
-description = "Addresses to probe (ip:port, comma-separated)."
+default = "255.255.255.255:9999"
+description = "Targets to probe (ip:port or local:<port>, comma-separated)."
 
 [config.probe]
 type = "string"

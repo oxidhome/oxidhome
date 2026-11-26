@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "OxidHome example plugin: probes the LAN over UDP from the streaming-plugin world and publishes the replies."
+description = "OxidHome example plugin: broadcasts a UDP probe on the LAN from the streaming-plugin world and publishes the replies."
 
 [lib]
 crate-type = ["cdylib"]

@@ -738,6 +738,32 @@ interface host-state {
   list-state: func(filter: state-filter, cursor: option<string>, limit: u32) -> result<state-page, error>;
 }
 
+interface host-network {
+  use wasi:io/poll@0.2.0.{pollable};
+  use wasi:sockets/network@0.2.0.{error-code, ip-address, ip-address-family, ip-socket-address};
+
+  record local-network {
+    address: ip-address,
+    prefix-len: u8,
+  }
+
+  record datagram {
+    data: list<u8>,
+    remote-address: ip-socket-address,
+  }
+
+  resource discovery-socket {
+    open: static func(family: ip-address-family, local-port: u16) -> result<discovery-socket, error-code>;
+    local-address: func() -> result<ip-socket-address, error-code>;
+    join-multicast: func(group: ip-address) -> result<_, error-code>;
+    send: func(data: list<u8>, remote-address: ip-socket-address) -> result<_, error-code>;
+    receive: func(max-results: u32) -> result<list<datagram>, error-code>;
+    subscribe: func() -> pollable;
+  }
+
+  local-networks: func() -> list<local-network>;
+}
+
 interface host-media {
   use types.{device-id, error};
   use media.{media-pipeline, pipeline-handle, plugin-pipe-config, pipe-writer};
@@ -784,10 +810,11 @@ world streaming-plugin {
   import types;
   import media;
   import host-media;
+  import wasi:io/poll@0.2.0;
   import wasi:sockets/network@0.2.0;
+  import host-network;
   import wasi:sockets/instance-network@0.2.0;
   import wasi:io/error@0.2.0;
-  import wasi:io/poll@0.2.0;
   import wasi:io/streams@0.2.0;
   import wasi:clocks/monotonic-clock@0.2.0;
   import wasi:sockets/tcp@0.2.0;
@@ -854,10 +881,11 @@ world streaming-ai-plugin {
   import inference;
   import media;
   import host-media;
+  import wasi:io/poll@0.2.0;
   import wasi:sockets/network@0.2.0;
+  import host-network;
   import wasi:sockets/instance-network@0.2.0;
   import wasi:io/error@0.2.0;
-  import wasi:io/poll@0.2.0;
   import wasi:io/streams@0.2.0;
   import wasi:clocks/monotonic-clock@0.2.0;
   import wasi:sockets/tcp@0.2.0;

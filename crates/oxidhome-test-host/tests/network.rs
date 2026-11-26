@@ -650,6 +650,131 @@ async fn network_discovery_example_publishes_replies() {
     wait_for_deny(&host, "send", "discovery", &denied.to_string()).await;
 }
 
+// ── Discovery (Phase 8.3) ────────────────────────────────────────
+
+/// A free UDP port on loopback (bound and released), below 65535 so the
+/// next one up is a port too.
+fn free_udp_port() -> u16 {
+    loop {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .expect("free port")
+            .port();
+        if port < u16::MAX {
+            return port;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_sockets_reach_broadcast_and_multicast_only_through_named_rules() {
+    let host = TestHost::new().unwrap();
+    let port = free_udp_port();
+    let rules = [
+        format!("udp://255.255.255.255:{port}"),
+        "udp://224.0.0.251:5353".to_owned(),
+        // A CIDR never covers a group.
+        "udp://224.0.0.0/4:*".to_owned(),
+    ];
+    let ops = [
+        format!("disc-send 255.255.255.255:{port}"),
+        format!("disc-send 255.255.255.255:{}", port + 1),
+        "disc-send 239.255.255.250:1900".to_owned(),
+        // `std::net` sockets never reach broadcast, whatever the rules.
+        format!("udp 255.255.255.255:{port}"),
+        "disc-join 224.0.0.251".to_owned(),
+        "disc-join 239.255.255.250".to_owned(),
+        "disc-join 192.168.1.1".to_owned(),
+        format!("disc-bind {port}"),
+        format!("disc-bind {}", port + 1),
+    ];
+    let results = probe(&host, "disc", &rules, &ops).await;
+    // Allowed by the policy; a machine without a route for broadcast
+    // or multicast says so instead.
+    for (i, allowed, no_route) in [
+        (0, "ok:sent", "err:HostUnreachable"),
+        (4, "ok:joined", "err:Other"),
+    ] {
+        assert!(
+            results[i] == allowed || results[i] == no_route,
+            "{}: {}",
+            ops[i],
+            results[i]
+        );
+    }
+    assert_eq!(results[1], "err:PermissionDenied");
+    assert_eq!(results[2], "err:PermissionDenied");
+    assert_eq!(results[3], "err:PermissionDenied");
+    assert_eq!(results[5], "err:PermissionDenied");
+    assert_eq!(results[6], "err:InvalidInput");
+    assert_eq!(results[7], "ok:bound");
+    assert_eq!(results[8], "err:PermissionDenied");
+    wait_for_deny(&host, "send", "disc", "239.255.255.250:1900").await;
+    wait_for_deny(&host, "join", "disc", "239.255.255.250").await;
+    wait_for_deny(&host, "bind", "disc", &format!(":{}", port + 1)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_sockets_hear_only_allowed_senders() {
+    let host = TestHost::new().unwrap();
+    let echo = udp_echo();
+    let spoof = udp_reply_from_elsewhere();
+    let denied = udp_echo();
+    let results = probe(
+        &host,
+        "disc-unicast",
+        &[
+            format!("udp://127.0.0.1:{}", echo.port()),
+            format!("udp://127.0.0.1:{}", spoof.port()),
+        ],
+        &[
+            format!("disc {echo}"),
+            format!("disc {spoof}"),
+            format!("disc {denied}"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        results,
+        vec![
+            format!("ok:pong@{echo}"),
+            "err:no reply".to_owned(),
+            "err:PermissionDenied".to_owned(),
+        ]
+    );
+    wait_for_deny(&host, "send", "disc-unicast", &denied.to_string()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_networks_are_listed_when_the_grant_covers_them_whole() {
+    let host = TestHost::new().unwrap();
+    let ops = ["nets -".to_owned()];
+    let listed = probe(&host, "nets", &["tcp://127.0.0.0/8:*".to_owned()], &ops).await;
+    // Loopback may carry more prefixes (aliases), each inside the /8.
+    let listed = listed[0].strip_prefix("ok:").expect("listed");
+    assert!(
+        listed.split(',').any(|net| net == "127.0.0.0/8"),
+        "{listed}"
+    );
+    assert!(
+        listed.split(',').all(|net| net.starts_with("127.")),
+        "{listed}"
+    );
+    let narrowed = probe(
+        &host,
+        "nets-narrow",
+        &["udp://127.0.0.0/30:1".to_owned()],
+        &ops,
+    )
+    .await;
+    // A rule narrower than the network doesn't list it (a loopback
+    // alias inside the rule may be listed).
+    assert!(narrowed[0].starts_with("ok:"), "{narrowed:?}");
+    assert!(!narrowed[0].contains("127.0.0.0/8"), "{narrowed:?}");
+    let none = probe(&host, "nets-none", &[], &ops).await;
+    assert_eq!(none, vec!["ok:".to_owned()]);
+}
+
 // ── HTTPS (Phase 8.2) ────────────────────────────────────────────
 
 /// A certificate (DER chain head) and its key, made by `rcgen`.

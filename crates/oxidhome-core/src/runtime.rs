@@ -22,7 +22,7 @@ mod instance;
 mod io_wakeup;
 mod lifecycle;
 mod media_placeholder;
-mod network;
+pub(crate) mod network;
 mod plugin_stdio;
 mod registry;
 pub mod sandbox;

@@ -173,6 +173,10 @@ hyper.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+# Phase 8.3: broadcast / multicast discovery sockets and the host's
+# interface networks (`runtime::network::discovery`).
+socket2.workspace = true
+if-addrs.workspace = true
 # Phase 8: CIDR containment for network rules (`runtime::network`).
 ipnet.workspace = true
 # Decodes each plugin component's embedded WIT types for the load-time

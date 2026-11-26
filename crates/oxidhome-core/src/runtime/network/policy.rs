@@ -32,6 +32,21 @@
 //! An operator narrows a grant by containment: the effective rules are
 //! the granted rules some requested rule covers plus the requested rules
 //! some granted rule covers ([`covers`]).
+//!
+//! Discovery sockets (`host-network`, Phase 8.3) add three checks on
+//! their sends ([`NetworkPolicy::check_discovery_send`]):
+//!
+//! - The limited broadcast `255.255.255.255` and multicast groups
+//!   ([`is_group_address`]) are reached only through a `udp` rule naming
+//!   that exact address, for the port. A CIDR never covers them, and
+//!   `wasi:sockets` never reaches them.
+//! - A subnet-directed broadcast (an address the kernel treats as a
+//!   broadcast of a local IPv4 network: its last or first address, its
+//!   classful network's, or the interface's configured one) reaches every host of that network, so it needs a `udp`
+//!   (or `any`) IP rule covering the whole network. When the host can't
+//!   list its networks, IPv4 destinations other than named groups are
+//!   refused.
+//! - Everything else is an ordinary UDP send.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -58,6 +73,27 @@ pub(crate) const RESOLVED_TTL: Duration = Duration::from_mins(10);
 pub(crate) const MAX_RESOLVED: usize = 1024;
 /// Most addresses one lookup hands the plugin (and records).
 pub(crate) const MAX_LOOKUP_RESULTS: usize = 32;
+/// Most networks `local-networks` lists.
+pub(crate) const MAX_LOCAL_NETWORKS: usize = 64;
+
+/// One of the host's interface networks, as a discovery send sees it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalInterface {
+    /// The network (truncated to its prefix).
+    pub(crate) net: IpNet,
+    /// The broadcast address the interface is configured with, when the
+    /// system reports one: the kernel treats it as a broadcast too.
+    pub(crate) broadcast: Option<IpAddr>,
+}
+
+impl From<IpNet> for LocalInterface {
+    fn from(net: IpNet) -> Self {
+        Self {
+            net,
+            broadcast: None,
+        }
+    }
+}
 /// Longest DNS name, without the root dot.
 const MAX_NAME_LEN: usize = 253;
 /// Audited denials allowed in a burst, per instance.
@@ -129,6 +165,23 @@ pub(crate) enum Denial {
     /// A TLS server refused by its certificate pin.
     #[error("{0}")]
     Tls(String),
+    #[error("no udp network rule names {0}")]
+    GroupNotNamed(SocketAddr),
+    #[error(
+        "{addr} is the broadcast address of {net}; no udp network rule covers that whole network"
+    )]
+    SubnetBroadcast { addr: SocketAddr, net: IpNet },
+    #[error("joining {0} needs a udp network rule naming that group")]
+    Join(IpAddr),
+    #[error("binding discovery port {0} needs a udp broadcast or multicast rule for that port")]
+    DiscoveryPort(u16),
+    #[error("the host's networks couldn't be listed, so {0} may be a broadcast address")]
+    InterfacesUnknown(SocketAddr),
+    #[error(
+        "the system refused {0}: a broadcast address the host's network list didn't show, or a \
+         prohibit route"
+    )]
+    UnlistedBroadcast(SocketAddr),
 }
 
 /// The per-instance policy object. Shared (`Arc`) between the socket
@@ -247,6 +300,93 @@ impl CompiledRule {
     fn is_name_rule(&self) -> bool {
         matches!(self.host, RuleHost::Name(_) | RuleHost::Suffix(_))
     }
+
+    /// Whether this is a `udp` rule naming exactly `ip`: the only rule
+    /// that reaches a broadcast or multicast group.
+    fn names_group(&self, ip: IpAddr) -> bool {
+        self.proto == Proto::Udp && matches!(self.host, RuleHost::Ip(rule_ip) if rule_ip == ip)
+    }
+
+    /// Whether this IP rule covers every address of `net`: it contains
+    /// `net`, and grants every class `net` holds ([`net_class`]).
+    fn covers_net(&self, net: &IpNet) -> bool {
+        match &self.host {
+            RuleHost::Ip(ip) => {
+                net.prefix_len() == net.max_prefix_len()
+                    && *ip == net.network()
+                    && classify(*ip) != AddressClass::Forbidden
+            }
+            RuleHost::Net(rule_net) => {
+                rule_net.contains(net)
+                    && match net_class(net) {
+                        Some(AddressClass::Public) => true,
+                        Some(class) => net_within_class(rule_net, class),
+                        None => false,
+                    }
+            }
+            RuleHost::Name(_) | RuleHost::Suffix(_) => false,
+        }
+    }
+}
+
+/// Whether `ip` is a destination only a discovery socket may reach: the
+/// limited broadcast address or a multicast group (IPv4-mapped forms
+/// included).
+pub(crate) fn is_group_address(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast(),
+        IpAddr::V6(v6) => v6.is_multicast(),
+    }
+}
+
+/// The subnet-directed broadcast address of an IPv4 network; none for
+/// IPv6 and for `/31` and `/32`, which have no broadcast address.
+fn directed_broadcast(net: &IpNet) -> Option<IpAddr> {
+    match net {
+        IpNet::V4(v4) if v4.prefix_len() < 31 => Some(IpAddr::V4(v4.broadcast())),
+        _ => None,
+    }
+}
+
+/// An IPv4 network's first address, which BSD kernels (macOS) also
+/// treat as a broadcast address on any network but a `/32`.
+fn old_style_broadcast(net: &IpNet) -> Option<IpAddr> {
+    match net {
+        IpNet::V4(v4) if v4.prefix_len() < 32 => Some(IpAddr::V4(v4.network())),
+        _ => None,
+    }
+}
+
+/// The first and last addresses of the classful (A/B/C) network an
+/// IPv4 network lies in, which BSD kernels (macOS) also treat as
+/// broadcast addresses on that interface. Like XNU, the classful mask
+/// is narrowed to the network's own, so a supernet's classful network
+/// is the network itself. None for a `/32`, which XNU leaves out of its
+/// broadcast test.
+fn classful_broadcasts(net: &IpNet) -> [Option<IpAddr>; 2] {
+    let IpNet::V4(v4) = net else {
+        return [None, None];
+    };
+    if v4.prefix_len() == 32 {
+        return [None, None];
+    }
+    let prefix = match v4.network().octets()[0] {
+        0..=127 => 8,
+        128..=191 => 16,
+        192..=223 => 24,
+        _ => return [None, None],
+    };
+    let prefix = v4.prefix_len().min(prefix);
+    match ipnet::Ipv4Net::new(v4.network(), prefix) {
+        Ok(class) => {
+            let class = class.trunc();
+            [
+                Some(IpAddr::V4(class.network())),
+                Some(IpAddr::V4(class.broadcast())),
+            ]
+        }
+        Err(_) => [None, None],
+    }
 }
 
 /// A CIDR inside the IPv4-mapped IPv6 range (`::ffff:0:0/96`) as the
@@ -291,7 +431,10 @@ fn is_local_name(name: &str) -> bool {
 /// - A name never covers an IP rule, nor an IP rule a name.
 pub(crate) fn covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
     let (wide, narrow) = (CompiledRule::compile(wide), CompiledRule::compile(narrow));
-    let proto = wide.proto == Proto::Any || wide.proto == narrow.proto;
+    // Only a `udp` rule reaches a broadcast or multicast group, so an
+    // `any` rule naming one grants nothing and covers nothing.
+    let names_group = matches!(narrow.host, RuleHost::Ip(ip) if is_group_address(ip));
+    let proto = wide.proto == narrow.proto || (wide.proto == Proto::Any && !names_group);
     let port = match (wide.port, narrow.port) {
         (PortMatch::Any, _) => true,
         // Only the full range: a UDP sender may use source port 0.
@@ -352,10 +495,10 @@ fn grants_whole_range(host: &RuleHost) -> bool {
 /// Whether an IP rule grants some loopback, link-local or private address.
 fn grants_non_public(host: &RuleHost) -> bool {
     match host {
-        RuleHost::Ip(ip) => !matches!(
-            classify(*ip),
-            AddressClass::Public | AddressClass::Forbidden
-        ),
+        // A forbidden literal counts too: a broadcast or multicast group
+        // is reached only through a rule naming it, so `0.0.0.0/0` must
+        // not cover `255.255.255.255`.
+        RuleHost::Ip(ip) => classify(*ip) != AddressClass::Public,
         RuleHost::Net(_) => grants_whole_range(host),
         RuleHost::Name(_) | RuleHost::Suffix(_) => false,
     }
@@ -387,6 +530,59 @@ fn class_blocks(class: AddressClass) -> &'static [&'static str] {
         AddressClass::Public | AddressClass::Forbidden => &[],
     }
 }
+
+/// The one class every address of `net` has, as far as a rule grant
+/// goes: the class whose blocks hold all of it, or public when it
+/// overlaps none of them. `None` for a range that mixes classes
+/// (`172.0.0.0/11` holds public and private addresses).
+fn net_class(net: &IpNet) -> Option<AddressClass> {
+    if let Some(class) = NON_PUBLIC
+        .iter()
+        .find(|class| net_within_class(net, **class))
+    {
+        return Some(*class);
+    }
+    let overlaps = |block: &str| {
+        block
+            .parse::<IpNet>()
+            .is_ok_and(|block| block.contains(net) || net.contains(&block))
+    };
+    let mixed = NON_PUBLIC
+        .iter()
+        .flat_map(|class| class_blocks(*class))
+        .chain(NOT_WHOLLY_PUBLIC.iter())
+        .any(|block| overlaps(block));
+    let public = match net {
+        IpNet::V4(_) => true,
+        // Global unicast is the only public IPv6 space.
+        IpNet::V6(_) => "2000::/3"
+            .parse::<IpNet>()
+            .is_ok_and(|global| global.contains(net)),
+    };
+    (public && !mixed && classify(net.network()) == AddressClass::Public)
+        .then_some(AddressClass::Public)
+}
+
+/// Blocks a public CIDR may not overlap to count as wholly public: the
+/// forbidden ones `classify` knows, and the IPv6 ranges it classifies by
+/// an embedded IPv4 address.
+const NOT_WHOLLY_PUBLIC: [&str; 15] = [
+    "0.0.0.0/8",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.88.99.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "2001::/23",
+    "2001:db8::/32",
+    "3fff::/20",
+    "2002::/16",
+    "64:ff9b::/96",
+    "::ffff:0:0/96",
+];
 
 fn net_within_class(net: &IpNet, class: AddressClass) -> bool {
     class_blocks(class).iter().any(|block| {
@@ -572,6 +768,114 @@ impl NetworkPolicy {
         } else {
             Err(Denial::Bind(addr))
         }
+    }
+
+    /// Check a discovery socket's send to `addr` (see the module docs):
+    /// whether it is a broadcast (`SO_BROADCAST` is set for that send
+    /// only), or why it is refused. `local` are the host's interface
+    /// networks, which tell a subnet-directed broadcast from a unicast
+    /// address; `None` when the host couldn't list them, which refuses
+    /// every IPv4 destination but a named group (any could be a broadcast
+    /// address).
+    pub(crate) fn check_discovery_send(
+        &self,
+        addr: SocketAddr,
+        local: Option<&[LocalInterface]>,
+    ) -> Result<bool, Denial> {
+        let ip = addr.ip().to_canonical();
+        let port = addr.port();
+        if is_group_address(ip) {
+            return if self
+                .rules
+                .iter()
+                .any(|r| r.names_group(ip) && r.allows(Use::Udp, port))
+            {
+                Ok(!ip.is_multicast())
+            } else {
+                Err(Denial::GroupNotNamed(SocketAddr::new(ip, port)))
+            };
+        }
+        let Some(local) = local else {
+            return if ip.is_ipv4() {
+                Err(Denial::InterfacesUnknown(SocketAddr::new(ip, port)))
+            } else {
+                self.check_addr(Use::Udp, addr, None).map(|()| false)
+            };
+        };
+        // Every network it is a broadcast address of (computed or
+        // configured; overlapping interface networks can share one) must
+        // be covered whole.
+        let mut nets = local
+            .iter()
+            .filter(|iface| {
+                directed_broadcast(&iface.net) == Some(ip)
+                    || old_style_broadcast(&iface.net) == Some(ip)
+                    || classful_broadcasts(&iface.net).contains(&Some(ip))
+                    || iface.broadcast.map(|b| b.to_canonical()) == Some(ip)
+            })
+            .map(|iface| &iface.net)
+            .peekable();
+        if nets.peek().is_some() {
+            if classify(ip) == AddressClass::Forbidden {
+                return Err(Denial::Forbidden(ip, AddressClass::Forbidden));
+            }
+            // The address itself too: a configured broadcast address
+            // can lie outside its network.
+            self.check_addr(Use::Udp, addr, None)?;
+            for net in nets {
+                if !self
+                    .rules
+                    .iter()
+                    .any(|r| r.allows(Use::Udp, port) && r.covers_net(net))
+                {
+                    return Err(Denial::SubnetBroadcast {
+                        addr: SocketAddr::new(ip, port),
+                        net: *net,
+                    });
+                }
+            }
+            return Ok(true);
+        }
+        self.check_addr(Use::Udp, addr, None).map(|()| false)
+    }
+
+    /// Joining the multicast `group`: a `udp` rule must name it.
+    pub(crate) fn check_join(&self, group: IpAddr) -> Result<(), Denial> {
+        let group = group.to_canonical();
+        if group.is_multicast() && self.rules.iter().any(|r| r.names_group(group)) {
+            Ok(())
+        } else {
+            Err(Denial::Join(group))
+        }
+    }
+
+    /// Binding a discovery socket of the given family to `port`: an
+    /// ephemeral port always, a fixed one only when a `udp` broadcast or
+    /// multicast rule of that family allows that port (a socket on `5353`
+    /// for `udp://224.0.0.251:5353`).
+    pub(crate) fn check_discovery_bind(&self, port: u16, ipv6: bool) -> Result<(), Denial> {
+        let named = self.rules.iter().any(|r| {
+            r.proto == Proto::Udp
+                && matches!(r.host, RuleHost::Ip(ip) if is_group_address(ip) && ip.is_ipv6() == ipv6)
+                && r.allows(Use::Udp, port)
+        });
+        if port == 0 || named {
+            Ok(())
+        } else {
+            Err(Denial::DiscoveryPort(port))
+        }
+    }
+
+    /// The host's interface networks `interfaces` that one IP rule (of
+    /// any proto) covers whole, under the class rules of [`covers`].
+    /// Sorted, deduplicated, at most [`MAX_LOCAL_NETWORKS`].
+    pub(crate) fn local_networks(&self, interfaces: &[IpNet]) -> Vec<IpNet> {
+        let listed: std::collections::BTreeSet<IpNet> = interfaces
+            .iter()
+            .map(|net| canonical_net(*net))
+            .filter(|net| self.rules.iter().any(|rule| rule.covers_net(net)))
+            .collect();
+        listed.into_iter().take(MAX_LOCAL_NETWORKS).collect()
     }
 
     /// The name rules matching `name` for any of `uses`, after checking
@@ -1339,5 +1643,314 @@ mod tests {
         assert_eq!(bucket.take(now), None);
         assert_eq!(bucket.take(now), None);
         assert_eq!(bucket.take(now + Duration::from_secs(1)), Some(2));
+    }
+
+    fn nets(list: &[&str]) -> Vec<IpNet> {
+        list.iter().map(|n| n.parse().expect("net")).collect()
+    }
+
+    fn ifaces(list: &[&str]) -> Vec<LocalInterface> {
+        nets(list).into_iter().map(LocalInterface::from).collect()
+    }
+
+    #[test]
+    fn groups_need_a_udp_rule_naming_them() {
+        let p = policy(&[
+            "udp://255.255.255.255:9999",
+            "udp://224.0.0.251:5353",
+            "udp://[ff02::fb]:5353",
+            "any://239.255.255.250:1900",
+            "udp://224.0.0.0/4:*",
+            "udp://0.0.0.0/0:*",
+        ]);
+        let send = |a: &str| p.check_discovery_send(sa(a), Some(&[]));
+        // The limited broadcast needs `SO_BROADCAST`; multicast doesn't.
+        assert_eq!(send("255.255.255.255:9999"), Ok(true));
+        assert_eq!(send("224.0.0.251:5353"), Ok(false));
+        assert!(send("[::ffff:224.0.0.251]:5353").is_ok());
+        assert!(send("[ff02::fb]:5353").is_ok());
+        // Wrong port, an `any` rule, a CIDR: none names the group.
+        assert_eq!(
+            send("255.255.255.255:9998"),
+            Err(Denial::GroupNotNamed(sa("255.255.255.255:9998")))
+        );
+        assert!(send("239.255.255.250:1900").is_err());
+        assert!(send("224.0.0.252:5355").is_err());
+        assert!(send("[ff02::1]:5353").is_err());
+        // Ordinary sends still go through the UDP rules.
+        assert!(send("8.8.8.8:53").is_ok());
+        assert!(send("192.168.1.5:53").is_err());
+        // `wasi:sockets` never reaches a group, whatever the rules.
+        assert!(
+            p.check_addr(Use::Udp, sa("255.255.255.255:9999"), None)
+                .is_err()
+        );
+        assert!(
+            p.check_addr(Use::Udp, sa("224.0.0.251:5353"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_interfaces_refuse_ipv4_but_named_groups() {
+        let p = policy(&[
+            "udp://255.255.255.255:9999",
+            "udp://0.0.0.0/0:*",
+            "udp://[::/0]:*",
+        ]);
+        assert!(
+            p.check_discovery_send(sa("255.255.255.255:9999"), None)
+                .is_ok()
+        );
+        assert_eq!(
+            p.check_discovery_send(sa("8.8.8.8:53"), None),
+            Err(Denial::InterfacesUnknown(sa("8.8.8.8:53")))
+        );
+        assert!(
+            p.check_discovery_send(sa("[2001:4860::1]:53"), None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bsd_broadcast_forms_need_the_whole_network() {
+        let local = ifaces(&["192.168.1.0/24"]);
+        let half = policy(&["udp://192.168.1.0/25:9999", "udp://192.168.1.0:9999"]);
+        // The first address counts too (BSD treats it as a broadcast).
+        assert!(
+            half.check_discovery_send(sa("192.168.1.0:9999"), Some(&local))
+                .is_err()
+        );
+        assert_eq!(
+            policy(&["udp://192.168.1.0/24:9999"])
+                .check_discovery_send(sa("192.168.1.0:9999"), Some(&local)),
+            Ok(true)
+        );
+        // So do the classful network's first and last (BSD again): on
+        // 10.1.2.0/24, 10.255.255.255 needs that /24 whole.
+        let classful = ifaces(&["10.1.2.0/24"]);
+        assert!(
+            policy(&["udp://10.255.255.255:9999", "udp://10.1.2.0/25:9999"])
+                .check_discovery_send(sa("10.255.255.255:9999"), Some(&classful))
+                .is_err()
+        );
+        assert_eq!(
+            policy(&["udp://10.0.0.0/8:9999"])
+                .check_discovery_send(sa("10.255.255.255:9999"), Some(&classful)),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn subnet_broadcasts_need_the_whole_network() {
+        let local = ifaces(&["192.168.1.0/24", "10.0.0.2/31", "198.18.0.0/24"]);
+        let whole = policy(&["udp://192.168.0.0/16:9999"]);
+        assert!(
+            whole
+                .check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
+                .is_ok()
+        );
+        let half = policy(&["udp://192.168.1.128/25:9999"]);
+        assert_eq!(
+            half.check_discovery_send(sa("192.168.1.255:9999"), Some(&local)),
+            Err(Denial::SubnetBroadcast {
+                addr: sa("192.168.1.255:9999"),
+                net: "192.168.1.0/24".parse().unwrap(),
+            })
+        );
+        // A literal naming the broadcast address doesn't do: grant
+        // narrowing lets `192.168.1.128/25` cover it.
+        let named = policy(&["udp://192.168.1.255:9999"]);
+        assert!(
+            named
+                .check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
+                .is_err()
+        );
+        // Overlapping networks sharing a broadcast address must all be
+        // covered, whatever the order they are listed in.
+        let overlapping = ifaces(&["192.168.1.128/25", "192.168.1.0/24"]);
+        // A configured broadcast address counts as the network's too.
+        let configured = [
+            LocalInterface::from("192.168.1.0/24".parse::<IpNet>().unwrap()),
+            LocalInterface {
+                net: "10.9.0.0/16".parse().unwrap(),
+                broadcast: Some("192.168.1.255".parse().unwrap()),
+            },
+        ];
+        let lan = policy(&["udp://192.168.1.0/24:9999"]);
+        // A configured broadcast outside its network needs a rule for
+        // the address as well as the network.
+        let outside = [LocalInterface {
+            net: "10.0.0.5/32".parse().unwrap(),
+            broadcast: Some("10.0.0.255".parse().unwrap()),
+        }];
+        assert!(
+            policy(&["udp://10.0.0.5:9999"])
+                .check_discovery_send(sa("10.0.0.255:9999"), Some(&outside))
+                .is_err()
+        );
+        assert!(
+            lan.check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
+                .is_ok()
+        );
+        assert!(
+            lan.check_discovery_send(sa("192.168.1.255:9999"), Some(&configured))
+                .is_err()
+        );
+        assert!(
+            half.check_discovery_send(sa("192.168.1.255:9999"), Some(&overlapping))
+                .is_err()
+        );
+        // A supernet's classful network is the supernet itself, so a
+        // host inside it stays unicast.
+        let supernet = ifaces(&["192.168.0.0/23"]);
+        assert_eq!(
+            policy(&["udp://192.168.0.255:9999"])
+                .check_discovery_send(sa("192.168.0.255:9999"), Some(&supernet)),
+            Ok(false)
+        );
+        // A /32 alias is no broadcast domain of its own.
+        let alias = ifaces(&["192.168.1.128/25", "192.168.1.42/32"]);
+        assert_eq!(
+            policy(&["udp://192.168.1.128/25:9999"])
+                .check_discovery_send(sa("192.168.1.255:9999"), Some(&alias)),
+            Ok(true)
+        );
+        // A /31's first address counts (BSD exempts only a /32).
+        let p2p_first = ifaces(&["10.0.0.2/31"]);
+        assert!(
+            policy(&["udp://10.0.0.2:9999"])
+                .check_discovery_send(sa("10.0.0.2:9999"), Some(&p2p_first))
+                .is_err()
+        );
+        // A /31 has no last-address broadcast (its first is checked as
+        // the BSD form).
+        let p2p = policy(&["udp://10.0.0.3:9999"]);
+        assert!(
+            p2p.check_discovery_send(sa("10.0.0.3:9999"), Some(&local))
+                .is_ok()
+        );
+        // `0.0.0.0/0` covers public space only, and no rule covers a
+        // forbidden network's broadcast address.
+        let public = policy(&["udp://0.0.0.0/0:9999", "udp://198.18.0.255:9999"]);
+        assert!(
+            public
+                .check_discovery_send(sa("192.168.1.255:9999"), Some(&local))
+                .is_err()
+        );
+        assert!(
+            public
+                .check_discovery_send(sa("198.18.0.255:9999"), Some(&local))
+                .is_err()
+        );
+        // A public-looking network holding a forbidden block isn't
+        // covered by public space.
+        let mixed = ifaces(&["198.16.0.0/14"]);
+        assert!(
+            public
+                .check_discovery_send(sa("198.19.255.255:9999"), Some(&mixed))
+                .is_err()
+        );
+        // Broadcasts are flagged so the socket enables `SO_BROADCAST`
+        // for them only.
+        assert_eq!(
+            whole.check_discovery_send(sa("192.168.1.255:9999"), Some(&local)),
+            Ok(true)
+        );
+        assert_eq!(
+            whole.check_discovery_send(sa("192.168.1.7:9999"), Some(&local)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn joins_and_fixed_ports_need_group_rules() {
+        let p = policy(&[
+            "udp://224.0.0.251:5353",
+            "udp://255.255.255.255:9999",
+            "udp://192.168.0.0/16:*",
+            "any://239.255.255.250:1900",
+        ]);
+        assert!(p.check_join(ip("224.0.0.251")).is_ok());
+        assert_eq!(
+            p.check_join(ip("239.255.255.250")),
+            Err(Denial::Join(ip("239.255.255.250")))
+        );
+        // Not a group at all.
+        assert!(p.check_join(ip("192.168.1.5")).is_err());
+        assert!(p.check_discovery_bind(0, false).is_ok());
+        assert!(p.check_discovery_bind(5353, false).is_ok());
+        assert!(p.check_discovery_bind(9999, false).is_ok());
+        // An IPv4 group rule doesn't open the port for IPv6.
+        assert!(p.check_discovery_bind(5353, true).is_err());
+        // A unicast rule's port doesn't open a shared fixed port, nor
+        // does an `any` group rule.
+        assert_eq!(
+            p.check_discovery_bind(1900, false),
+            Err(Denial::DiscoveryPort(1900))
+        );
+        assert!(policy(&[]).check_discovery_bind(5353, false).is_err());
+    }
+
+    #[test]
+    fn wide_grants_never_cover_a_group_rule() {
+        assert!(!covers_str(
+            "udp://0.0.0.0/0:*",
+            "udp://255.255.255.255:9999"
+        ));
+        assert!(!covers_str("udp://224.0.0.0/4:*", "udp://224.0.0.251:5353"));
+        assert!(!covers_str("any://[::/0]:*", "udp://[ff02::fb]:5353"));
+        assert!(covers_str("udp://224.0.0.251:*", "udp://224.0.0.251:5353"));
+        // `any` names no group, so it covers no group rule.
+        assert!(!covers_str(
+            "any://255.255.255.255:*",
+            "udp://255.255.255.255:9999"
+        ));
+        assert!(covers_str(
+            "any://255.255.255.255:*",
+            "any://255.255.255.255:9999"
+        ));
+        // Public literals are still covered by a public range.
+        assert!(covers_str("udp://0.0.0.0/0:*", "udp://8.8.8.8:53"));
+    }
+
+    #[test]
+    fn local_networks_are_the_interface_networks_the_grant_covers() {
+        let ifaces = nets(&[
+            "192.168.1.0/24",
+            "10.0.0.0/8",
+            "127.0.0.0/8",
+            "fe80::/64",
+            "2001:4860::/64",
+            "fd00:1::/64",
+            "172.0.0.0/11",
+            "198.16.0.0/14",
+            "2002:8000::/17",
+        ]);
+        let p = policy(&[
+            "udp://192.168.0.0/16:9999",
+            // Inside a network: lists nothing.
+            "tcp://10.1.2.0/24:80",
+            "udp://10.9.9.9:1",
+            "udp://255.255.255.255:9999",
+            "tcp://mqtt.lan:1883",
+            "https://[::/0]",
+            // Public space only: not the mixed public / private /11.
+            "udp://0.0.0.0/0:*",
+        ]);
+        let listed: Vec<String> = p
+            .local_networks(&ifaces)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(listed, ["192.168.1.0/24", "2001:4860::/64"]);
+        assert_eq!(policy(&[]).local_networks(&ifaces), Vec::<IpNet>::new());
+        let loopback = policy(&["udp://127.0.0.0/8:*", "udp://[fe80::/10]:*"]);
+        let listed: Vec<String> = loopback
+            .local_networks(&ifaces)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(listed, ["127.0.0.0/8", "fe80::/64"]);
     }
 }

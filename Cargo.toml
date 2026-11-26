@@ -219,6 +219,12 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "h
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "0.8.5"
+# Phase 8.3: LAN discovery for streaming plugins (`runtime::network::discovery`).
+# `socket2` (already in the graph via tokio / hyper) sets `SO_BROADCAST`,
+# `SO_REUSEADDR` and multicast membership, which `wasmtime-wasi`'s UDP
+# socket doesn't expose; `if-addrs` lists the host's interface networks.
+socket2 = { version = "0.6.3", features = ["all"] }
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 # Test-only: certificates for the local TLS servers in the test-host
 # HTTPS tests. `ring` like rustls above, no PEM.
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }

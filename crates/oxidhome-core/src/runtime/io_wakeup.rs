@@ -8,8 +8,9 @@
 //!
 //! - **What is watched:** every TCP input stream (the one
 //!   `finish-connect` handed the guest) and every UDP
-//!   `incoming-datagram-stream` in the instance's resource table. Other
-//!   streams (stdin, `wasi:http` bodies) are not.
+//!   `incoming-datagram-stream` in the instance's resource table, and
+//!   every `host-network` discovery socket. Other streams (stdin,
+//!   `wasi:http` bodies) are not.
 //! - **Who gets it:** `streaming-plugin` / `streaming-ai-plugin`
 //!   instances whose manifest sets `runtime.tick_interval_ms`. A plugin
 //!   without a tick cadence is never ticked, early or not; the other
@@ -28,7 +29,8 @@
 //!
 //! A datagram the network policy drops on receive (its sender isn't
 //! allowed) never makes the stream readable: `wasmtime-wasi` discards it
-//! inside the receive that readiness waits on.
+//! inside the receive that readiness waits on; a discovery socket's wait
+//! discards it the same way.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -40,6 +42,8 @@ use std::time::Duration;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::bindings::sockets::udp::IncomingDatagramStream;
 use wasmtime_wasi::p2::{DynFuture, DynInputStream, Pollable as _, TcpSocket};
+
+use super::network::DiscoverySocket;
 
 /// Shortest time between the end of one tick and the start of an early
 /// tick a readable socket triggers.
@@ -84,6 +88,9 @@ pub(crate) fn readable(table: &mut ResourceTable) -> Readable<'_> {
             if entry.is::<IncomingDatagramStream>() {
                 let stream = entry.downcast_mut::<IncomingDatagramStream>()?;
                 Some(stream.ready())
+            } else if entry.is::<DiscoverySocket>() {
+                let socket = entry.downcast_mut::<DiscoverySocket>()?;
+                Some(socket.ready())
             } else if tcp_inputs.contains(&entry_addr(entry)) {
                 let stream = entry.downcast_mut::<DynInputStream>()?;
                 Some(stream.ready())
