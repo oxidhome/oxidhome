@@ -21,6 +21,8 @@ wasm = "target/wasm32-wasip2/debug/service_bouncer.wasm"
 
 [capabilities]
 declares_services = ["bouncer"]
+# A button whose `press` bounces like `kick` (H6 slice 5 fixture).
+declares_devices = ["button"]
 # Bouncer reads `bounce_to` from KV — give it a tiny per-instance quota.
 storage_quota_kb = 4
 # `kick` may announce on `bouncer.relay`, and every bouncer listens

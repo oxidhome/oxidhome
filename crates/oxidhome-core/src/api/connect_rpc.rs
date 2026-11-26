@@ -1259,14 +1259,129 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             ..Default::default()
         })
     }
+
+    async fn get_plugin_deny<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb_grant::GetPluginDenyRequest>,
+    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+        let req = request.to_owned_message();
+        require_connect(
+            &ctx,
+            Action::PolicyManage,
+            &Resource::plugin(req.plugin_id.as_str()),
+        )?;
+        let view =
+            super::plugin_deny_admin::plugin_deny(&self.engine.plugin_denies(), req.plugin_id);
+        Response::ok(proto_plugin_deny(view))
+    }
+
+    async fn set_plugin_deny<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb_grant::SetPluginDenyRequest>,
+    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+        // Owner only: refuse others before copying the list.
+        require_connect(
+            &ctx,
+            Action::PolicyManage,
+            &Resource::pre_check(ResourceKind::Plugin),
+        )?;
+        let req = request.to_owned_message();
+        let specs = req.deny.into_iter().map(selector_spec).collect();
+        let view = self
+            .change_plugin_deny(&ctx, req.plugin_id, Some(specs))
+            .await?;
+        Response::ok(view)
+    }
+
+    async fn reset_plugin_deny<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb_grant::ResetPluginDenyRequest>,
+    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+        let req = request.to_owned_message();
+        let view = self.change_plugin_deny(&ctx, req.plugin_id, None).await?;
+        Response::ok(view)
+    }
+}
+
+/// H6 slice 5: a plugin's deny list as `PluginDeny`.
+fn proto_plugin_deny(view: super::plugin_deny_admin::PluginDenyView) -> pb_grant::PluginDeny {
+    let strings = |v: &serde_json::Value, key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or_else(Vec::new, |a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect()
+            })
+    };
+    pb_grant::PluginDeny {
+        plugin_id: view.plugin_id,
+        deny: view
+            .deny
+            .iter()
+            .map(|d| ProtoSelector {
+                actions: strings(d, "actions"),
+                category: strings(d, "category"),
+                devices: strings(d, "devices"),
+                services: strings(d, "services"),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+impl OxidHomePlugins {
+    /// `SetPluginDeny` / `ResetPluginDeny` (`specs = None`):
+    /// `policy.manage` on the plugin, then
+    /// [`super::plugin_deny_admin::change_plugin_deny`].
+    async fn change_plugin_deny(
+        &self,
+        ctx: &RequestContext,
+        plugin_id: String,
+        specs: Option<Vec<super::token_admin::SelectorSpec>>,
+    ) -> Result<pb_grant::PluginDeny, ConnectError> {
+        use super::plugin_deny_admin::PluginDenyAdminError as E;
+        require_connect(
+            ctx,
+            Action::PolicyManage,
+            &Resource::plugin(plugin_id.as_str()),
+        )?;
+        let invocation = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .ok_or_else(|| rpc_err(ctx, ConnectError::internal("no invocation context")))?;
+        let view = super::plugin_deny_admin::change_plugin_deny(
+            self.engine.clone(),
+            super::network_admin::GrantActor::of("connect", invocation),
+            plugin_id,
+            specs,
+        )
+        .await
+        .map_err(|e| {
+            let err = match &e {
+                E::Invalid(m) => ConnectError::invalid_argument(m.clone()),
+                E::Full(m) => ConnectError::failed_precondition(m.clone()),
+                E::Store(_) => {
+                    tracing::error!(target: "api.plugins", error = %e, "plugin deny change failed");
+                    ConnectError::internal("plugin deny change failed")
+                }
+            };
+            rpc_err(ctx, err)
+        })?;
+        Ok(proto_plugin_deny(view))
+    }
 }
 
 /// Phase 8.5: the proto messages of the network grant RPCs.
 mod pb_grant {
     pub(super) use oxidhome_proto::proto::oxidhome::v1::{
-        NetworkGrantChange, NetworkGrants, NotRestartedInstance, ResetPluginNetworkGrantRequest,
-        ResetPluginNetworkGrantResponse, SetPluginNetworkGrantRequest,
-        SetPluginNetworkGrantResponse,
+        GetPluginDenyRequest, NetworkGrantChange, NetworkGrants, NotRestartedInstance, PluginDeny,
+        ResetPluginDenyRequest, ResetPluginNetworkGrantRequest, ResetPluginNetworkGrantResponse,
+        SetPluginDenyRequest, SetPluginNetworkGrantRequest, SetPluginNetworkGrantResponse,
     };
 }
 

@@ -359,6 +359,8 @@ pub struct OfflineStores {
     pub devices: crate::state::DeviceMetaStore,
     /// The `network_tls_pin` table (Phase 8.2).
     pub tls_pins: crate::state::TlsPinStore,
+    /// The `plugin_deny` table (H6 slice 5).
+    pub plugin_denies: crate::state::PluginDenyStore,
     /// The database itself, for tables without a store. Private, so
     /// no handle outlives the state-dir lock: see [`Self::db`].
     db: std::sync::Arc<crate::state::Db>,
@@ -393,6 +395,8 @@ pub fn with_offline_stores<T>(
             .context("reading device_meta")?,
         tls_pins: crate::state::TlsPinStore::open(std::sync::Arc::clone(&db))
             .context("reading TLS pins")?,
+        plugin_denies: crate::state::PluginDenyStore::open(std::sync::Arc::clone(&db))
+            .context("reading plugin deny lists")?,
         db,
     };
     op(&stores)

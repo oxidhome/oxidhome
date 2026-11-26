@@ -736,12 +736,9 @@ mod tests {
                 ][..]
             )
         );
-        // A device selector never matches a service: a narrowed `*` is
-        // every action but `service.call`.
-        assert_eq!(
-            policy.deny[1].actions,
-            crate::auth::ActionSet::ALL.without(crate::auth::role::SERVICE_NARROWABLE)
-        );
+        // A device selector matches only actions on devices: a
+        // narrowed `*` is those.
+        assert_eq!(policy.deny[1].actions, crate::auth::role::DEVICE_SELECTABLE);
         assert_eq!(parse_policy(&policy.to_json()), Some(policy.clone()));
         // A role-only policy keeps the object shape.
         let role_only = TokenPolicy {

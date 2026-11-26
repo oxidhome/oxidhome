@@ -56,7 +56,11 @@
 //! stop a token from commanding lights. A `services` deny matches only
 //! the services it names; a device selector never matches a service
 //! (services carry no category yet), so a deny of `service.call` on
-//! some services names them.
+//! some services names them. A device-narrowed entry may only name
+//! actions whose target can be a device ([`DEVICE_SELECTABLE`]): a
+//! `host.status@lock` could never match, so it is refused rather than
+//! stored as a deny that silently refuses nothing. A plugin's state
+//! read ([`Resource::State`]) is matched on its device.
 
 use std::str::FromStr;
 
@@ -201,6 +205,20 @@ pub const SCOPED: ActionSet = ActionSet::ALL.without(ActionSet::of(&[
 /// The actions a `services` selector may narrow: a narrowed `*`
 /// means these.
 pub const SERVICE_NARROWABLE: ActionSet = ActionSet::of(&[Action::ServiceCall]);
+
+/// The actions whose target can carry device attributes: a device, a
+/// device's state entry, an event or a blob (which may be a device's
+/// bytes). A deny narrowed to devices may name only these; a narrowed
+/// `*` means these.
+pub const DEVICE_SELECTABLE: ActionSet = ActionSet::of(&[
+    Action::DeviceList,
+    Action::DeviceRead,
+    Action::DeviceCommand,
+    Action::EventSubscribe,
+    Action::EventRead,
+    Action::BlobRead,
+    Action::StateRead,
+]);
 
 /// The actions a role grant may narrow to devices: the ones whose
 /// target is a device. A narrowed `*` means these.
@@ -442,8 +460,9 @@ impl SelectorWire {
     /// would silently match nothing.
     /// A stored deny entry, refused (`None`) when it explicitly names an
     /// action its selector could never match: a `services` selector
-    /// covers only `service.call`, and a device selector never matches
-    /// a service. A narrowed `*` means what the selector can match.
+    /// covers only `service.call`, and a device selector only
+    /// [`DEVICE_SELECTABLE`]. A narrowed `*` means what the selector can
+    /// match.
     pub(crate) fn into_deny(self) -> Option<DenyRule> {
         let names = self.actions.clone();
         let (_, categories, devices, services) = self.into_parts()?;
@@ -455,6 +474,14 @@ impl SelectorWire {
             devices,
             services,
         })
+    }
+
+    /// A stored plugin deny entry: [`Self::into_deny`], restricted to
+    /// [`crate::auth::plugin::PLUGIN_ACTIONS`].
+    pub(crate) fn into_plugin_deny(self) -> Option<DenyRule> {
+        let names = self.actions.clone();
+        let rule = self.into_deny()?;
+        super::plugin::restrict_to_plugin_actions(&names, rule)
     }
 
     pub(crate) fn into_parts(self) -> Option<SelectorParts> {
@@ -501,7 +528,7 @@ pub(crate) fn deny_actions(
     let unmatchable = if to_services {
         ActionSet::ALL.without(SERVICE_NARROWABLE)
     } else if to_devices {
-        SERVICE_NARROWABLE
+        ActionSet::ALL.without(DEVICE_SELECTABLE)
     } else {
         return Some(actions);
     };
@@ -775,15 +802,18 @@ fn deny_matches(
     if categories.is_none() && devices.is_none() {
         return true;
     }
+    let device_matches = |d: &super::authorize::DeviceResource| {
+        let class = d.class();
+        // An unregistered device's display category is unknown:
+        // every category deny matches it.
+        categories.is_none_or(|c| {
+            !class.is_registered() || falls_under(c, class.category(), class.sensitive())
+        }) && devices.is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
+    };
     match resource {
-        Resource::Device(d) => {
-            let class = d.class();
-            // An unregistered device's display category is unknown:
-            // every category deny matches it.
-            categories.is_none_or(|c| {
-                !class.is_registered() || falls_under(c, class.category(), class.sensitive())
-            }) && devices.is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
-        }
+        Resource::Device(d) => device_matches(d),
+        // A plugin's read of a device's state entry.
+        Resource::State(s) => device_matches(s.device()),
         Resource::Blob(b) => {
             // A blob names no device: a device-narrowed deny refuses
             // it (whatever else it narrows to); a category deny refuses

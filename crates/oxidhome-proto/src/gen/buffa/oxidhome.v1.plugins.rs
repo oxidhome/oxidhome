@@ -2907,3 +2907,588 @@ pub const __NOT_RESTARTED_INSTANCE_JSON_ANY: ::buffa::type_registry::JsonAnyEntr
     from_json: ::buffa::type_registry::any_from_json::<NotRestartedInstance>,
     is_wkt: false,
 };
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct GetPluginDenyRequest {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for GetPluginDenyRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("GetPluginDenyRequest")
+            .field("plugin_id", &self.plugin_id)
+            .finish()
+    }
+}
+impl GetPluginDenyRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetPluginDenyRequest";
+}
+::buffa::impl_default_instance!(GetPluginDenyRequest);
+impl ::buffa::MessageName for GetPluginDenyRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "GetPluginDenyRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.GetPluginDenyRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.GetPluginDenyRequest";
+}
+impl ::buffa::Message for GetPluginDenyRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.plugin_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.plugin_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for GetPluginDenyRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.GetPluginDenyRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for GetPluginDenyRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __GET_PLUGIN_DENY_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.GetPluginDenyRequest",
+    to_json: ::buffa::type_registry::any_to_json::<GetPluginDenyRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<GetPluginDenyRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct SetPluginDenyRequest {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// Deny entries; `*` names every plugin action.
+    ///
+    /// Field 2: `deny`
+    #[serde(
+        rename = "deny",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub deny: ::buffa::alloc::vec::Vec<Selector>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for SetPluginDenyRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("SetPluginDenyRequest")
+            .field("plugin_id", &self.plugin_id)
+            .field("deny", &self.deny)
+            .finish()
+    }
+}
+impl SetPluginDenyRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.SetPluginDenyRequest";
+}
+::buffa::impl_default_instance!(SetPluginDenyRequest);
+impl ::buffa::MessageName for SetPluginDenyRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "SetPluginDenyRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.SetPluginDenyRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.SetPluginDenyRequest";
+}
+impl ::buffa::Message for SetPluginDenyRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.plugin_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.plugin_id) as u64;
+        }
+        for v in &self.deny {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        for v in &self.deny {
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.deny.push(elem);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.deny.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for SetPluginDenyRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.SetPluginDenyRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for SetPluginDenyRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __SET_PLUGIN_DENY_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.SetPluginDenyRequest",
+    to_json: ::buffa::type_registry::any_to_json::<SetPluginDenyRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<SetPluginDenyRequest>,
+    is_wkt: false,
+};
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct ResetPluginDenyRequest {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for ResetPluginDenyRequest {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("ResetPluginDenyRequest")
+            .field("plugin_id", &self.plugin_id)
+            .finish()
+    }
+}
+impl ResetPluginDenyRequest {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ResetPluginDenyRequest";
+}
+::buffa::impl_default_instance!(ResetPluginDenyRequest);
+impl ::buffa::MessageName for ResetPluginDenyRequest {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "ResetPluginDenyRequest";
+    const FULL_NAME: &'static str = "oxidhome.v1.ResetPluginDenyRequest";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.ResetPluginDenyRequest";
+}
+impl ::buffa::Message for ResetPluginDenyRequest {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.plugin_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.plugin_id) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for ResetPluginDenyRequest {
+    const PROTO_FQN: &'static str = "oxidhome.v1.ResetPluginDenyRequest";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for ResetPluginDenyRequest {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __RESET_PLUGIN_DENY_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.ResetPluginDenyRequest",
+    to_json: ::buffa::type_registry::any_to_json::<ResetPluginDenyRequest>,
+    from_json: ::buffa::type_registry::any_from_json::<ResetPluginDenyRequest>,
+    is_wkt: false,
+};
+/// A plugin's deny list after a read or change.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct PluginDeny {
+    /// Field 1: `plugin_id`
+    #[serde(
+        rename = "pluginId",
+        alias = "plugin_id",
+        with = "::buffa::json_helpers::proto_string",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
+    )]
+    pub plugin_id: ::buffa::alloc::string::String,
+    /// Field 2: `deny`
+    #[serde(
+        rename = "deny",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub deny: ::buffa::alloc::vec::Vec<Selector>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for PluginDeny {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("PluginDeny")
+            .field("plugin_id", &self.plugin_id)
+            .field("deny", &self.deny)
+            .finish()
+    }
+}
+impl PluginDeny {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.PluginDeny";
+}
+::buffa::impl_default_instance!(PluginDeny);
+impl ::buffa::MessageName for PluginDeny {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "PluginDeny";
+    const FULL_NAME: &'static str = "oxidhome.v1.PluginDeny";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.PluginDeny";
+}
+impl ::buffa::Message for PluginDeny {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        if !self.plugin_id.is_empty() {
+            size += 1u64 + ::buffa::types::string_encoded_len(&self.plugin_id) as u64;
+        }
+        for v in &self.deny {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        if !self.plugin_id.is_empty() {
+            ::buffa::types::put_string_field(1u32, &self.plugin_id, buf);
+        }
+        for v in &self.deny {
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                ::buffa::types::merge_string(&mut self.plugin_id, buf)?;
+            }
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
+                )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.deny.push(elem);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.plugin_id.clear();
+        self.deny.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for PluginDeny {
+    const PROTO_FQN: &'static str = "oxidhome.v1.PluginDeny";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for PluginDeny {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __PLUGIN_DENY_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.PluginDeny",
+    to_json: ::buffa::type_registry::any_to_json::<PluginDeny>,
+    from_json: ::buffa::type_registry::any_from_json::<PluginDeny>,
+    is_wkt: false,
+};

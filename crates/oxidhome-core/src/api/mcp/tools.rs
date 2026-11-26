@@ -29,6 +29,9 @@
 //!   (Phase 8.5 — owner-only `policy.manage`; narrow a plugin's
 //!   network grant or reset it to the request, restarting its running
 //!   instances).
+//! - `plugins.set_deny` / `plugins.reset_deny` (H6 slice 5 — owner-only
+//!   `policy.manage`; the owner's deny list over a plugin, applied to
+//!   the next decision of its running instances).
 //! - `plugins.uninstall` (14.3e — mutating admin,
 //!   destructive, gated on `plugins:uninstall`; tool-shape
 //!   of `DELETE /api/v1/plugins/{id}`).
@@ -314,6 +317,41 @@ pub(super) fn list_tools() -> Vec<Tool> {
             ToolAnnotations::new()
                 .read_only(false)
                 .destructive(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.set_deny",
+            "Replace the owner's deny list over a plugin: what it, or any plugin whose \
+             service call reaches another, may not do, whatever its manifest grants. \
+             Entries take the token deny shape (`actions` from `service.call`, \
+             `state.read`, `blob.read`, `event.subscribe`, or `*` for all four; \
+             optionally narrowed by `category`, `devices` or `services`). The plugin \
+             need not be installed; running instances apply it at once. An empty list \
+             removes it. Returns the list. Owner only (`policy.manage`); audited with \
+             the old and new list.",
+            Arc::new(plugins_set_deny_schema()),
+        )
+        .with_title("Set plugin deny list")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                // Replaces the list; reversible by setting it again.
+                .destructive(true)
+                .idempotent(true)
+                .open_world(false),
+        ),
+        Tool::new(
+            "plugins.reset_deny",
+            "Remove the owner's deny list over a plugin, undoing `plugins.set_deny`. \
+             Owner only (`policy.manage`); audited with the old list.",
+            Arc::new(plugins_reset_deny_schema()),
+        )
+        .with_title("Reset plugin deny list")
+        .annotate(
+            ToolAnnotations::new()
+                .read_only(false)
+                .destructive(true)
+                .idempotent(true)
                 .open_world(false),
         ),
         Tool::new(
@@ -630,6 +668,8 @@ pub(super) fn canonical_tool_name(name: &str) -> &'static str {
         "plugins.install" => "plugins.install",
         "plugins.set_network_grant" => "plugins.set_network_grant",
         "plugins.reset_network_grant" => "plugins.reset_network_grant",
+        "plugins.set_deny" => "plugins.set_deny",
+        "plugins.reset_deny" => "plugins.reset_deny",
         "tokens.list" => "tokens.list",
         _ => "unknown",
     }
@@ -726,6 +766,16 @@ pub(super) async fn call(
             Action::PolicyManage,
             Resource::pre_check(ResourceKind::Plugin),
         ),
+        "plugins.set_deny" => (
+            "plugins.set_deny",
+            Action::PolicyManage,
+            Resource::pre_check(ResourceKind::Plugin),
+        ),
+        "plugins.reset_deny" => (
+            "plugins.reset_deny",
+            Action::PolicyManage,
+            Resource::pre_check(ResourceKind::Plugin),
+        ),
         _ => {
             let outcome = ToolOutcome::UnknownTool(format!("no MCP tool named `{name}`"));
             return finalize_synchronous(engine, &token_id, "unknown", outcome, audit_permit).await;
@@ -818,6 +868,12 @@ pub(super) async fn call(
         }
         "plugins.reset_network_grant" => {
             network_grant_call(engine.clone(), request.arguments, &invocation, true).await
+        }
+        "plugins.set_deny" => {
+            plugin_deny_call(engine.clone(), request.arguments, &invocation, false).await
+        }
+        "plugins.reset_deny" => {
+            plugin_deny_call(engine.clone(), request.arguments, &invocation, true).await
         }
         // Unreachable — every routed tool above has a body
         // arm here. If a future addition to the routing
@@ -2770,6 +2826,136 @@ async fn network_grant_call(
         Err(e @ (E::Unavailable(..) | E::Store(_))) => {
             tracing::error!(target: "mcp.tool.network_grant", error = %e, "network grant change failed");
             ToolOutcome::Internal("network grant change failed; see server logs".into())
+        }
+    }
+}
+
+// ── plugins.set_deny / reset_deny (H6 slice 5) ──────────────────
+
+fn plugins_set_deny_schema() -> serde_json::Map<String, JsonValue> {
+    let strings = json!({"type": "array", "items": {"type": "string"}});
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id", "deny"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Plugin id (reverse-DNS) whose deny list to set; need not be installed.",
+            },
+            "deny": {
+                "type": "array",
+                "maxItems": crate::state::plugin_deny::MAX_PLUGIN_DENY_ENTRIES,
+                "description": "Deny entries. Empty removes the list.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["actions"],
+                    "properties": {
+                        "actions": strings,
+                        "category": strings,
+                        "devices": strings,
+                        "services": strings,
+                    }
+                }
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+fn plugins_reset_deny_schema() -> serde_json::Map<String, JsonValue> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["plugin_id"],
+        "properties": {
+            "plugin_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Plugin id whose deny list to remove.",
+            }
+        }
+    });
+    match schema {
+        JsonValue::Object(map) => map,
+        _ => unreachable!("json! macro built with object literal"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetPluginDenyArgs {
+    plugin_id: String,
+    deny: Vec<crate::api::token_admin::SelectorSpec>,
+}
+
+/// `plugins.set_deny` (`reset = false`) and `plugins.reset_deny`:
+/// `policy.manage` on the plugin, then
+/// [`crate::api::plugin_deny_admin::change_plugin_deny`].
+async fn plugin_deny_call(
+    engine: Engine,
+    arguments: Option<serde_json::Map<String, JsonValue>>,
+    invocation: &InvocationContext,
+    reset: bool,
+) -> ToolOutcome {
+    use crate::api::plugin_deny_admin::PluginDenyAdminError as E;
+    let tool = if reset {
+        "plugins.reset_deny"
+    } else {
+        "plugins.set_deny"
+    };
+    let args_value = arguments.map_or(JsonValue::Object(serde_json::Map::new()), JsonValue::Object);
+    let schema_err =
+        |err: serde_json::Error| format!("{tool} arguments do not match the input schema: {err}");
+    let (plugin_id, specs) = if reset {
+        // Same shape as `plugins.reset_network_grant`'s arguments.
+        match serde_json::from_value::<ResetNetworkGrantArgs>(args_value) {
+            Ok(a) => (a.plugin_id, None),
+            Err(err) => return ToolOutcome::InvalidParams(schema_err(err)),
+        }
+    } else {
+        match serde_json::from_value::<SetPluginDenyArgs>(args_value) {
+            Ok(a) => (a.plugin_id, Some(a.deny)),
+            Err(err) => return ToolOutcome::InvalidParams(schema_err(err)),
+        }
+    };
+    if let Err(denied) = authorize_target(
+        invocation,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    ) {
+        return denied;
+    }
+    match crate::api::plugin_deny_admin::change_plugin_deny(
+        engine,
+        crate::api::network_admin::GrantActor::of("mcp", invocation),
+        plugin_id,
+        specs,
+    )
+    .await
+    {
+        Ok(view) => match super::resources::encode_body_capped(&view, tool, MAX_TOOL_BODY_BYTES) {
+            EncodedBody::Value(value) => ToolOutcome::Ok {
+                value,
+                plugin_reached: false,
+            },
+            EncodedBody::TooLarge(reason) => ToolOutcome::TooLarge(reason),
+            EncodedBody::SerializeFailed(reason) => ToolOutcome::Internal(reason),
+        },
+        Err(E::Invalid(reason)) => ToolOutcome::InvalidParams(reason),
+        Err(E::Full(message)) => ToolOutcome::ExecErr {
+            message,
+            structured: Some(json!({"kind": "too_many_lists"})),
+            domain_kind: None,
+        },
+        Err(e @ E::Store(_)) => {
+            tracing::error!(target: "mcp.tool.plugin_deny", error = %e, "plugin deny change failed");
+            ToolOutcome::Internal("plugin deny change failed; see server logs".into())
         }
     }
 }

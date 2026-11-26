@@ -5,5 +5,5 @@ include!("oxidhome.v1.health.__connect.rs");
 include!("oxidhome.v1.instances.__connect.rs");
 include!("oxidhome.v1.logs.__connect.rs");
 include!("oxidhome.v1.network.__connect.rs");
-include!("oxidhome.v1.plugins.__connect.rs");
 include!("oxidhome.v1.tokens.__connect.rs");
+include!("oxidhome.v1.plugins.__connect.rs");

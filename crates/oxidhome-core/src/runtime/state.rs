@@ -369,6 +369,11 @@ pub struct PluginState {
     /// materialized cross-product grows O(N²) in the count of
     /// selectors and is DoS-able from the manifest side.
     pub consumes_services_requested: Arc<Vec<oxidhome_manifest::ServiceGrant>>,
+    /// H6 slice 5: the owner's deny lists over plugins (the engine's),
+    /// which every decision of this instance reads. A detached, empty
+    /// store for low-level test states; the loader sets it via
+    /// [`Self::with_plugin_denies`].
+    pub plugin_denies: Arc<crate::state::PluginDenyStore>,
     /// Resource handles owned by this store. Required by Wasmtime's
     /// component model; populated when Phase 5 introduces blob/model
     /// resource handling.
@@ -557,6 +562,7 @@ impl PluginState {
             installation_uuid,
             granted_capabilities,
             consumes_services_requested,
+            plugin_denies: Arc::default(),
             table: ResourceTable::new(),
             wasi,
             devices,
@@ -647,6 +653,29 @@ impl PluginState {
     ) -> Self {
         self.granted_capabilities = granted;
         self
+    }
+
+    /// H6 slice 5: attach the engine's plugin deny lists.
+    #[must_use]
+    pub fn with_plugin_denies(mut self, denies: Arc<crate::state::PluginDenyStore>) -> Self {
+        self.plugin_denies = denies;
+        self
+    }
+
+    /// This instance as a principal of the authorization engine: its
+    /// effective grants and the owner's deny lists
+    /// ([`crate::auth::authorize_plugin`]).
+    #[must_use]
+    pub fn principal(&self) -> crate::auth::PluginPrincipal<'_> {
+        crate::auth::PluginPrincipal {
+            plugin_id: &self.manifest.plugin.id,
+            instance_id: &self.instance_id,
+            requested_services: &self.consumes_services_requested,
+            granted_services: &self.granted_capabilities.consumes_services,
+            reads_state: &self.granted_capabilities.reads_state,
+            subscribes_events: self.granted_capabilities.subscribes_events,
+            denies: &self.plugin_denies,
+        }
     }
 
     /// H6: attach the audit ledger that records delegated
@@ -1409,23 +1438,20 @@ impl host_services::Host for PluginState {
         args: Vec<KeyValue>,
     ) -> Result<CommandResult, WitError> {
         // Phase 7c: route through the dispatcher. Resolves target →
-        // `(owner_instance, owner_plugin_id, local_id)`. H10
-        // round-4: authorizes by checking **both** the caller's
-        // requested `consumes_services` list AND the operator's
-        // granted list at call time — a call is authorized iff at
-        // least one entry in each matches the call tuple. Rejects
-        // same-instance / A→…→A cycles, races
-        // `execute-service-command` against the dispatcher
-        // timeout, holds a `CallGuard` so `remove-service` refuses
-        // while the call is alive.
+        // `(owner_instance, owner_plugin_id, local_id)`, decides the
+        // hop in the engine (H6 slice 5: this instance's
+        // `consumes_services`, requested and granted (H10 round-4), the
+        // chain's plugin deny lists and an external root's permit),
+        // rejects same-instance / A→…→A cycles, races
+        // `execute-service-command` against the dispatcher timeout,
+        // holds a `CallGuard` so `remove-service` refuses while the
+        // call is alive.
         crate::runtime::dispatcher::call_service(
             &self.services,
             &self.instances,
             self.audit_log.as_ref(),
             self.pending_commands.as_ref(),
-            self.instance_id.clone(),
-            &self.consumes_services_requested,
-            &self.granted_capabilities.consumes_services,
+            &self.principal(),
             target,
             command,
             args,
@@ -1795,15 +1821,36 @@ impl host_events::Host for PluginState {
         // decision, not a default. `unsubscribe` is deliberately
         // uncapped — cleaning up a subscription that shouldn't
         // exist is fine.
-        if !self.granted_capabilities.subscribes_events {
+        // H6 slice 5: the engine decides — `subscribes_events`, the
+        // chain's plugin deny lists, and an external root's
+        // `event.read` (a subscription outlives the request that made
+        // it). What each event delivers is filtered by the deny list
+        // again at delivery.
+        let decision = crate::auth::authorize_plugin(
+            &crate::auth::invocation::current_or_host(&self.instance_id),
+            &self.principal(),
+            crate::auth::Action::EventSubscribe,
+            &crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+        );
+        if !decision.allow {
+            let label = decision.reason.audit_label().unwrap_or("no-permit");
             tracing::warn!(
                 target: "host.events",
                 instance_id = %self.instance_id,
-                "subscribe denied — capabilities.subscribes_events is not set",
+                required = label,
+                "subscribe denied",
             );
             return Err(WitError::PermissionDenied(
-                "subscribe requires `capabilities.subscribes_events = true` in the plugin manifest"
-                    .into(),
+                if matches!(
+                    decision.reason,
+                    crate::auth::Reason::MissingPluginGrant { .. }
+                ) {
+                    "subscribe requires `capabilities.subscribes_events = true` in the plugin \
+                     manifest"
+                        .into()
+                } else {
+                    format!("subscribe refused (`{label}`)")
+                },
             ));
         }
         // C4: per-instance subscription cap. Complements the bus-side

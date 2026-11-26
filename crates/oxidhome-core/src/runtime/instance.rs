@@ -993,6 +993,7 @@ impl PluginInstance {
             engine.instances(),
         )
         .with_granted_capabilities(granted_capabilities)
+        .with_plugin_denies(engine.plugin_denies())
         .with_audit_log(engine.audit_log())
         .with_pending_commands(engine.pending_commands())
         .with_storage_ops(engine.storage_ops());
@@ -1447,6 +1448,28 @@ impl PluginInstance {
         // fan-out (it is in every matching queue); later ones may not
         // have yet.
         let cutoff = state.events.row_watermark().get();
+        // H6 slice 5: the owner's deny list for this plugin filters
+        // what its subscriptions deliver, per event (a category deny
+        // on `event.subscribe` hides that category's events).
+        let denies = Arc::clone(&state.plugin_denies);
+        let devices = Arc::clone(&state.devices);
+        let plugin_id = state.manifest.plugin.id.clone();
+        let owner_refuses = |ev: &Event| {
+            !denies.is_empty() && {
+                let resource = ev.device.as_deref().map_or(
+                    crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+                    |d| devices.resource(d),
+                );
+                crate::auth::denied_on_chain(
+                    &denies,
+                    &plugin_id,
+                    &[],
+                    crate::auth::Action::EventSubscribe,
+                    &resource,
+                )
+                .is_some()
+            }
+        };
         // One FIFO run per subscription, merged below.
         let mut runs: Vec<VecDeque<(u64, Event)>> = Vec::new();
         for sub in &mut state.subscriptions {
@@ -1498,7 +1521,7 @@ impl PluginInstance {
                 // `Arc::unwrap_or_clone` (Rust 1.76) — clone-on-
                 // write per subscription.
                 let ev = Arc::unwrap_or_clone(ev);
-                if !sub.matches(&ev) {
+                if !sub.matches(&ev) || owner_refuses(&ev) {
                     continue;
                 }
                 // A recorded event fanned out after the cutoff may

@@ -6,8 +6,8 @@ include!("oxidhome.v1.health.rs");
 include!("oxidhome.v1.instances.rs");
 include!("oxidhome.v1.logs.rs");
 include!("oxidhome.v1.network.rs");
-include!("oxidhome.v1.plugins.rs");
 include!("oxidhome.v1.tokens.rs");
+include!("oxidhome.v1.plugins.rs");
 #[allow(
     non_camel_case_types,
     dead_code,
@@ -31,8 +31,8 @@ pub mod __buffa {
         include!("oxidhome.v1.instances.__view.rs");
         include!("oxidhome.v1.logs.__view.rs");
         include!("oxidhome.v1.network.__view.rs");
-        include!("oxidhome.v1.plugins.__view.rs");
         include!("oxidhome.v1.tokens.__view.rs");
+        include!("oxidhome.v1.plugins.__view.rs");
         pub mod oneof {
             #[allow(unused_imports)]
             use super::*;
@@ -97,6 +97,22 @@ pub mod __buffa {
         reg.register_json_any(super::__RESET_TLS_PINS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__RESET_TLS_PINS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__TLS_PIN_JSON_ANY);
+        reg.register_json_any(super::__CREATE_TOKEN_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__SELECTOR_JSON_ANY);
+        reg.register_json_any(super::__CREATE_TOKEN_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__LIST_TOKENS_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__LIST_TOKENS_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__TOKEN_JSON_ANY);
+        reg.register_json_any(super::__ROLE_DEFINITION_JSON_ANY);
+        reg.register_json_any(super::__ROLE_JSON_ANY);
+        reg.register_json_any(super::__LIST_ROLES_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__LIST_ROLES_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__CREATE_ROLE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__CREATE_ROLE_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__UPDATE_ROLE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__UPDATE_ROLE_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__DELETE_ROLE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__DELETE_ROLE_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_PLUGINS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__PLUGIN_JSON_ANY);
@@ -115,22 +131,10 @@ pub mod __buffa {
         reg.register_json_any(super::__RESET_PLUGIN_NETWORK_GRANT_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__NETWORK_GRANT_CHANGE_JSON_ANY);
         reg.register_json_any(super::__NOT_RESTARTED_INSTANCE_JSON_ANY);
-        reg.register_json_any(super::__CREATE_TOKEN_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__SELECTOR_JSON_ANY);
-        reg.register_json_any(super::__CREATE_TOKEN_RESPONSE_JSON_ANY);
-        reg.register_json_any(super::__LIST_TOKENS_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__LIST_TOKENS_RESPONSE_JSON_ANY);
-        reg.register_json_any(super::__TOKEN_JSON_ANY);
-        reg.register_json_any(super::__ROLE_DEFINITION_JSON_ANY);
-        reg.register_json_any(super::__ROLE_JSON_ANY);
-        reg.register_json_any(super::__LIST_ROLES_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__LIST_ROLES_RESPONSE_JSON_ANY);
-        reg.register_json_any(super::__CREATE_ROLE_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__CREATE_ROLE_RESPONSE_JSON_ANY);
-        reg.register_json_any(super::__UPDATE_ROLE_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__UPDATE_ROLE_RESPONSE_JSON_ANY);
-        reg.register_json_any(super::__DELETE_ROLE_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__DELETE_ROLE_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__GET_PLUGIN_DENY_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__SET_PLUGIN_DENY_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__RESET_PLUGIN_DENY_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__PLUGIN_DENY_JSON_ANY);
     }
 }
 #[doc(inline)]
@@ -294,6 +298,70 @@ pub use self::__buffa::view::TlsPinView;
 #[doc(inline)]
 pub use self::__buffa::view::TlsPinOwnedView;
 #[doc(inline)]
+pub use self::__buffa::view::CreateTokenRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateTokenRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::SelectorView;
+#[doc(inline)]
+pub use self::__buffa::view::SelectorOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateTokenResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateTokenResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTokensRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTokensRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTokensResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ListTokensResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::TokenView;
+#[doc(inline)]
+pub use self::__buffa::view::TokenOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::RoleDefinitionView;
+#[doc(inline)]
+pub use self::__buffa::view::RoleDefinitionOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::RoleView;
+#[doc(inline)]
+pub use self::__buffa::view::RoleOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListRolesRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::ListRolesRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ListRolesResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ListRolesResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateRoleRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateRoleRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateRoleResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::CreateRoleResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::UpdateRoleRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::UpdateRoleRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::UpdateRoleResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::UpdateRoleResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::DeleteRoleRequestView;
+#[doc(inline)]
+pub use self::__buffa::view::DeleteRoleRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::DeleteRoleResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::DeleteRoleResponseOwnedView;
+#[doc(inline)]
 pub use self::__buffa::view::ListPluginsRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::ListPluginsRequestOwnedView;
@@ -366,68 +434,20 @@ pub use self::__buffa::view::NotRestartedInstanceView;
 #[doc(inline)]
 pub use self::__buffa::view::NotRestartedInstanceOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::CreateTokenRequestView;
+pub use self::__buffa::view::GetPluginDenyRequestView;
 #[doc(inline)]
-pub use self::__buffa::view::CreateTokenRequestOwnedView;
+pub use self::__buffa::view::GetPluginDenyRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::SelectorView;
+pub use self::__buffa::view::SetPluginDenyRequestView;
 #[doc(inline)]
-pub use self::__buffa::view::SelectorOwnedView;
+pub use self::__buffa::view::SetPluginDenyRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::CreateTokenResponseView;
+pub use self::__buffa::view::ResetPluginDenyRequestView;
 #[doc(inline)]
-pub use self::__buffa::view::CreateTokenResponseOwnedView;
+pub use self::__buffa::view::ResetPluginDenyRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::ListTokensRequestView;
+pub use self::__buffa::view::PluginDenyView;
 #[doc(inline)]
-pub use self::__buffa::view::ListTokensRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::ListTokensResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::ListTokensResponseOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::TokenView;
-#[doc(inline)]
-pub use self::__buffa::view::TokenOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleDefinitionView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleDefinitionOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::ListRolesRequestView;
-#[doc(inline)]
-pub use self::__buffa::view::ListRolesRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::ListRolesResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::ListRolesResponseOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::CreateRoleRequestView;
-#[doc(inline)]
-pub use self::__buffa::view::CreateRoleRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::CreateRoleResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::CreateRoleResponseOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::UpdateRoleRequestView;
-#[doc(inline)]
-pub use self::__buffa::view::UpdateRoleRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::UpdateRoleResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::UpdateRoleResponseOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::DeleteRoleRequestView;
-#[doc(inline)]
-pub use self::__buffa::view::DeleteRoleRequestOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::DeleteRoleResponseView;
-#[doc(inline)]
-pub use self::__buffa::view::DeleteRoleResponseOwnedView;
+pub use self::__buffa::view::PluginDenyOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

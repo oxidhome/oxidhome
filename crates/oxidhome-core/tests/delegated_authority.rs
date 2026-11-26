@@ -8,6 +8,11 @@
 //! request causes carry its call id (live, and in `event_log`), and a
 //! subscriber's `on-event` reaction records it as `caused_by` on its
 //! own hop rows.
+//!
+//! H6 slice 5: a token's device command whose handler calls a service
+//! (the bouncer's `button::press`) needs the token's `service.call` on
+//! the hop, and the owner's deny list over a plugin refuses its hops
+//! and filters what its subscriptions deliver, live.
 
 #[path = "support.rs"]
 mod support;
@@ -19,10 +24,11 @@ use oxidhome_core::auth::{
     Action, ActionSet, ActorKind, DenyRule, InvocationContext, Principal, RoleDef, RoleGrant,
     TokenPolicy, Transport,
 };
-use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
+use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{
     Error as WitError, ServiceId, Value,
 };
+use oxidhome_core::runtime::CommandOutcome;
 use oxidhome_core::runtime::dispatcher;
 use oxidhome_core::state::{AuditEntry, AuditQuery, EventQuery};
 use oxidhome_core::{Actor, Engine, InstanceHandle};
@@ -115,6 +121,69 @@ impl Bouncers {
         )
         .await;
         (call_id, outcome)
+    }
+
+    /// `button::press` on `owner`'s button, as a device command rooted
+    /// at `actor`.
+    async fn press_as(&self, actor: &Actor, owner: &str) -> (String, CommandOutcome) {
+        let device = self
+            .engine
+            .devices()
+            .list()
+            .into_iter()
+            .find(|d| d.owner_instance == owner)
+            .expect("button registered")
+            .id
+            .clone();
+        let handle = self
+            .instances
+            .iter()
+            .find(|h| h.instance_id() == owner)
+            .expect("instance");
+        let root =
+            InvocationContext::external(Principal::token(ActorKind::Api, actor, Transport::Rest));
+        let call_id = root.call_id().to_owned();
+        let cmd = Command {
+            id: String::new(),
+            capability: "button".into(),
+            action: "press".into(),
+            args: Vec::new(),
+        };
+        let report = handle.execute_command_in(root, device, cmd).await;
+        (call_id, report.outcome)
+    }
+
+    /// `kick` on `target` from the host (no external root).
+    async fn kick_from_host(&self, target: &str) -> Result<CommandResult, WitError> {
+        let grants = [oxidhome_manifest::ServiceGrant {
+            plugin: PLUGIN.into(),
+            instance: "*".into(),
+            service: "bouncer".into(),
+            commands: vec!["kick".into()],
+            caller_instance: "*".into(),
+        }];
+        dispatcher::call_service_from_host(
+            &self.engine,
+            "test-driver",
+            &grants,
+            &grants,
+            self.service(target),
+            "kick",
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Wait until `instance` has run `kick`.
+    async fn wait_kicked(&self, instance: &str) {
+        let started = Instant::now();
+        while !self.kicked(instance) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{instance} not kicked"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// The `CALL` rows matching `query` once `n` of them are final.
@@ -343,23 +412,7 @@ async fn host_rooted_events_are_not_attributed() {
     let b = Bouncers::start(&["alpha", "beta", "gamma"]).await;
     b.set("alpha", "announce", "yes".into());
     b.set("beta", "relay_to", b.service("gamma"));
-    let grants = [oxidhome_manifest::ServiceGrant {
-        plugin: PLUGIN.into(),
-        instance: "*".into(),
-        service: "bouncer".into(),
-        commands: vec!["kick".into()],
-        caller_instance: "*".into(),
-    }];
-    let outcome = dispatcher::call_service_from_host(
-        &b.engine,
-        "test-driver",
-        &grants,
-        &grants,
-        b.service("alpha"),
-        "kick",
-        Vec::new(),
-    )
-    .await;
+    let outcome = b.kick_from_host("alpha").await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
     let events = b
         .engine
@@ -375,11 +428,7 @@ async fn host_rooted_events_are_not_attributed() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0].call_id, None);
     // beta's reaction ran (gamma got kicked) and wrote no row.
-    let started = Instant::now();
-    while !b.kicked("gamma") {
-        assert!(started.elapsed() < Duration::from_secs(10), "no relay");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    b.wait_kicked("gamma").await;
     let rows: Vec<_> = b
         .engine
         .audit_log()
@@ -389,5 +438,130 @@ async fn host_rooted_events_are_not_attributed() {
         .filter(|r| r.method == dispatcher::SERVICE_CALL_AUDIT_METHOD)
         .collect();
     assert!(rows.is_empty(), "{rows:?}");
+    b.stop().await;
+}
+
+/// H6 slice 5, end to end: a token's device command runs a handler that
+/// calls a service. The hop is the token's too, so a token with
+/// `devices:command` alone has it refused (the command is `rejected`
+/// with the plugin's error, and the hop leaves a `deny` row on the
+/// command's call id); with `services:call` the chain runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_command_that_calls_a_service_needs_the_roots_permit() {
+    let b = Bouncers::start(&["alpha", "beta"]).await;
+    b.set("alpha", "bounce_to", b.service("beta"));
+
+    let narrow = Actor::api("tok-press", vec!["devices:command".into()]);
+    let (call_id, outcome) = b.press_as(&narrow, "alpha").await;
+    assert!(
+        matches!(&outcome, CommandOutcome::Rejected { error: WitError::PermissionDenied(m) }
+            if m.contains("root principal")),
+        "got {outcome:?}"
+    );
+    let rows = b.hop_rows(by_call(&call_id), 1).await;
+    assert_eq!(rows[0].decision, "deny");
+    assert_eq!(rows[0].required_scope.as_deref(), Some("services:call"));
+    assert_eq!(rows[0].token_id, "tok-press");
+    assert!(!b.kicked("beta"));
+
+    let actor = Actor::api(
+        "tok-press-call",
+        vec!["devices:command".into(), "services:call".into()],
+    );
+    let (call_id, outcome) = b.press_as(&actor, "alpha").await;
+    assert!(
+        matches!(outcome, CommandOutcome::Completed { .. }),
+        "got {outcome:?}"
+    );
+    let rows = b.hop_rows(by_call(&call_id), 1).await;
+    assert_eq!(rows[0].decision, "allow");
+    assert!(b.kicked("beta"));
+    b.stop().await;
+}
+
+/// The owner's deny list over a plugin refuses its hops whatever its
+/// manifest grants and whoever the root is (the wildcard token, the
+/// host), applies to running instances at once, and lifts on
+/// reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_deny_list_refuses_its_hops_live() {
+    let b = Bouncers::start(&["alpha", "beta"]).await;
+    b.set("alpha", "bounce_to", b.service("beta"));
+    let denies = b.engine.plugin_denies();
+    denies
+        .set(
+            PLUGIN,
+            vec![DenyRule {
+                actions: ActionSet::of(&[Action::ServiceCall]),
+                categories: None,
+                devices: None,
+                services: Some(vec![format!("{PLUGIN}/bouncer")]),
+            }],
+        )
+        .expect("set deny");
+
+    let owner = Actor::api("tok-all", vec!["*".into()]);
+    // The driver's hop into alpha isn't alpha's own: it runs; alpha's
+    // hop to beta is refused by alpha's plugin's list.
+    // alpha answers with beta's refusal as its result.
+    let (call_id, outcome) = b.kick_as(&owner, "alpha").await;
+    assert!(
+        matches!(&outcome, Ok(CommandResult::Err(WitError::PermissionDenied(m))) if m.contains(PLUGIN)),
+        "got {outcome:?}"
+    );
+    let rows = b.hop_rows(by_call(&call_id), 2).await;
+    assert_eq!(rows[1].decision, "deny");
+    assert_eq!(rows[1].required_scope.as_deref(), Some("plugin-deny"));
+    assert!(!b.kicked("beta"));
+
+    // From the host, and through a device command: refused the same
+    // way.
+    assert!(matches!(
+        b.kick_from_host("alpha").await,
+        Ok(CommandResult::Err(WitError::PermissionDenied(_)))
+    ));
+    let (_, outcome) = b.press_as(&owner, "alpha").await;
+    assert!(
+        matches!(outcome, CommandOutcome::Rejected { .. }),
+        "got {outcome:?}"
+    );
+
+    denies.set(PLUGIN, Vec::new()).expect("reset");
+    let (_, outcome) = b.kick_as(&owner, "alpha").await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    assert!(b.kicked("beta"));
+    b.stop().await;
+}
+
+/// A deny list naming `event.subscribe` stops what the plugin's
+/// subscriptions deliver (beta never relays the announcement), live;
+/// a reset lets the next one through.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plugin_deny_list_filters_event_delivery() {
+    let b = Bouncers::start(&["alpha", "beta", "gamma"]).await;
+    b.set("alpha", "announce", "yes".into());
+    b.set("beta", "relay_to", b.service("gamma"));
+    let denies = b.engine.plugin_denies();
+    denies
+        .set(
+            PLUGIN,
+            vec![DenyRule {
+                actions: ActionSet::of(&[Action::EventSubscribe]),
+                categories: None,
+                devices: None,
+                services: None,
+            }],
+        )
+        .expect("set deny");
+
+    let outcome = b.kick_from_host("alpha").await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!b.kicked("gamma"), "a denied subscription delivered");
+
+    denies.set(PLUGIN, Vec::new()).expect("reset");
+    let outcome = b.kick_from_host("alpha").await;
+    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
+    b.wait_kicked("gamma").await;
     b.stop().await;
 }

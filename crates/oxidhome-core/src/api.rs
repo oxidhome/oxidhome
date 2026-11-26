@@ -27,6 +27,7 @@ pub(crate) mod bytes;
 mod connect_rpc;
 pub mod mcp;
 pub mod network_admin;
+pub mod plugin_deny_admin;
 pub(crate) mod scopes;
 pub mod sensitive_admin;
 pub(crate) mod server;

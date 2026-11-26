@@ -542,6 +542,13 @@ pub fn check_capability_limits(
 /// 255 bytes), and a role selector can always name it exactly.
 pub const MAX_PLUGIN_ID_BYTES: usize = 255;
 
+/// `true` for a `plugin.id`: reverse-DNS (two or more dot-separated
+/// labels, each `[a-z0-9][a-z0-9-]*`), at most [`MAX_PLUGIN_ID_BYTES`].
+#[must_use]
+pub fn is_plugin_id(id: &str) -> bool {
+    id.len() <= MAX_PLUGIN_ID_BYTES && is_reverse_dns(id)
+}
+
 /// Longest service `local-id` the host accepts.
 pub const MAX_SERVICE_LOCAL_ID_BYTES: usize = 64;
 
@@ -679,7 +686,7 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         });
     }
 
-    if m.plugin.id.len() > MAX_PLUGIN_ID_BYTES || !is_reverse_dns(&m.plugin.id) {
+    if !is_plugin_id(&m.plugin.id) {
         errors.push(ValidationError::InvalidPluginId {
             got: m.plugin.id.clone(),
         });

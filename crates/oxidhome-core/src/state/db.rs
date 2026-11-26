@@ -378,6 +378,15 @@ const INITIAL_SCHEMA: &str = "
         updated_ms  INTEGER NOT NULL
     ) WITHOUT ROWID;
 
+    -- The owner's deny list over a plugin (`state::plugin_deny`), by
+    -- plugin id: it outlives an uninstall, and every running instance
+    -- of the plugin is held to it from its next decision on.
+    CREATE TABLE plugin_deny (
+        plugin_id   TEXT PRIMARY KEY NOT NULL,
+        definition  BLOB NOT NULL,
+        updated_ms  INTEGER NOT NULL
+    ) WITHOUT ROWID;
+
     -- Certificates streaming instances trusted on first use for LAN
     -- devices (`state::tls_pins`), keyed by instance, the request's
     -- host and port, and plugin installation. Reset by the operator;

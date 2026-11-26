@@ -2,12 +2,15 @@
 //! history (the H4 follow-up), so a plugin can resume `on-event`
 //! delivery from the last `row-id` it handled after a restart or a lag.
 //!
-//! Scope follows live delivery. The call needs
-//! `capabilities.subscribes_events` (refused `permission-denied`, with
-//! an audit `deny` row, like H2's refused reads), and a row is visible
-//! when it matches one of the instance's current subscription filters
-//! (the same `filter_matches` the bus uses), so history never shows a
-//! plugin more than `on-event` would have. H3 gap markers match every
+//! Scope follows live delivery. The call is `event.subscribe` in the
+//! engine (H6 slice 5): it needs `capabilities.subscribes_events`, no
+//! plugin deny list on the chain may refuse it, and an external root
+//! needs `event.read` (refused `permission-denied`, with an audit
+//! `deny` row, like H2's refused reads). A row is visible when it
+//! matches one of the instance's current subscription filters (the
+//! same `filter_matches` the bus uses) and no deny list on the chain
+//! refuses its device, so history never shows a plugin more than
+//! `on-event` would have. H3 gap markers match every
 //! filter and are visible even with no subscription. Rows that aren't
 //! visible are skipped silently: the cursor moves past them and the
 //! page doesn't say why, as with `list-state`. Allowed reads are
@@ -140,24 +143,70 @@ fn read_page(
 }
 
 impl PluginState {
+    /// `read-events` is `event.subscribe` in the engine; a refusal is
+    /// audited in the background and answered `permission-denied`.
+    fn authorize_event_read(&self, ctx: &crate::auth::InvocationContext) -> Result<(), WitError> {
+        let decision = crate::auth::authorize_plugin(
+            ctx,
+            &self.principal(),
+            crate::auth::Action::EventSubscribe,
+            &crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+        );
+        if !decision.allow {
+            let scope = decision.reason.audit_label().unwrap_or("no-permit");
+            queue_deny_audit(
+                self.audit_log.clone(),
+                &self.instance_id,
+                DeniedRead::Events { scope },
+            );
+            return Err(WitError::PermissionDenied(
+                if matches!(
+                    decision.reason,
+                    crate::auth::Reason::MissingPluginGrant { .. }
+                ) {
+                    "read-events requires `capabilities.subscribes_events = true` in the \
+                     plugin manifest"
+                        .into()
+                } else {
+                    format!("read-events refused (`{scope}`)")
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drop the rows a plugin deny list on `ctx`'s chain refuses
+    /// `event.subscribe` of (per row's device; a row without one is a
+    /// pre-check), as live delivery does.
+    fn hide_denied_events(&self, ctx: &crate::auth::InvocationContext, events: &mut Vec<Event>) {
+        if self.plugin_denies.is_empty() {
+            return;
+        }
+        let plugin_id = &self.manifest.plugin.id;
+        events.retain(|ev| {
+            let resource = ev.device.as_deref().map_or(
+                crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+                |d| self.devices.resource(d),
+            );
+            crate::auth::denied_on_chain(
+                &self.plugin_denies,
+                plugin_id,
+                ctx.chain(),
+                crate::auth::Action::EventSubscribe,
+                &resource,
+            )
+            .is_none()
+        });
+    }
+
     /// `host-events::read-events`; see the module docs.
     pub(super) async fn read_events_impl(
         &mut self,
         after_id: u64,
         limit: u32,
     ) -> Result<EventRead, WitError> {
-        if !self.granted_capabilities.subscribes_events {
-            queue_deny_audit(
-                self.audit_log.clone(),
-                &self.instance_id,
-                DeniedRead::Events,
-            );
-            return Err(WitError::PermissionDenied(
-                "read-events requires `capabilities.subscribes_events = true` in the plugin \
-                 manifest"
-                    .into(),
-            ));
-        }
+        let ctx = crate::auth::invocation::current_or_host(&self.instance_id);
+        self.authorize_event_read(&ctx)?;
         let limit = match usize::try_from(limit).unwrap_or(usize::MAX) {
             0 => DEFAULT_LIMIT,
             n => n.min(MAX_LIMIT),
@@ -234,16 +283,20 @@ impl PluginState {
                 return Err(WitError::Internal("event history read failed".into()));
             }
         };
+        // The deny lists on the chain hide their devices' rows, as at
+        // delivery; the cursor still moves past them.
+        let mut events = page.events;
+        self.hide_denied_events(&ctx, &mut events);
         tracing::debug!(
             target: "host.events",
             instance_id = %self.instance_id,
             after_id,
-            events = page.events.len(),
+            events = events.len(),
             next_after_id = page.next_after_id,
             "read-events",
         );
         Ok(EventRead::Page(EventPage {
-            events: page.events,
+            events,
             next_after_id: page.next_after_id,
             head_id: page.head_id,
         }))

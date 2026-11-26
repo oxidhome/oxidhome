@@ -1,26 +1,34 @@
 //! H2: the `host-state` import — plugin read access to the host-owned
 //! device-state projection.
 //!
-//! A plugin always sees the entries its own instance wrote. Any other
-//! entry needs a `[[capabilities.reads_state]]` grant matching its
-//! owner plugin, capability and device ([`StateGrant::matches`]); the
-//! effective grant is requested ∩ granted (see
-//! `state::effective_capabilities`). `bytes-val` fields are replaced
-//! by a withheld marker unless a matching grant sets `bytes = true`
-//! (own entries are returned as written). `get-state` answers
-//! `not-found` both for an unknown device and for one with no entry
-//! this plugin may see, so a plugin can't probe which device ids
-//! exist; the second case also writes an audit `deny` row
-//! (`method = STATE`, `required_scope = reads_state`) in the
-//! background, for the operator. Allowed reads are traced, not
-//! audited: reads change nothing and would dominate the ledger.
+//! A plugin always sees the entries its own instance wrote, as written.
+//! Any other entry is a [`crate::auth::Resource::State`] the engine
+//! decides on ([`crate::auth::authorize_plugin`], H6 slice 5):
+//! `state.read` needs a `[[capabilities.reads_state]]` grant matching
+//! its owner plugin, capability and device ([`StateGrant::matches`];
+//! the effective grant is requested ∩ granted, see
+//! `state::effective_capabilities`), no deny list on the chain may
+//! refuse it, and when the read is part of an invocation rooted at a
+//! token, the token needs `device.read` on the device. `bytes-val`
+//! fields are replaced by a withheld marker unless `blob.read` is
+//! allowed the same way (a matching grant with `bytes = true`, and the
+//! root's `blob.read`; an allow that carries a sensitive obligation,
+//! camera bytes, withholds them too: a plugin read can't meet it).
+//! `get-state` answers `not-found` both for an unknown device and for
+//! one with no entry this plugin may see, so a plugin can't probe which
+//! device ids exist; the second case also writes an audit `deny` row
+//! (`method = STATE`, `required_scope` the refusal's label, e.g.
+//! `reads_state`) in the background, for the operator. Allowed reads
+//! are traced, not audited: reads change nothing and would dominate
+//! the ledger.
 
 use std::sync::Arc;
 
 use oxidhome_manifest::StateGrant;
 
 use super::state::PluginState;
-use crate::auth::invocation;
+use crate::auth::invocation::{self, InvocationContext};
+use crate::auth::{Action, DeviceClass, PluginPrincipal, Resource, authorize_plugin};
 use crate::host_impl::plugin::oxidhome::plugin::host_state::{
     self, DeviceState as WitDeviceState, StateFilter, StatePage, StateQuality as WitQuality,
 };
@@ -54,7 +62,6 @@ pub(crate) const NETWORK_AUDIT_METHOD: &str = "NET";
 /// What a plugin may see of one entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Visibility {
-    Hidden,
     /// Visible, `bytes-val` withheld.
     Withheld,
     Full,
@@ -68,25 +75,63 @@ enum Visibility {
 /// parent don't see each other's entries as their own. They share the
 /// installation's `reads_state` grants, so a grant naming the plugin's
 /// own id lets them read each other.
-fn visibility(
+fn is_own(instance_id: &str, installation_uuid: &str, entry: &DeviceState) -> bool {
+    entry.owner_instance == instance_id && entry.owner_install == installation_uuid
+}
+
+/// The cheap first pass of a `list-state` scan, run under the store
+/// lock: own entries, and entries some `reads_state` grant covers. A
+/// superset of what [`visibility`] lets through.
+fn maybe_visible(
     instance_id: &str,
     installation_uuid: &str,
     grants: &[StateGrant],
     entry: &DeviceState,
-) -> Visibility {
-    if entry.owner_instance == instance_id && entry.owner_install == installation_uuid {
-        return Visibility::Full;
+) -> bool {
+    is_own(instance_id, installation_uuid, entry)
+        || grants
+            .iter()
+            .any(|g| g.matches(&entry.owner_plugin, &entry.device_id, &entry.capability))
+}
+
+/// What `plugin`, reading within `ctx`, may see of `entry` (of a
+/// device of `class`), or the label of the refusal.
+fn visibility(
+    ctx: &InvocationContext,
+    plugin: &PluginPrincipal<'_>,
+    installation_uuid: &str,
+    class: DeviceClass,
+    entry: &DeviceState,
+) -> Result<Visibility, &'static str> {
+    if is_own(plugin.instance_id, installation_uuid, entry) {
+        return Ok(Visibility::Full);
     }
-    let mut seen = Visibility::Hidden;
-    for grant in grants {
-        if grant.matches(&entry.owner_plugin, &entry.device_id, &entry.capability) {
-            if grant.bytes {
-                return Visibility::Full;
-            }
-            seen = Visibility::Withheld;
-        }
+    let resource = Resource::state(
+        entry.device_id.as_str(),
+        class,
+        entry.owner_plugin.as_str(),
+        entry.capability.as_str(),
+    );
+    let read = authorize_plugin(ctx, plugin, Action::StateRead, &resource);
+    if !read.allow {
+        return Err(read.reason.audit_label().unwrap_or("reads_state"));
     }
-    seen
+    // Only an entry with bytes needs the second decision.
+    if !entry
+        .fields
+        .iter()
+        .any(|kv| matches!(kv.value, Value::BytesVal(_)))
+    {
+        return Ok(Visibility::Withheld);
+    }
+    let bytes = authorize_plugin(ctx, plugin, Action::BlobRead, &resource);
+    // A sensitive obligation (camera bytes for the root) is one a
+    // plugin read can't meet: withhold.
+    Ok(if bytes.allow && bytes.obligations.sensitive.is_empty() {
+        Visibility::Full
+    } else {
+        Visibility::Withheld
+    })
 }
 
 fn to_wit(entry: &DeviceState, vis: Visibility) -> WitDeviceState {
@@ -128,10 +173,12 @@ pub(crate) struct DenyAudit {
 
 /// What a [`DenyAudit`] row refused.
 pub(crate) enum DeniedRead {
-    /// `host-state::get-state` of a device with no visible entry.
-    State { device: String },
-    /// `host-events::read-events` without `subscribes_events`.
-    Events,
+    /// `host-state::get-state` of a device with no visible entry;
+    /// `scope` is the refusal's label.
+    State { device: String, scope: &'static str },
+    /// `host-events::read-events` refused; `scope` is the refusal's
+    /// label (`subscribes_events` without the grant).
+    Events { scope: &'static str },
     /// Network access the instance's `[capabilities] network` rules
     /// don't allow (Phase 8). `op` is `connect` / `send` / `bind` /
     /// `listen` / `lookup` / `http`; `target` the address, name or
@@ -153,12 +200,18 @@ pub(crate) enum DeniedRead {
 /// row and the write all happen on one long-lived worker thread, so
 /// neither the error nor its latency tells the plugin the device
 /// exists. The operator still sees the row.
-fn audit_state_denied(log: Option<Arc<crate::state::AuditLog>>, instance_id: &str, device: &str) {
+fn audit_state_denied(
+    log: Option<Arc<crate::state::AuditLog>>,
+    instance_id: &str,
+    device: &str,
+    scope: &'static str,
+) {
     queue_deny_audit(
         log,
         instance_id,
         DeniedRead::State {
             device: device.to_owned(),
+            scope,
         },
     );
 }
@@ -255,12 +308,13 @@ fn deny_audit_worker(
             tracing::warn!(target: "host.audit", lost, "plugin-read deny rows dropped: queue full");
         }
         let (method, path, scope) = match &job.read {
-            DeniedRead::State { device } => {
+            DeniedRead::State { device, scope } => {
                 tracing::warn!(
                     target: "host.state",
                     instance_id = %job.instance_id,
                     device = %device,
-                    "get-state denied — no matching capabilities.reads_state grant",
+                    required = scope,
+                    "get-state denied",
                 );
                 (
                     STATE_READ_AUDIT_METHOD,
@@ -269,19 +323,20 @@ fn deny_audit_worker(
                         invocation::audit_cap(&job.instance_id),
                         invocation::audit_cap(device)
                     ),
-                    "reads_state",
+                    *scope,
                 )
             }
-            DeniedRead::Events => {
+            DeniedRead::Events { scope } => {
                 tracing::warn!(
                     target: "host.events",
                     instance_id = %job.instance_id,
-                    "read-events denied — capabilities.subscribes_events is not set",
+                    required = scope,
+                    "read-events denied",
                 );
                 (
                     EVENT_READ_AUDIT_METHOD,
                     format!("event.history/{}", invocation::audit_cap(&job.instance_id)),
-                    "subscribes_events",
+                    *scope,
                 )
             }
             // The policy already traced it (rate-limited with the row).
@@ -306,7 +361,9 @@ fn deny_audit_worker(
         };
         let domain_error = match &job.read {
             DeniedRead::Network { reason, .. } => Some(reason.clone()),
-            DeniedRead::State { .. } | DeniedRead::Events | DeniedRead::TlsPinned { .. } => None,
+            DeniedRead::State { .. } | DeniedRead::Events { .. } | DeniedRead::TlsPinned { .. } => {
+                None
+            }
         };
         let allowed = matches!(job.read, DeniedRead::TlsPinned { .. });
         let ctx = job
@@ -363,17 +420,29 @@ impl host_state::Host for PluginState {
         if entries.is_empty() {
             return Err(no_visible_state(&device));
         }
-        let grants = Arc::clone(&self.granted_capabilities);
-        let install = self.installation_uuid.to_string();
+        let ctx = invocation::current_or_host(&self.instance_id);
+        let plugin = self.principal();
+        let class = self.devices.class_of(&device);
+        let mut refused = None;
         let mut out: Vec<WitDeviceState> = entries
             .iter()
-            .filter_map(|e| {
-                let vis = visibility(&self.instance_id, &install, &grants.reads_state, e);
-                (vis != Visibility::Hidden).then(|| to_wit(e, vis))
-            })
+            .filter_map(
+                |e| match visibility(&ctx, &plugin, &self.installation_uuid, class, e) {
+                    Ok(vis) => Some(to_wit(e, vis)),
+                    Err(label) => {
+                        refused.get_or_insert(label);
+                        None
+                    }
+                },
+            )
             .collect();
         if out.is_empty() {
-            audit_state_denied(self.audit_log.clone(), &self.instance_id, &device);
+            audit_state_denied(
+                self.audit_log.clone(),
+                &self.instance_id,
+                &device,
+                refused.unwrap_or(crate::auth::READS_STATE_GRANT),
+            );
             return Err(no_visible_state(&device));
         }
         out.sort_by(|a, b| a.capability.cmp(&b.capability));
@@ -419,6 +488,9 @@ impl host_state::Host for PluginState {
         let grants = Arc::clone(&self.granted_capabilities);
         let instance_id = self.instance_id.clone();
         let install = self.installation_uuid.to_string();
+        // Two passes: the scan keeps what a grant could show (cheap,
+        // under the store lock), then each kept entry is decided in
+        // full, off the lock. A page may come back short.
         let page = self.device_state.snapshot_page_capped(
             after.as_deref(),
             limit,
@@ -431,22 +503,26 @@ impl host_state::Host for PluginState {
                         .capability
                         .as_ref()
                         .is_none_or(|c| *c == e.capability)
-                    && visibility(&instance_id, &install, &grants.reads_state, e)
-                        != Visibility::Hidden
+                    && maybe_visible(&instance_id, &install, &grants.reads_state, e)
             },
         );
         let next_cursor = page
             .resume_after
             .map(|after| self.device_state.seal_scan_position(&after));
+        let ctx = &invocation::current_or_host(&self.instance_id);
+        let plugin = &self.principal();
+        let install = install.as_str();
         let entries = page
             .devices
             .iter()
-            .flatten()
-            .map(|e| {
-                to_wit(
-                    e,
-                    visibility(&instance_id, &install, &grants.reads_state, e),
-                )
+            .flat_map(|entries| {
+                let class = entries.first().map(|e| self.devices.class_of(&e.device_id));
+                entries.iter().filter_map(move |e| {
+                    let class = class.unwrap_or_else(DeviceClass::unregistered);
+                    visibility(ctx, plugin, install, class, e)
+                        .ok()
+                        .map(|vis| to_wit(e, vis))
+                })
             })
             .collect();
         Ok(StatePage {
@@ -490,13 +566,33 @@ mod tests {
         }
     }
 
+    /// What instance `me` of `p.me` (installation `install`) with
+    /// `grants` sees of `e`, in host-rooted work.
+    fn vis(me: &str, install: &str, grants: &[StateGrant], e: &DeviceState) -> Option<Visibility> {
+        let denies = crate::state::PluginDenyStore::detached();
+        let plugin = PluginPrincipal {
+            plugin_id: "p.me",
+            instance_id: me,
+            requested_services: &[],
+            granted_services: &[],
+            reads_state: grants,
+            subscribes_events: false,
+            denies: &denies,
+        };
+        let ctx = InvocationContext::host_origin(me);
+        let v = visibility(&ctx, &plugin, install, DeviceClass::other(), e).ok();
+        // The scan's first pass never hides what the decision shows.
+        assert!(v.is_none() || maybe_visible(me, install, grants, e));
+        v
+    }
+
     #[test]
     fn own_entries_are_always_fully_visible() {
         let e = entry("me", "p.me", "dev-1", "camera");
-        assert_eq!(visibility("me", "inst-p.me", &[], &e), Visibility::Full);
+        assert_eq!(vis("me", "inst-p.me", &[], &e), Some(Visibility::Full));
         // Same instance id, another installation (reinstall or another
         // plugin): not its own.
-        assert_eq!(visibility("me", "inst-p.new", &[], &e), Visibility::Hidden);
+        assert_eq!(vis("me", "inst-p.new", &[], &e), None);
     }
 
     /// H1 × H2: a sandbox child and its parent share the installation
@@ -505,42 +601,36 @@ mod tests {
     #[test]
     fn sandbox_children_do_not_inherit_own_entries() {
         let parent = entry("me", "p.me", "dev-1", "switch");
-        assert_eq!(
-            visibility("me~s1", "inst-p.me", &[], &parent),
-            Visibility::Hidden
-        );
+        assert_eq!(vis("me~s1", "inst-p.me", &[], &parent), None);
         let child = entry("me~s1", "p.me", "dev-2", "switch");
-        assert_eq!(
-            visibility("me", "inst-p.me", &[], &child),
-            Visibility::Hidden
-        );
+        assert_eq!(vis("me", "inst-p.me", &[], &child), None);
         let own_plugin = grant("p.me", &["*"], &["*"], false);
         assert_eq!(
-            visibility("me~s1", "inst-p.me", &[own_plugin], &parent),
-            Visibility::Withheld
+            vis("me~s1", "inst-p.me", &[own_plugin], &parent),
+            Some(Visibility::Withheld)
         );
     }
 
     #[test]
     fn foreign_entries_need_a_matching_grant() {
         let e = entry("other", "p.other", "dev-1", "camera");
-        assert_eq!(visibility("me", "inst-p.me", &[], &e), Visibility::Hidden);
+        assert_eq!(vis("me", "inst-p.me", &[], &e), None);
         let wrong_plugin = grant("p.else", &["*"], &["*"], true);
         let wrong_cap = grant("p.other", &["switch"], &["*"], true);
         let wrong_dev = grant("*", &["*"], &["dev-2"], true);
         let empty_caps = grant("*", &[], &["*"], true);
         for g in [wrong_plugin, wrong_cap, wrong_dev, empty_caps] {
-            assert_eq!(visibility("me", "inst-p.me", &[g], &e), Visibility::Hidden);
+            assert_eq!(vis("me", "inst-p.me", &[g], &e), None);
         }
         let no_bytes = grant("p.other", &["camera"], &["dev-1"], false);
         assert_eq!(
-            visibility("me", "inst-p.me", std::slice::from_ref(&no_bytes), &e),
-            Visibility::Withheld
+            vis("me", "inst-p.me", std::slice::from_ref(&no_bytes), &e),
+            Some(Visibility::Withheld)
         );
         let bytes = grant("*", &["*"], &["*"], true);
         assert_eq!(
-            visibility("me", "inst-p.me", &[no_bytes, bytes], &e),
-            Visibility::Full
+            vis("me", "inst-p.me", &[no_bytes, bytes], &e),
+            Some(Visibility::Full)
         );
     }
 
@@ -580,7 +670,7 @@ mod tests {
         };
         held_rx.recv().expect("writer held");
         for device in ["dev-a", "dev-b"] {
-            audit_state_denied(Some(Arc::clone(&log)), "inst", device);
+            audit_state_denied(Some(Arc::clone(&log)), "inst", device, "reads_state");
         }
         assert!(
             !drain_state_read_audit(std::time::Duration::from_millis(50)),

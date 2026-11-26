@@ -89,14 +89,17 @@
 //! so a refused call spends no refcount and cannot influence
 //! `remove-service` timing.
 //!
-//! **Root authority (H6 slice 4)**: the grant gate is one half of the
-//! hop decision. [`crate::auth::authorize_hop`] combines it with the
-//! root's own authority: when the invocation is rooted at an external
+//! **The hop decision (H6 slices 4 and 5)**: the grant gate is one
+//! part of [`crate::auth::authorize_plugin`], which decides every hop
+//! in the engine. The owner's deny list for the calling plugin, and for
+//! every plugin that made a hop on the way to it, refuses the call
+//! whatever grants it; and when the invocation is rooted at an external
 //! principal, the root must hold `service.call` on the target (the
 //! `services:call` scope, or a role grant whose `services` selector
 //! covers it) and none of its denies may match. A narrow token can't
 //! have a script call services on its behalf that the token itself
-//! wasn't given. Host-rooted work is decided by the grant alone.
+//! wasn't given. Host-rooted work is decided by the grant and the
+//! chain's denies.
 //!
 //! **Delegation audit (H6)**: when the invocation is attributable
 //! (rooted at an external principal, or an `on-event` reaction to an
@@ -107,7 +110,8 @@
 //! intent/finalize contract as API requests and fail closed if the
 //! intent cannot be written; refusals are single-shot `deny` rows
 //! whose `required_scope` names what was missing (`consumes_services`
-//! for the plugin's grant, `services:call` or `deny` for the root).
+//! for the plugin's grant, `plugin-deny` for a plugin deny list,
+//! `services:call` or `deny` for the root).
 //! Other host-origin chains (`init`, `tick`, reactions to unattributed
 //! events) are traced but not audited.
 //!
@@ -123,7 +127,7 @@ use std::time::Duration;
 use oxidhome_manifest::ServiceGrant;
 
 use crate::auth::invocation::{self, DelegationHop, InvocationContext, audit_cap};
-use crate::auth::{Action, CONSUMES_SERVICES_GRANT, Resource, authorize_hop};
+use crate::auth::{Action, PluginPrincipal, Reason, Resource, authorize_plugin};
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
 use crate::state::{AuditEntry, AuditLog, ServiceRegistry};
@@ -187,14 +191,24 @@ pub async fn call_service_from_host(
     let instances = engine.instances();
     let audit = engine.audit_log();
     let pending = engine.pending_commands();
+    let denies = engine.plugin_denies();
+    // The test driver is its own plugin: its id is its instance id.
+    let caller_instance: String = caller_instance.into();
+    let caller = PluginPrincipal {
+        plugin_id: &caller_instance,
+        instance_id: &caller_instance,
+        requested_services: caller_requested_grants,
+        granted_services: caller_granted_grants,
+        reads_state: &[],
+        subscribes_events: false,
+        denies: &denies,
+    };
     call_service(
         &services,
         &instances,
         Some(&audit),
         Some(&pending),
-        caller_instance.into(),
-        caller_requested_grants,
-        caller_granted_grants,
+        &caller,
         target,
         command.into(),
         args,
@@ -235,13 +249,13 @@ pub async fn call_service_from_host_in(
 
 /// Entry point for the `host-services::call-service` host impl.
 ///
-/// `caller_instance` identifies *this* instance (from `PluginState`).
-/// H10 round-4: authorization runs against **two** independent
+/// `caller` is *this* instance as a principal (from `PluginState`).
+/// H10 round-4: the grant check runs against **two** independent
 /// selector lists — the caller's `[capabilities] consumes_services`
-/// declared in the manifest (`caller_requested_grants`) and the
+/// declared in the manifest (`caller.requested_services`) and the
 /// operator-narrowed grant from
 /// `plugin_installation.granted_capabilities_json`
-/// (`caller_granted_grants`). A call is authorized iff at least
+/// (`caller.granted_services`). A call is authorized iff at least
 /// one entry in each list matches the target-tuple, semantically
 /// equivalent to intersection but with no materialized
 /// cross-product (bounded O(N) per call in each list). Manifest
@@ -265,13 +279,12 @@ pub(crate) async fn call_service(
     instances: &Arc<InstanceRegistry>,
     audit: Option<&Arc<AuditLog>>,
     journal: Option<&Arc<PendingCommands>>,
-    caller_instance: String,
-    caller_requested_grants: &[ServiceGrant],
-    caller_granted_grants: &[ServiceGrant],
+    caller: &PluginPrincipal<'_>,
     target: ServiceId,
     command: String,
     args: Vec<KeyValue>,
 ) -> Result<CommandResult, WitError> {
+    let caller_instance = caller.instance_id.to_owned();
     // 1. Resolve the target to its full identity tuple:
     //    `(owner_instance, owner_plugin_id, local_id)`. All three
     //    are needed — owner_instance to route + cycle-check,
@@ -328,6 +341,7 @@ pub(crate) async fn call_service(
 
     let callee_ctx = parent.delegate(DelegationHop {
         caller_instance: caller_instance.clone(),
+        caller_plugin: caller.plugin_id.to_owned(),
         target_plugin: target_plugin_id.clone(),
         target_instance: target_instance.clone(),
         target_service: target_local_id.clone(),
@@ -363,41 +377,20 @@ pub(crate) async fn call_service(
             .map_or(wait_until, |d| d.min(wait_until)),
     ));
 
-    // 3. H10 structured capability gate. Runs before `acquire_call`
-    //    so a refused call spends no refcount and cannot influence
-    //    `remove-service` timing. Matches on the immutable
-    //    `(caller_instance, target_plugin, target_instance,
-    //    local_id, command)` 5-tuple — a callee's `update-service`
-    //    can't shadow or bypass the grant by renaming `name`, and
-    //    an operator can narrow a grant to specific caller
-    //    instances via `caller_instance` (H10 round-3 finding 2).
-    //
-    //    H10 round-4: both lists are checked independently. Fast
-    //    path — reject on the first list that has no match — so
-    //    the total cost is O(|first list|) when the manifest
-    //    doesn't declare a matching selector, and
-    //    O(|requested|+|granted|) otherwise. No materialized
-    //    cross-product.
-    let matches_requested = crate::state::any_grant_matches(
-        caller_requested_grants,
-        &caller_instance,
-        &target_plugin_id,
-        &target_instance,
-        &target_local_id,
-        &command,
-    );
-    let matches_granted = crate::state::any_grant_matches(
-        caller_granted_grants,
-        &caller_instance,
-        &target_plugin_id,
-        &target_instance,
-        &target_local_id,
-        &command,
-    );
-    // H6 slice 4: the hop decision — the plugin's grant above, plus
-    // the root's own permit and denies when the root is external.
-    let decision = authorize_hop(
+    // 3. The hop decision (H6 slices 4 and 5), in the engine. Runs
+    //    before `acquire_call` so a refused call spends no refcount and
+    //    cannot influence `remove-service` timing. The plugin's grant
+    //    (H10) matches on the immutable `(caller_instance,
+    //    target_plugin, target_instance, local_id, command)` 5-tuple —
+    //    a callee's `update-service` can't shadow or bypass it by
+    //    renaming `name`, and an operator can narrow a grant to
+    //    specific caller instances via `caller_instance` — in both the
+    //    requested and the granted list (H10 round-4), with no
+    //    materialized cross-product. The chain's plugin deny lists and
+    //    an external root's own permit and denies apply on top.
+    let decision = authorize_plugin(
         &callee_ctx,
+        caller,
         Action::ServiceCall,
         // The command is caller-supplied and unchecked until after
         // authorization: bound it before it's copied or echoed.
@@ -407,67 +400,24 @@ pub(crate) async fn call_service(
             target_local_id.as_str(),
             audit_cap(&command),
         ),
-        CONSUMES_SERVICES_GRANT,
-        matches_requested && matches_granted,
     );
     if decision.allow {
         // `service.call` targets carry no sensitive category yet, so
         // an allowed hop has no obligations to meet. When services can
         // be marked sensitive, the charge is made here, at dispatch.
         debug_assert!(decision.obligations.sensitive.is_empty());
-    } else if matches_requested && matches_granted {
-        // The plugin may make the call; the root may not have it made.
-        // The reason stays in the audit row.
-        if let Some(hop_audit) = hop_audit {
-            hop_audit
-                .record_denied(
-                    wait_until,
-                    decision.reason.audit_label().unwrap_or("no-permit"),
-                )
-                .await;
-        }
-        return Err(WitError::PermissionDenied(format!(
-            "caller `{caller_instance}` refused: invocation `{}` was not granted \
-             `service.call` on target `{target_plugin_id}` service `{target_local_id}` \
-             command `{}` by its root principal (a token needs `services:call` or a \
-             role grant naming the service for every hop it causes)",
-            callee_ctx.call_id(),
-            audit_cap(&command),
-        )));
     } else {
-        // Wording notes: this error also flows through
-        // `call_service_from_host`, which passes explicit slices
-        // and has no "manifest" behind it — the guidance below
-        // covers both. Which of `matches_requested` or
-        // `matches_granted` fired is included so an operator (or
-        // test harness) can localize the fix instead of guessing.
-        // The verb rides with the failing-list phrase so the
-        // polarity is correct on every arm (round-6 review
-        // fix: prior wording said "the requested list contains a
-        // matching selector" when in fact it *didn't* — that arm
-        // was inverted).
-        let failed_clause = match (matches_requested, matches_granted) {
-            (false, false) => "neither the caller's requested nor the granted list contains",
-            (false, true) => "the caller's requested list does not contain",
-            (true, false) => "the operator's granted list does not contain",
-            (true, true) => unreachable!("both matched but guard fired"),
-        };
+        let label = decision.reason.audit_label().unwrap_or("no-permit");
         if let Some(hop_audit) = hop_audit {
-            hop_audit
-                .record_denied(wait_until, CONSUMES_SERVICES_GRANT)
-                .await;
+            hop_audit.record_denied(wait_until, label).await;
         }
-        return Err(WitError::PermissionDenied(format!(
-            "caller `{caller_instance}` refused: {failed_clause} a matching \
-             `consumes_services` selector for target \
-             `{target_plugin_id}` instance `{target_instance}` service \
-             `{target_local_id}` command `{}` (caller_instance \
-             `{caller_instance}` must match too). For plugin callers, add \
-             a matching `[[capabilities.consumes_services]]` entry to the \
-             caller's manifest and ensure the operator's granted copy \
-             authorizes the same selector",
+        return Err(hop_refused(
+            &decision.reason,
+            caller,
+            &callee_ctx,
+            (&target_plugin_id, &target_instance, &target_local_id),
             audit_cap(&command),
-        )));
+        ));
     }
 
     // M2: the command must be one the service declares, and `args`
@@ -603,6 +553,68 @@ pub(crate) async fn call_service(
     };
     hop.finish(audited.as_ref().unwrap_or(&outcome));
     outcome
+}
+
+/// The error a refused hop returns, by the reason the engine gave.
+/// Grant refusals say which `consumes_services` list failed, so an
+/// operator (or test harness) can localize the fix; the reason itself
+/// is in the hop's audit row.
+fn hop_refused(
+    reason: &Reason,
+    caller: &PluginPrincipal<'_>,
+    callee_ctx: &InvocationContext,
+    (target_plugin, target_instance, target_local_id): (&str, &str, &str),
+    command: &str,
+) -> WitError {
+    let caller_instance = caller.instance_id;
+    match reason {
+        Reason::MissingPluginGrant { .. } => {
+            let covers = |grants: &[ServiceGrant]| {
+                crate::state::any_grant_matches(
+                    grants,
+                    caller_instance,
+                    target_plugin,
+                    target_instance,
+                    target_local_id,
+                    command,
+                )
+            };
+            // This error also flows through `call_service_from_host`,
+            // which passes explicit slices and has no "manifest" behind
+            // it — the guidance below covers both.
+            let failed_clause = match (
+                covers(caller.requested_services),
+                covers(caller.granted_services),
+            ) {
+                (false, false) => "neither the caller's requested nor the granted list contains",
+                (false, true) => "the caller's requested list does not contain",
+                (true, _) => "the operator's granted list does not contain",
+            };
+            WitError::PermissionDenied(format!(
+                "caller `{caller_instance}` refused: {failed_clause} a matching \
+                 `consumes_services` selector for target \
+                 `{target_plugin}` instance `{target_instance}` service \
+                 `{target_local_id}` command `{command}` (caller_instance \
+                 `{caller_instance}` must match too). For plugin callers, add \
+                 a matching `[[capabilities.consumes_services]]` entry to the \
+                 caller's manifest and ensure the operator's granted copy \
+                 authorizes the same selector",
+            ))
+        }
+        Reason::PluginDenied { plugin } => WitError::PermissionDenied(format!(
+            "caller `{caller_instance}` refused: the owner's deny list for plugin `{plugin}` \
+             forbids `service.call` on target `{target_plugin}` service `{target_local_id}` \
+             command `{command}` (invocation `{}`)",
+            callee_ctx.call_id(),
+        )),
+        _ => WitError::PermissionDenied(format!(
+            "caller `{caller_instance}` refused: invocation `{}` was not granted \
+             `service.call` on target `{target_plugin}` service `{target_local_id}` \
+             command `{command}` by its root principal (a token needs `services:call` or a \
+             role grant naming the service for every hop it causes)",
+            callee_ctx.call_id(),
+        )),
+    }
 }
 
 /// Finalizes a hop's intent row exactly once: with the call's outcome,
@@ -913,6 +925,38 @@ impl HopAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The production entry point with a caller built from explicit
+    /// grant lists (its plugin id is its instance id, and no plugin
+    /// has a deny list): the shape these tests were written against.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_service(
+        services: &Arc<ServiceRegistry>,
+        instances: &Arc<InstanceRegistry>,
+        audit: Option<&Arc<AuditLog>>,
+        journal: Option<&Arc<PendingCommands>>,
+        caller_instance: String,
+        requested: &[ServiceGrant],
+        granted: &[ServiceGrant],
+        target: ServiceId,
+        command: String,
+        args: Vec<KeyValue>,
+    ) -> Result<CommandResult, WitError> {
+        let denies = crate::state::PluginDenyStore::detached();
+        let caller = PluginPrincipal {
+            plugin_id: &caller_instance,
+            instance_id: &caller_instance,
+            requested_services: requested,
+            granted_services: granted,
+            reads_state: &[],
+            subscribes_events: false,
+            denies: &denies,
+        };
+        super::call_service(
+            services, instances, audit, journal, &caller, target, command, args,
+        )
+        .await
+    }
     use crate::host_impl::plugin::oxidhome::plugin::services::ServiceInfo;
 
     /// Chain fixture: a context whose delegation chain holds one hop
@@ -923,6 +967,7 @@ mod tests {
             |ctx, (caller, target)| {
                 ctx.delegate(DelegationHop {
                     caller_instance: (*caller).into(),
+                    caller_plugin: "example.caller".into(),
                     target_plugin: "irrelevant".into(),
                     target_instance: (*target).into(),
                     target_service: "irrelevant".into(),
@@ -1514,6 +1559,7 @@ mod tests {
     /// (the first hop) can't have alpha's wasm call beta's `ring`,
     /// although alpha's own grant allows it.
     #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::too_many_lines)]
     async fn inner_hop_needs_the_roots_permit_too() {
         use crate::auth::{
             Action, ActionSet, Actor, ActorKind, Principal, RoleDef, RoleGrant, Transport,
@@ -1548,6 +1594,7 @@ mod tests {
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
                 .delegate(DelegationHop {
                     caller_instance: "driver".into(),
+                    caller_plugin: "example.caller".into(),
                     target_plugin: "com.example.alpha".into(),
                     target_instance: "alpha".into(),
                     target_service: "ring".into(),
@@ -1594,6 +1641,7 @@ mod tests {
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
                 .delegate(DelegationHop {
                     caller_instance: "driver".into(),
+                    caller_plugin: "example.caller".into(),
                     target_plugin: "com.example.alpha".into(),
                     target_instance: "alpha".into(),
                     target_service: "ring".into(),

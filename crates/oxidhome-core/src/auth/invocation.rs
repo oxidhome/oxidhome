@@ -25,7 +25,7 @@
 //!   `call-service` hop, outermost first. The dispatcher's cycle
 //!   detection reads the same chain, and every hop is authorized
 //!   against the root's authority as well as the calling plugin's
-//!   grants ([`crate::auth::authorize_hop`]);
+//!   grants ([`crate::auth::authorize_plugin`]);
 //! - what the invocation was **caused by** — the call id of the
 //!   invocation that published the event an `on-event` reaction is
 //!   handling ([`InvocationContext::reacting_to`]). Attribution only:
@@ -239,6 +239,10 @@ pub struct DelegationHop {
     /// Instance whose wasm issued the call. Also the unit of cycle
     /// detection: that supervisor is parked until the hop returns.
     pub caller_instance: String,
+    /// Plugin id of the caller instance. Every plugin that made a hop
+    /// contributes the owner's deny list for it to every later
+    /// decision of the invocation ([`crate::auth::authorize_plugin`]).
+    pub caller_plugin: String,
     /// Plugin id that owns the target service.
     pub target_plugin: String,
     /// Instance that owns the target service.
@@ -462,6 +466,7 @@ impl InvocationContext {
             .map(|h| {
                 serde_json::json!({
                     "caller": audit_cap(&h.caller_instance),
+                    "caller_plugin": audit_cap(&h.caller_plugin),
                     "plugin": audit_cap(&h.target_plugin),
                     "instance": audit_cap(&h.target_instance),
                     "service": audit_cap(&h.target_service),
@@ -528,6 +533,7 @@ mod tests {
     fn hop(caller: &str, target: &str) -> DelegationHop {
         DelegationHop {
             caller_instance: caller.into(),
+            caller_plugin: "example.caller".into(),
             target_plugin: "example.p".into(),
             target_instance: target.into(),
             target_service: "svc".into(),
@@ -679,6 +685,7 @@ mod tests {
         assert!(capped.len() >= MAX_AUDIT_IDENT_BYTES - 1);
         let ctx = InvocationContext::host_origin("a").delegate(DelegationHop {
             caller_instance: "a".into(),
+            caller_plugin: "p".into(),
             target_plugin: "p".into(),
             target_instance: "b".into(),
             target_service: "x".repeat(10_000),

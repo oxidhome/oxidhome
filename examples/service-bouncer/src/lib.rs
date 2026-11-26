@@ -20,12 +20,20 @@
 //! KV `kicked`, so a test can see that a relay landed. Don't point
 //! `relay_to` at an announcing bouncer: each announcement would start
 //! a fresh reaction, a loop only the publish quota stops.
+//!
+//! H6 slice 5 (a device command that calls a service): each bouncer
+//! also registers a `button` device. Its `button::press` command does
+//! what `kick` does with `bounce_to` — calls `bounce_to.kick` when KV
+//! `bounce_to` is set, otherwise lands as a leaf — so a token's device
+//! command starts a chain whose first hop the token must also be
+//! allowed.
 
 use oxidhome_sdk::Plugin;
-use oxidhome_sdk::bindings::oxidhome::plugin::devices::CommandResult;
+use oxidhome_sdk::bindings::oxidhome::plugin::capabilities::CapabilitySpec;
+use oxidhome_sdk::bindings::oxidhome::plugin::devices::{Command, CommandResult};
 use oxidhome_sdk::bindings::oxidhome::plugin::events::{Event, EventPayload};
 use oxidhome_sdk::bindings::oxidhome::plugin::types::{Error, KeyValue, Value};
-use oxidhome_sdk::{CommandSpec, Service, host};
+use oxidhome_sdk::{CommandSpec, Device, Service, host};
 
 const BOUNCE_KEY: &str = "bounce_to";
 const ANNOUNCE_KEY: &str = "announce";
@@ -55,6 +63,10 @@ impl Plugin for Bouncer {
         )
         .map_err(|e| format!("register-service failed: {e:?}"))?;
         oxidhome_sdk::tracing::info!(service_id = %id, "service-bouncer registered");
+        host::register_device(
+            Device::new("button", "Bouncer Button").capability(CapabilitySpec::Button),
+        )
+        .map_err(|e| format!("register-device failed: {e:?}"))?;
         // The relay is optional: without `subscribes_events` the
         // bouncer still serves `kick`.
         if let Err(e) = host::subscribe_topic(RELAY_TOPIC.to_owned()) {
@@ -77,6 +89,26 @@ impl Plugin for Bouncer {
                 Err(e) => oxidhome_sdk::tracing::warn!("relay kick failed: {e:?}"),
                 Ok(_) => {}
             }
+        }
+    }
+
+    fn execute_command(&mut self, _device: String, cmd: Command) -> CommandResult {
+        if cmd.capability != "button" || cmd.action != "press" {
+            return CommandResult::Err(Error::InvalidArgument(format!(
+                "unknown bouncer button command: {}::{}",
+                cmd.capability, cmd.action
+            )));
+        }
+        // Like `kick`: bounce when a target is set, else land.
+        let Some(target) = kv_string(BOUNCE_KEY) else {
+            if let Err(e) = host::storage::set(KICKED_KEY, &Value::BoolVal(true)) {
+                oxidhome_sdk::tracing::warn!("marking kicked failed: {e:?}");
+            }
+            return CommandResult::Ok;
+        };
+        match host::call_service(&target, "kick", &[]) {
+            Ok(result) => result,
+            Err(e) => CommandResult::Err(e),
         }
     }
 

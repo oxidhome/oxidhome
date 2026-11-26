@@ -2985,6 +2985,7 @@ mod tests {
         let handle = InstanceHandle::with_pending_for_test("inst-a", control, &pending);
         let ctx = root.delegate(DelegationHop {
             caller_instance: "caller".into(),
+            caller_plugin: "example.caller".into(),
             target_plugin: "test.plugin".into(),
             target_instance: "inst-a".into(),
             target_service: "svc".into(),
@@ -3073,6 +3074,7 @@ mod tests {
         let (audit, pending) = journaled();
         let ctx = api_ctx().delegate(crate::auth::invocation::DelegationHop {
             caller_instance: "caller".into(),
+            caller_plugin: "example.caller".into(),
             target_plugin: "test.plugin".into(),
             target_instance: "inst-a".into(),
             target_service: "svc".into(),

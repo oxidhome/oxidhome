@@ -30,6 +30,7 @@ pub mod events;
 pub mod installed_plugins;
 pub mod kv;
 pub mod log_store;
+pub mod plugin_deny;
 pub mod retention;
 pub mod services;
 pub mod tls_pins;
@@ -81,6 +82,7 @@ pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
 };
+pub use plugin_deny::{PluginDenyError, PluginDenyList, PluginDenyStore};
 pub use retention::{
     AUDIT_RETENTION_ENV, EVENT_LOG_RETENTION_ENV, LOG_RETENTION_ENV, RetentionConfig, RetentionEnv,
     RetentionPolicy, RetentionTask, RetentionTasks,

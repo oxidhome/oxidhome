@@ -59,31 +59,41 @@
 //!    [`Action::TokenManage`] (minting and listing tokens) are the
 //!    owner's alone; no scope or role grants them.
 //!
-//! # Delegated hops (H6 slice 4)
+//! # Plugin principals (H6 slices 4 and 5)
 //!
-//! A `call-service` hop is decided by [`authorize_hop`]:
-//! `allow = permit(root) ∧ permit(calling plugin) ∧ no deny on the
-//! chain`. The calling plugin's permit is its `consumes_services`
-//! grant (requested ∩ granted), which the dispatcher matches and
-//! passes in. When the root is external, the root must also hold
-//! [`Action::ServiceCall`] on the target [`Resource::Service`] — the
-//! `services:call` scope (or the wildcard), or a role grant whose
-//! `services` selector covers it — and none of its denies may match
-//! the hop. A narrow token therefore can't have a script use the
-//! script's broader grants on its behalf. Host-rooted work (`init`,
-//! `tick`, `on-event`, including reactions to an event an external
-//! request caused) has the plugin itself as its root: only the
-//! plugin's grant applies. Plugins carry no deny lists yet, so the
-//! root is the only principal on the chain that contributes denies.
+//! A plugin instance is a principal too. Its permits are compiled
+//! from its effective manifest grants, and the owner may give it a
+//! deny list. [`crate::auth::authorize_plugin`] decides every action
+//! a plugin takes through a host import: a `call-service` hop
+//! ([`Action::ServiceCall`], `consumes_services`), a `host-state` read
+//! ([`Action::StateRead`] and, for `bytes-val` fields,
+//! [`Action::BlobRead`] on a [`Resource::State`] entry, `reads_state`),
+//! and subscribing to or reading the event bus
+//! ([`Action::EventSubscribe`], `subscribes_events`). The rule is
+//! `allow = permit(acting plugin) ∧ permit(root) ∧ no deny on the
+//! chain`:
+//!
+//! - every plugin on the chain (the acting plugin and each plugin that
+//!   made a hop to reach it) contributes the owner's deny list for it
+//!   ([`Reason::PluginDenied`], label `plugin-deny`);
+//! - the acting plugin's compiled grant must cover the action
+//!   ([`Reason::MissingPluginGrant`], labelled with the grant's name);
+//! - when the invocation is rooted at an external principal, the root
+//!   must itself be allowed the token-facing equivalent by
+//!   [`authorize`] (`service.call` as is, `state.read` as
+//!   `device.read`, bytes as `blob.read`, `event.subscribe` as
+//!   `event.read`), so a narrow token can't have a plugin use the
+//!   plugin's broader grants on its behalf.
+//!
+//! Host-rooted work (`init`, `tick`, `on-event`, including reactions
+//! to an event an external request caused) has the plugin itself as
+//! its root: only the plugin's grants and the chain's denies apply.
+//! [`Action::StateRead`] has no scope, so [`authorize`] refuses it for
+//! a token.
 //!
 //! The scenario tests (`scenarios.rs`) check the sensitive
 //! categories, the deny list and sample owner-defined roles against an
 //! independent oracle.
-//!
-//! Plugin principals are still authorized by their manifest grants at
-//! their own call sites (`consumes_services`, `reads_state`,
-//! `subscribes_events`); [`Action::StateRead`] exists so the taxonomy
-//! is complete, and is refused here.
 //!
 //! Each transport keeps its existing deny wire shape (an empty REST
 //! 403, Connect `permission_denied` with `scope <label> required`, a
@@ -152,11 +162,13 @@ pub enum Action {
     PolicyManage,
     /// Call a plugin service through a delegated hop
     /// (`services:call`). Checked for the root of every hop
-    /// ([`authorize_hop`]), on top of the calling plugin's
-    /// `consumes_services` grant.
+    /// ([`crate::auth::authorize_plugin`]), on top of the calling
+    /// plugin's `consumes_services` grant.
     ServiceCall,
-    /// Read another plugin's device state. Plugin principals are
-    /// authorized by `reads_state`; no scope grants it.
+    /// Read an entry of the device-state projection through
+    /// `host-state`. A plugin action (`reads_state`); no scope grants
+    /// it, so a token is refused. A token rooting the read must hold
+    /// `device.read` on the device instead.
     StateRead,
 }
 
@@ -306,6 +318,11 @@ pub enum Resource {
     /// One command of one plugin service: the target of a delegated
     /// `call-service` hop.
     Service(ServiceResource),
+    /// One entry of the device-state projection, as a plugin reads it
+    /// through `host-state` (H6 slice 5): a device plus the owner and
+    /// capability of the entry. A deny's device selectors match it as
+    /// they match the device.
+    State(StateResource),
 }
 
 impl Resource {
@@ -373,6 +390,27 @@ impl Resource {
             instance_id: instance_id.into(),
             local_id: local_id.into(),
             command: command.into(),
+        })
+    }
+
+    /// One entry of the device-state projection: device `id` (with the
+    /// class the host derived for it, from
+    /// [`crate::state::DeviceRegistry::class_of`]), written by a
+    /// device of `owner_plugin` under `capability`.
+    #[must_use]
+    pub fn state(
+        id: impl Into<String>,
+        class: DeviceClass,
+        owner_plugin: impl Into<String>,
+        capability: impl Into<String>,
+    ) -> Self {
+        Self::State(StateResource {
+            device: DeviceResource {
+                id: id.into(),
+                class,
+            },
+            owner_plugin: owner_plugin.into(),
+            capability: capability.into(),
         })
     }
 
@@ -539,6 +577,35 @@ impl ServiceResource {
     #[must_use]
     pub fn command(&self) -> &str {
         &self.command
+    }
+}
+
+/// State-entry attributes the host decides on: the device, the plugin
+/// whose device wrote the entry, and the entry's capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateResource {
+    device: DeviceResource,
+    owner_plugin: String,
+    capability: String,
+}
+
+impl StateResource {
+    /// The device the entry describes.
+    #[must_use]
+    pub fn device(&self) -> &DeviceResource {
+        &self.device
+    }
+
+    /// Plugin id of the instance that wrote the entry.
+    #[must_use]
+    pub fn owner_plugin(&self) -> &str {
+        &self.owner_plugin
+    }
+
+    /// The entry's capability key.
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
     }
 }
 
@@ -804,17 +871,23 @@ pub enum Reason {
     /// Allowed: an owner-only host action (`policy.manage`,
     /// `token.manage`).
     Owner,
-    /// Allowed: a hop of host-rooted work, which the calling plugin's
-    /// own manifest grant `grant` decides alone.
+    /// Allowed: host-rooted plugin work, which the acting plugin's own
+    /// manifest grant `grant` decides alone (with the chain's denies).
     PluginGrant {
-        /// The manifest grant (`consumes_services`).
+        /// The manifest grant (`consumes_services`, `reads_state`, …).
         grant: &'static str,
     },
-    /// Denied: the calling plugin's manifest grant `grant` does not
-    /// cover the hop. Its label is the grant's name.
+    /// Denied: the acting plugin's manifest grant `grant` does not
+    /// cover the action. Its label is the grant's name.
     MissingPluginGrant {
-        /// The manifest grant (`consumes_services`).
+        /// The manifest grant (`consumes_services`, `reads_state`, …).
         grant: &'static str,
+    },
+    /// Denied: the owner's deny list for `plugin`, a plugin on the
+    /// chain, matched (H6 slice 5).
+    PluginDenied {
+        /// The plugin whose deny list matched.
+        plugin: String,
     },
 }
 
@@ -823,6 +896,9 @@ pub const NO_PERMIT_LABEL: &str = "no-permit";
 
 /// Audit label for [`Reason::Denied`].
 pub const DENIED_LABEL: &str = "deny";
+
+/// Audit label for [`Reason::PluginDenied`].
+pub const PLUGIN_DENIED_LABEL: &str = "plugin-deny";
 
 /// What [`Reason::Sensitive`] names as the grant when a role decided.
 pub const ROLE_LABEL: &str = "role";
@@ -845,6 +921,7 @@ impl Reason {
             Reason::NoPermit => Some(NO_PERMIT_LABEL),
             Reason::MissingSensitive { category } => Some(category.deny_label()),
             Reason::MissingPluginGrant { grant } => Some(*grant),
+            Reason::PluginDenied { .. } => Some(PLUGIN_DENIED_LABEL),
         }
     }
 }
@@ -913,7 +990,7 @@ pub struct Decision {
 }
 
 impl Decision {
-    fn allow(reason: Reason) -> Self {
+    pub(crate) fn allow(reason: Reason) -> Self {
         Self {
             allow: true,
             reason,
@@ -921,7 +998,7 @@ impl Decision {
         }
     }
 
-    fn deny(reason: Reason) -> Self {
+    pub(crate) fn deny(reason: Reason) -> Self {
         Self {
             allow: false,
             reason,
@@ -949,53 +1026,6 @@ impl Decision {
 #[must_use]
 pub fn authorize(ctx: &InvocationContext, action: Action, resource: &Resource) -> Decision {
     evaluate(ctx.root().authority(), action, resource)
-}
-
-/// Manifest grant name of a plugin's service-call permit.
-pub const CONSUMES_SERVICES_GRANT: &str = "consumes_services";
-
-/// Decide a delegated hop (H6 slice 4): `ctx` is the callee's
-/// context (the hop already on its chain), `plugin_permit` whether the
-/// calling plugin's own manifest grant (`plugin_grant`, e.g.
-/// [`CONSUMES_SERVICES_GRANT`]) covers the hop.
-///
-/// The rule is `permit(root) ∧ permit(calling plugin) ∧ no deny on the
-/// chain`:
-///
-/// - the calling plugin's grant is checked first, so a hop no grant
-///   covers is refused with [`Reason::MissingPluginGrant`] whoever the
-///   root is;
-/// - an external root must itself be allowed `action` on `resource` by
-///   [`authorize`] (its scopes, roles, constraints and sensitive
-///   grants), and its denies refuse the hop whatever the plugin may;
-/// - a host-rooted hop (`init`, `tick`, `on-event`) is the plugin's own
-///   work: its grant decides ([`Reason::PluginGrant`]).
-///
-/// Plugins carry no deny lists yet, so the chain's other principals
-/// add no denies; when they do, every plugin on `ctx.chain()`
-/// contributes its own.
-///
-/// An allow may carry [`Obligations`] (a sensitive target); the caller
-/// meets them when it dispatches, as for a direct request.
-#[must_use]
-pub fn authorize_hop(
-    ctx: &InvocationContext,
-    action: Action,
-    resource: &Resource,
-    plugin_grant: &'static str,
-    plugin_permit: bool,
-) -> Decision {
-    if !plugin_permit {
-        return Decision::deny(Reason::MissingPluginGrant {
-            grant: plugin_grant,
-        });
-    }
-    if ctx.root().is_external() {
-        return authorize(ctx, action, resource);
-    }
-    Decision::allow(Reason::PluginGrant {
-        grant: plugin_grant,
-    })
 }
 
 /// The evaluator behind [`authorize`], on an [`Authority`] directly.
@@ -1267,51 +1297,6 @@ mod tests {
 
     fn bouncer() -> Resource {
         Resource::service("example.bouncer", "alpha", "bouncer", "kick")
-    }
-
-    /// H6 slice 4: a hop needs the plugin's grant and, for an external
-    /// root, the root's own `service.call`; host-rooted work is the
-    /// plugin's alone.
-    #[test]
-    fn hops_need_the_plugin_grant_and_the_roots_permit() {
-        let hop = |ctx: &InvocationContext, plugin: bool| {
-            authorize_hop(
-                ctx,
-                Action::ServiceCall,
-                &bouncer(),
-                CONSUMES_SERVICES_GRANT,
-                plugin,
-            )
-        };
-        let host = InvocationContext::host_origin("alpha");
-        let d = hop(&host, true);
-        assert!(d.allow);
-        assert_eq!(
-            d.reason,
-            Reason::PluginGrant {
-                grant: CONSUMES_SERVICES_GRANT
-            }
-        );
-        let reaction = InvocationContext::reacting_to("alpha", "call-x");
-        assert!(hop(&reaction, true).allow);
-        let d = hop(&host, false);
-        assert_eq!(d.reason.audit_label(), Some(CONSUMES_SERVICES_GRANT));
-
-        let narrow = ctx_for(&Actor::api("t", vec!["devices:command".into()]));
-        let d = hop(&narrow, true);
-        assert!(!d.allow);
-        assert_eq!(d.reason.audit_label(), Some("services:call"));
-        // The plugin's grant is asked first, whoever the root is.
-        let admin = ctx_for(&Actor::api("t", vec!["*".into()]));
-        assert_eq!(
-            hop(&admin, false).reason.audit_label(),
-            Some(CONSUMES_SERVICES_GRANT)
-        );
-        let d = hop(&admin, true);
-        assert!(d.allow);
-        assert_eq!(d.obligations, Obligations::default());
-        let scoped = ctx_for(&Actor::api("t", vec!["services:call".into()]));
-        assert!(hop(&scoped, true).allow);
     }
 
     /// A role's `services` selector narrows the delegation grant; a

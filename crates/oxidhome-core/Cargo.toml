@@ -120,6 +120,10 @@ name = "plugin_network_grants"
 path = "tests/plugin_network_grants.rs"
 
 [[test]]
+name = "plugin_deny_admin"
+path = "tests/plugin_deny_admin.rs"
+
+[[test]]
 name = "api_skeleton"
 path = "tests/api_skeleton.rs"
 

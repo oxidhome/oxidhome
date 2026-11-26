@@ -248,7 +248,7 @@ pub fn build_policy(
     Ok(policy)
 }
 
-fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
+pub(crate) fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
     check_len("deny entries", specs)?;
     specs
         .iter()
@@ -263,8 +263,9 @@ fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
                         invalid(if services.is_some() {
                             "a deny entry narrowed to services can only name service.call"
                         } else {
-                            "a deny entry narrowed to devices can't name service.call (narrow it \
-                             with `services` instead)"
+                            "a deny entry narrowed to devices can only name actions on devices, \
+                             their state, events and blobs (narrow `service.call` with `services` \
+                             instead)"
                         })
                     })?;
             Ok(DenyRule {
@@ -1072,7 +1073,7 @@ mod tests {
                     }],
                     ..req("x", &["resident"])
                 },
-                "can't name service.call",
+                "narrowed to devices can only name actions on devices",
             ),
             (
                 MintRequest {

@@ -25,8 +25,9 @@
 //! follow a request into plugin dispatch — lives in
 //! [`invocation::InvocationContext`] (H6). Every REST, Connect and MCP
 //! token-scope check is made by [`authorize()`] against that root
-//! authority; plugin manifest grants are still checked at their own
-//! call sites.
+//! authority; every plugin action through a host import (service calls,
+//! state reads, the event bus) by [`authorize_plugin()`], against the
+//! plugin's compiled grants, the chain's deny lists and the root.
 //!
 //! See `ARCHITECTURE.md` "Auth & actor identity" for the
 //! cross-cutting design and `00_OVERVIEW.md` for the per-phase
@@ -38,16 +39,22 @@ use std::sync::Arc;
 pub mod authorize;
 pub mod category;
 pub mod invocation;
+pub mod plugin;
 pub mod policy;
 pub mod role;
 pub mod sensitive;
 
 pub use authorize::{
-    Action, AuditLevel, Authority, CONSUMES_SERVICES_GRANT, Decision, Obligations, Reason,
-    Resource, ResourceKind, ServiceResource, authorize, authorize_hop,
+    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind,
+    ServiceResource, StateResource, authorize,
 };
 pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
+pub use plugin::{
+    CONSUMES_SERVICES_GRANT, PLUGIN_ACTIONS, PluginPrincipal, READS_STATE_BYTES_GRANT,
+    READS_STATE_GRANT, SUBSCRIBES_EVENTS_GRANT, authorize_plugin, denied_on_chain,
+    restrict_to_plugin_actions,
+};
 pub use policy::{
     DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
     parse_policy,

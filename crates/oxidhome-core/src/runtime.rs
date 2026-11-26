@@ -104,6 +104,9 @@ pub struct Engine {
     /// H6 slice 2: rate limits and `warn` audit rows for allowed
     /// sensitive actions, shared by every transport.
     sensitive: Arc<crate::auth::sensitive::SensitiveGuard>,
+    /// H6 slice 5: the owner's deny lists over plugins, which every
+    /// plugin decision reads.
+    plugin_denies: Arc<crate::state::PluginDenyStore>,
     /// ADR-0001: KV / blob operations in flight per instance, which a
     /// removed sandbox's purge waits out.
     storage_ops: Arc<sandbox_purge::StorageOps>,
@@ -450,7 +453,12 @@ impl Engine {
         let tls_pins = crate::state::TlsPinStore::open(Arc::clone(&db))
             .context("loading TLS certificate pins")?;
         purge_tls_pins_of_removed_installations(&db, &tls_pins, &audit_log);
+        let plugin_denies = Arc::new(
+            crate::state::PluginDenyStore::open(Arc::clone(&db))
+                .context("loading plugin deny lists")?,
+        );
         Ok(Self {
+            plugin_denies,
             tls: Arc::new(network::TlsClient::new(Arc::new(tls_pins))),
             dns: None,
             inner,
@@ -602,6 +610,12 @@ impl Engine {
     #[must_use]
     pub fn sensitive(&self) -> Arc<crate::auth::sensitive::SensitiveGuard> {
         Arc::clone(&self.sensitive)
+    }
+
+    /// H6 slice 5: the owner's deny lists over plugins.
+    #[must_use]
+    pub fn plugin_denies(&self) -> Arc<crate::state::PluginDenyStore> {
+        Arc::clone(&self.plugin_denies)
     }
 
     /// H9 host-owned device-state projection. Consumers (API/UI,

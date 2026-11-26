@@ -120,6 +120,13 @@ pub fn build_router(engine: Engine) -> Router {
             "/api/v1/plugins/{plugin_id}/network-grant",
             axum::routing::put(set_network_grant).delete(reset_network_grant),
         )
+        // H6 slice 5: the owner's deny list over a plugin.
+        .route(
+            "/api/v1/plugins/{plugin_id}/deny",
+            get(get_plugin_deny)
+                .put(set_plugin_deny)
+                .delete(reset_plugin_deny),
+        )
         // Phase 13 slice 2: schema-driven UI. Returns the
         // installed manifest's `config` schema (Phase 4)
         // and `[ui]` section (Phase 13 slice 1) so the
@@ -969,6 +976,135 @@ async fn reset_network_grant(
     )
     .await
     .map_err(NetworkGrantApiError::Grant)?;
+    Ok(Json(view))
+}
+
+// ── Plugin deny lists (H6 slice 5) ───────────────────────────────
+
+/// Body of `PUT /api/v1/plugins/{plugin_id}/deny`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginDenyBody {
+    /// Deny entries, as token deny lists take them; `*` names every
+    /// plugin action. Empty removes the list.
+    deny: Vec<super::token_admin::SelectorSpec>,
+}
+
+/// Why a deny list request failed, as REST answers it.
+enum PluginDenyApiError {
+    Scope(ScopeDenied),
+    BadRequest(String),
+    Change(super::plugin_deny_admin::PluginDenyAdminError),
+}
+
+impl IntoResponse for PluginDenyApiError {
+    fn into_response(self) -> axum::response::Response {
+        use super::plugin_deny_admin::PluginDenyAdminError as E;
+        let error = |status, error: &str, reason: String| {
+            (
+                status,
+                Json(serde_json::json!({"error": error, "reason": reason})),
+            )
+                .into_response()
+        };
+        match self {
+            Self::Scope(s) => s.into_response(),
+            Self::BadRequest(reason) | Self::Change(E::Invalid(reason)) => {
+                error(StatusCode::BAD_REQUEST, "bad_request", reason)
+            }
+            Self::Change(E::Full(reason)) => error(StatusCode::CONFLICT, "too_many_lists", reason),
+            Self::Change(e @ E::Store(_)) => {
+                tracing::error!(target: "api.plugins", error = %e, "plugin deny change failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+            }
+        }
+    }
+}
+
+/// `GET /api/v1/plugins/{plugin_id}/deny` — the owner's deny list over
+/// the plugin (`deny` empty when none). `policy.manage`.
+///
+/// # Errors
+/// - `403` not the owner.
+async fn get_plugin_deny(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<super::plugin_deny_admin::PluginDenyView>, PluginDenyApiError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    )
+    .map_err(PluginDenyApiError::Scope)?;
+    Ok(Json(super::plugin_deny_admin::plugin_deny(
+        &state.engine.plugin_denies(),
+        plugin_id,
+    )))
+}
+
+/// `PUT /api/v1/plugins/{plugin_id}/deny` with `{"deny": [...]}` —
+/// replace the owner's deny list over the plugin: what it, or any
+/// plugin whose call reaches another, may not do (`service.call`,
+/// `state.read`, `blob.read`, `event.subscribe`), whatever its manifest
+/// grants. The plugin need not be installed; running instances apply
+/// it at once. `policy.manage`: the owner only.
+///
+/// # Errors
+/// - `400` a bad body, plugin id or entry (an action a plugin doesn't
+///   take), or too many entries.
+/// - `403` not the owner.
+/// - `409` too many plugins have a list.
+async fn set_plugin_deny(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+    body: Result<Json<PluginDenyBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<super::plugin_deny_admin::PluginDenyView>, PluginDenyApiError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    )
+    .map_err(PluginDenyApiError::Scope)?;
+    let Json(body) =
+        body.map_err(|e| PluginDenyApiError::BadRequest(format!("invalid body: {e}")))?;
+    let view = super::plugin_deny_admin::change_plugin_deny(
+        state.engine.clone(),
+        super::network_admin::GrantActor::of("api", &ctx),
+        plugin_id,
+        Some(body.deny),
+    )
+    .await
+    .map_err(PluginDenyApiError::Change)?;
+    Ok(Json(view))
+}
+
+/// `DELETE /api/v1/plugins/{plugin_id}/deny` — remove the owner's deny
+/// list over the plugin. `policy.manage`.
+///
+/// # Errors
+/// - `400` not a plugin id.
+/// - `403` not the owner.
+async fn reset_plugin_deny(
+    Extension(ctx): Extension<InvocationContext>,
+    State(state): State<ApiState>,
+    Path(plugin_id): Path<String>,
+) -> Result<Json<super::plugin_deny_admin::PluginDenyView>, PluginDenyApiError> {
+    require(
+        &ctx,
+        Action::PolicyManage,
+        &Resource::plugin(plugin_id.as_str()),
+    )
+    .map_err(PluginDenyApiError::Scope)?;
+    let view = super::plugin_deny_admin::change_plugin_deny(
+        state.engine.clone(),
+        super::network_admin::GrantActor::of("api", &ctx),
+        plugin_id,
+        None,
+    )
+    .await
+    .map_err(PluginDenyApiError::Change)?;
     Ok(Json(view))
 }
 

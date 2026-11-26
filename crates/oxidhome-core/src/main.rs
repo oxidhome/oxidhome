@@ -842,7 +842,7 @@ fn run_token_create(args: &[String], usage: &str) -> anyhow::Result<()> {
 fn parse_token_create(
     args: &[String],
 ) -> anyhow::Result<oxidhome_core::api::token_admin::MintRequest> {
-    use oxidhome_core::api::token_admin::{MintRequest, SelectorSpec};
+    use oxidhome_core::api::token_admin::MintRequest;
     let mut req = MintRequest::default();
     let mut label = None;
     let mut rest = args.iter();
@@ -856,26 +856,7 @@ fn parse_token_create(
             "--role" => req.roles.push(value()?),
             "--scope" => req.scopes.push(value()?),
             "--sensitive" => req.sensitive.push(value()?),
-            "--deny" => {
-                let v = value()?;
-                let list = |l: &str| Some(l.split(',').map(str::to_owned).collect());
-                // `<actions>{<services>}` (as listings show it) or
-                // `<actions>[@<categories>]`.
-                let (actions, category, services) =
-                    match v.strip_suffix('}').and_then(|v| v.split_once('{')) {
-                        Some((a, svc)) => (a, None, list(svc)),
-                        None => match v.split_once('@') {
-                            Some((a, c)) => (a, list(c), None),
-                            None => (v.as_str(), None, None),
-                        },
-                    };
-                req.deny.push(SelectorSpec {
-                    actions: actions.split(',').map(str::to_owned).collect(),
-                    category,
-                    devices: None,
-                    services,
-                });
-            }
+            "--deny" => req.deny.push(parse_deny_spec(&value()?)),
             other if other.starts_with('-') => anyhow::bail!("unexpected argument `{other}`"),
             other if label.is_none() => label = Some(other.to_owned()),
             other => anyhow::bail!("unexpected argument `{other}`"),
@@ -883,6 +864,25 @@ fn parse_token_create(
     }
     req.label = label.ok_or_else(|| anyhow::anyhow!("missing <label>"))?;
     Ok(req)
+}
+
+/// A deny entry as the CLI takes it: `<actions>{<services>}` (as
+/// listings show it) or `<actions>[@<categories>]`.
+fn parse_deny_spec(v: &str) -> oxidhome_core::api::token_admin::SelectorSpec {
+    let list = |l: &str| Some(l.split(',').map(str::to_owned).collect());
+    let (actions, category, services) = match v.strip_suffix('}').and_then(|v| v.split_once('{')) {
+        Some((a, svc)) => (a, None, list(svc)),
+        None => match v.split_once('@') {
+            Some((a, c)) => (a, list(c), None),
+            None => (v, None, None),
+        },
+    };
+    oxidhome_core::api::token_admin::SelectorSpec {
+        actions: actions.split(',').map(str::to_owned).collect(),
+        category,
+        devices: None,
+        services,
+    }
 }
 
 /// H6 slice 2: `oxidhome device set-category <dev-id> <category>|--clear`.
@@ -1009,6 +1009,7 @@ fn run_tls_pin() -> anyhow::Result<()> {
 
 const PLUGIN_USAGE: &str = "usage: oxidhome plugin list
        oxidhome plugin grant <plugin_id> (<rule>... | --none | --reset)
+       oxidhome plugin deny <plugin_id> (<entry>... | --reset)
 
   list   installed plugins and their network rules (requested, granted,
          effective)
@@ -1016,7 +1017,13 @@ const PLUGIN_USAGE: &str = "usage: oxidhome plugin list
          tcp://192.168.1.20:554) must lie inside one the manifest
          requests. --none grants no network access, --reset grants what
          the manifest requests. The daemon must be stopped; it applies
-         the grant when it next starts the plugin.";
+         the grant when it next starts the plugin.
+  deny   replace the owner's deny list over a plugin: what it, or a
+         plugin whose service call reaches another, may not do. Each
+         entry is <action,...|*>[@<category,...>|{<service,...>}] with
+         actions from service.call, state.read, blob.read and
+         event.subscribe. --reset removes the list. The daemon must be
+         stopped; it loads the list when it next starts.";
 
 /// What `oxidhome plugin` was asked to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -1027,6 +1034,11 @@ enum PluginCmd {
     Grant {
         plugin_id: String,
         rules: Option<Vec<String>>,
+    },
+    /// `entries: None` removes the list.
+    Deny {
+        plugin_id: String,
+        entries: Option<Vec<String>>,
     },
 }
 
@@ -1053,6 +1065,19 @@ fn parse_plugin_args(args: &[Option<String>]) -> anyhow::Result<PluginCmd> {
             PluginCmd::Grant {
                 plugin_id: (*plugin_id).to_owned(),
                 rules,
+            }
+        }
+        ["deny", plugin_id, rest @ ..] if !plugin_id.starts_with('-') && !rest.is_empty() => {
+            let entries = match rest {
+                ["--reset"] => None,
+                entries if entries.iter().all(|e| !e.starts_with('-')) => {
+                    Some(entries.iter().map(|e| (*e).to_owned()).collect())
+                }
+                _ => anyhow::bail!("{PLUGIN_USAGE}"),
+            };
+            PluginCmd::Deny {
+                plugin_id: (*plugin_id).to_owned(),
+                entries,
             }
         }
         _ => anyhow::bail!("{PLUGIN_USAGE}"),
@@ -1100,6 +1125,23 @@ fn run_plugin() -> anyhow::Result<()> {
                 )
             })?;
             print!("{}", format_grant_change(&plugin_id, &change));
+            Ok(())
+        }
+        PluginCmd::Deny { plugin_id, entries } => {
+            let specs: Option<Vec<_>> =
+                entries.map(|e| e.iter().map(|v| parse_deny_spec(v)).collect());
+            let view = with_offline_stores(&state_dir, |stores| {
+                oxidhome_core::api::plugin_deny_admin::set_plugin_deny_offline(
+                    &stores.audit,
+                    &stores.plugin_denies,
+                    &plugin_id,
+                    specs.as_deref(),
+                )
+            })?;
+            println!("{}", printable(&view.plugin_id));
+            for entry in &view.deny {
+                println!("\tdeny\t{}", printable(&entry.to_string()));
+            }
             Ok(())
         }
     }

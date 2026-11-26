@@ -9,6 +9,8 @@ syntax = "proto3";
 
 package oxidhome.v1;
 
+import "oxidhome/v1/tokens.proto";
+
 // PluginsService — the installed-and/or-running plugin catalogue.
 service PluginsService {
   // List every plugin the host knows about: entries in the
@@ -53,6 +55,22 @@ service PluginsService {
   // restarting its running instances. `policy.manage`. Same shape as
   // `DELETE /api/v1/plugins/{plugin_id}/network-grant`.
   rpc ResetPluginNetworkGrant(ResetPluginNetworkGrantRequest) returns (ResetPluginNetworkGrantResponse);
+
+  // A plugin's deny list (H6 slice 5), empty when the owner set none.
+  // `policy.manage`. Same shape as `GET /api/v1/plugins/{plugin_id}/deny`.
+  rpc GetPluginDeny(GetPluginDenyRequest) returns (PluginDeny);
+
+  // Replace a plugin's deny list: what the plugin, or any plugin whose
+  // call reaches another, may not do (`service.call`, `state.read`,
+  // `blob.read`, `event.subscribe`), whatever its manifest grants. The
+  // plugin need not be installed; running instances apply it at once.
+  // An empty list removes it. `policy.manage`. Same shape as
+  // `PUT /api/v1/plugins/{plugin_id}/deny`.
+  rpc SetPluginDeny(SetPluginDenyRequest) returns (PluginDeny);
+
+  // Remove a plugin's deny list. `policy.manage`. Same shape as
+  // `DELETE /api/v1/plugins/{plugin_id}/deny`.
+  rpc ResetPluginDeny(ResetPluginDenyRequest) returns (PluginDeny);
 }
 
 message ListPluginsRequest {}
@@ -196,4 +214,24 @@ message NetworkGrantChange {
 message NotRestartedInstance {
   string instance_id = 1;
   string reason = 2;
+}
+
+message GetPluginDenyRequest {
+  string plugin_id = 1;
+}
+
+message SetPluginDenyRequest {
+  string plugin_id = 1;
+  // Deny entries; `*` names every plugin action.
+  repeated Selector deny = 2;
+}
+
+message ResetPluginDenyRequest {
+  string plugin_id = 1;
+}
+
+// A plugin's deny list after a read or change.
+message PluginDeny {
+  string plugin_id = 1;
+  repeated Selector deny = 2;
 }

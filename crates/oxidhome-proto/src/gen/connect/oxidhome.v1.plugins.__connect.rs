@@ -58,6 +58,22 @@ pub type OwnedResetPluginNetworkGrantResponseView = ::buffa::view::OwnedView<
         'static,
     >,
 >;
+///Shorthand for `OwnedView<GetPluginDenyRequestView<'static>>`.
+pub type OwnedGetPluginDenyRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyRequestView<'static>,
+>;
+///Shorthand for `OwnedView<PluginDenyView<'static>>`.
+pub type OwnedPluginDenyView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+>;
+///Shorthand for `OwnedView<SetPluginDenyRequestView<'static>>`.
+pub type OwnedSetPluginDenyRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyRequestView<'static>,
+>;
+///Shorthand for `OwnedView<ResetPluginDenyRequestView<'static>>`.
+pub type OwnedResetPluginDenyRequestView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyRequestView<'static>,
+>;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListPluginsResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListPluginsResponseView<'_> {
     fn encode(
@@ -298,6 +314,40 @@ for ::buffa::view::OwnedView<
         )
     }
 }
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::PluginDeny>
+for crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::PluginDeny>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
 /// Full service name for this service.
 pub const PLUGINS_SERVICE_SERVICE_NAME: &str = "oxidhome.v1.PluginsService";
 /// Static [`Spec`](::connectrpc::Spec) for the `ListPlugins` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
@@ -339,6 +389,24 @@ pub const PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC: ::connectrpc::Spec = ::
 /// Static [`Spec`](::connectrpc::Spec) for the `ResetPluginNetworkGrant` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
 pub const PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
         "/oxidhome.v1.PluginsService/ResetPluginNetworkGrant",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `GetPluginDeny` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const PLUGINS_SERVICE_GET_PLUGIN_DENY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/GetPluginDeny",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `SetPluginDeny` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const PLUGINS_SERVICE_SET_PLUGIN_DENY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/SetPluginDeny",
+        ::connectrpc::StreamType::Unary,
+    )
+    .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
+/// Static [`Spec`](::connectrpc::Spec) for the `ResetPluginDeny` RPC, as seen by the server; the generated client passes it with [`origin`](::connectrpc::Spec::origin) `Client` (compare across sides with [`Spec::same_method`](::connectrpc::Spec::same_method)).
+pub const PLUGINS_SERVICE_RESET_PLUGIN_DENY_SPEC: ::connectrpc::Spec = ::connectrpc::Spec::server(
+        "/oxidhome.v1.PluginsService/ResetPluginDeny",
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
@@ -573,6 +641,82 @@ pub trait PluginsService: Send + Sync + 'static {
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
                 crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// A plugin's deny list (H6 slice 5), empty when the owner set none.
+    /// `policy.manage`. Same shape as `GET /api/v1/plugins/{plugin_id}/deny`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn get_plugin_deny<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::GetPluginDenyRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::PluginDeny,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Replace a plugin's deny list: what the plugin, or any plugin whose
+    /// call reaches another, may not do (`service.call`, `state.read`,
+    /// `blob.read`, `event.subscribe`), whatever its manifest grants. The
+    /// plugin need not be installed; running instances apply it at once.
+    /// An empty list removes it. `policy.manage`. Same shape as
+    /// `PUT /api/v1/plugins/{plugin_id}/deny`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn set_plugin_deny<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::SetPluginDenyRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::PluginDeny,
+            > + Send + use<'a, Self>,
+        >,
+    > + Send;
+    /// Remove a plugin's deny list. `policy.manage`. Same shape as
+    /// `DELETE /api/v1/plugins/{plugin_id}/deny`.
+    ///
+    /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
+    ///
+    /// `request` is borrowed from the request body and is valid for the
+    /// duration of the call; message fields are read directly on it
+    /// (zero-copy). The response cannot borrow from `request` — use
+    /// `.to_owned_message()` (or copy the specific fields) for anything
+    /// returned, stored, or moved into `tokio::spawn`.
+    fn reset_plugin_deny<'a>(
+        &'a self,
+        ctx: ::connectrpc::RequestContext,
+        request: ::connectrpc::ServiceRequest<
+            '_,
+            crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+        >,
+    ) -> impl ::std::future::Future<
+        Output = ::connectrpc::ServiceResult<
+            impl ::connectrpc::Encodable<
+                crate::proto::oxidhome::v1::PluginDeny,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -811,6 +955,87 @@ impl<S: PluginsService> PluginsServiceExt for S {
                 },
             )
             .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "GetPluginDeny",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::GetPluginDenyRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.get_plugin_deny(ctx, sreq)
+                                .await?
+                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_GET_PLUGIN_DENY_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "SetPluginDeny",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::SetPluginDenyRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.set_plugin_deny(ctx, sreq)
+                                .await?
+                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_SET_PLUGIN_DENY_SPEC)
+            .route_view(
+                PLUGINS_SERVICE_SERVICE_NAME,
+                "ResetPluginDeny",
+                {
+                    let svc = ::std::sync::Arc::clone(&self);
+                    ::connectrpc::view_handler_fn(move |
+                        ctx,
+                        req: ::buffa::view::OwnedView<
+                            crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyRequestView<
+                                'static,
+                            >,
+                        >,
+                        format|
+                    {
+                        let svc = ::std::sync::Arc::clone(&svc);
+                        async move {
+                            let sreq = ::connectrpc::ServiceRequest::<
+                                crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+                            >::from_parts(req.reborrow(), req.bytes());
+                            svc.reset_plugin_deny(ctx, sreq)
+                                .await?
+                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        }
+                    })
+                },
+            )
+            .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_DENY_SPEC)
     }
 }
 /// Type-inference marker used by [`Router::add_service`](::connectrpc::Router::add_service).
@@ -905,6 +1130,24 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                 Some(
                     ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
                         .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC),
+                )
+            }
+            "GetPluginDeny" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_GET_PLUGIN_DENY_SPEC),
+                )
+            }
+            "SetPluginDeny" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_SET_PLUGIN_DENY_SPEC),
+                )
+            }
+            "ResetPluginDeny" => {
+                Some(
+                    ::connectrpc::dispatcher::codegen::MethodDescriptor::unary(false)
+                        .with_spec(PLUGINS_SERVICE_RESET_PLUGIN_DENY_SPEC),
                 )
             }
             _ => None,
@@ -1072,6 +1315,66 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                         .encode::<
                             crate::proto::oxidhome::v1::ResetPluginNetworkGrantResponse,
                         >(format)
+                })
+            }
+            "GetPluginDeny" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::GetPluginDenyRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::GetPluginDenyRequest,
+                    >::from_parts(&req, &body);
+                    svc.get_plugin_deny(ctx, req)
+                        .await?
+                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                })
+            }
+            "SetPluginDeny" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::SetPluginDenyRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::SetPluginDenyRequest,
+                    >::from_parts(&req, &body);
+                    svc.set_plugin_deny(ctx, req)
+                        .await?
+                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                })
+            }
+            "ResetPluginDeny" => {
+                let svc = ::std::sync::Arc::clone(&self.inner);
+                Box::pin(async move {
+                    let body = ::connectrpc::dispatcher::codegen::request_proto_bytes::<
+                        crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+                    >(request.encoded()?, format)?;
+                    let req: crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyRequestView<
+                        '_,
+                    > = ::connectrpc::dispatcher::codegen::decode_borrowed_request_view(
+                        &body,
+                        ctx.decode_options(),
+                    )?;
+                    let req = ::connectrpc::ServiceRequest::<
+                        crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+                    >::from_parts(&req, &body);
+                    svc.reset_plugin_deny(ctx, req)
+                        .await?
+                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
                 })
             }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
@@ -1511,6 +1814,129 @@ where
                 &self.transport,
                 &self.config,
                 PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the GetPluginDeny RPC. Sends a request to /oxidhome.v1.PluginsService/GetPluginDeny.
+    pub async fn get_plugin_deny(
+        &self,
+        request: crate::proto::oxidhome::v1::GetPluginDenyRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.get_plugin_deny_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the GetPluginDeny RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn get_plugin_deny_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::GetPluginDenyRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_GET_PLUGIN_DENY_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the SetPluginDeny RPC. Sends a request to /oxidhome.v1.PluginsService/SetPluginDeny.
+    pub async fn set_plugin_deny(
+        &self,
+        request: crate::proto::oxidhome::v1::SetPluginDenyRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.set_plugin_deny_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the SetPluginDeny RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn set_plugin_deny_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::SetPluginDenyRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_SET_PLUGIN_DENY_SPEC
+                    .with_origin(::connectrpc::SpecOrigin::Client),
+                request,
+                options,
+            )
+            .await
+    }
+    /// Call the ResetPluginDeny RPC. Sends a request to /oxidhome.v1.PluginsService/ResetPluginDeny.
+    pub async fn reset_plugin_deny(
+        &self,
+        request: crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        self.reset_plugin_deny_with_options(
+                request,
+                ::connectrpc::client::CallOptions::default(),
+            )
+            .await
+    }
+    /// Call the ResetPluginDeny RPC with explicit per-call options. Options override [`ClientConfig`](::connectrpc::client::ClientConfig) defaults.
+    pub async fn reset_plugin_deny_with_options(
+        &self,
+        request: crate::proto::oxidhome::v1::ResetPluginDenyRequest,
+        options: ::connectrpc::client::CallOptions,
+    ) -> Result<
+        ::connectrpc::client::UnaryResponse<
+            ::buffa::view::OwnedView<
+                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+            >,
+        >,
+        ::connectrpc::ConnectError,
+    > {
+        ::connectrpc::client::call_unary(
+                &self.transport,
+                &self.config,
+                PLUGINS_SERVICE_RESET_PLUGIN_DENY_SPEC
                     .with_origin(::connectrpc::SpecOrigin::Client),
                 request,
                 options,

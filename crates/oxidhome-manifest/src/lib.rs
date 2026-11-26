@@ -48,5 +48,6 @@ pub use network::{
 };
 pub use validate::{
     MAX_PLUGIN_ID_BYTES, MAX_SERVICE_LOCAL_ID_BYTES, ValidationError, WasmPathProblem,
-    check_capability_limits, check_capability_limits_owned, is_service_local_id, validate,
+    check_capability_limits, check_capability_limits_owned, is_plugin_id, is_service_local_id,
+    validate,
 };
