@@ -75,6 +75,9 @@ pub struct DeviceMeta {
 pub struct ClassSnapshot {
     classes: HashMap<String, DeviceClass>,
     cameras: std::collections::HashSet<String>,
+    /// The registry's generation it was read at
+    /// ([`DeviceRegistry::is_current`]).
+    generation: u64,
 }
 
 impl ClassSnapshot {
@@ -113,6 +116,10 @@ pub struct DeviceRegistry {
     /// H6 slice 2: the durable category floor and operator overrides.
     /// Every registration and update reports its derived class here.
     meta: Arc<DeviceMetaStore>,
+    /// Bumped on every registration change, under the write lock.
+    generation: std::sync::atomic::AtomicU64,
+    /// The last [`Self::class_snapshot`], shared while it is current.
+    snapshot: std::sync::Mutex<Option<Arc<ClassSnapshot>>>,
 }
 
 /// Compute the deterministic host-side device id for an
@@ -189,6 +196,8 @@ impl DeviceRegistry {
         Self {
             inner: RwLock::default(),
             meta,
+            generation: std::sync::atomic::AtomicU64::new(0),
+            snapshot: std::sync::Mutex::new(None),
         }
     }
 
@@ -250,35 +259,48 @@ impl DeviceRegistry {
         Resource::device(id, self.class_of(id))
     }
 
+    /// Registry and metadata changes so far: equal readings bracket a
+    /// moment with no change in between.
+    fn generation(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.generation
+            .load(Ordering::SeqCst)
+            .wrapping_add(self.meta.generation())
+    }
+
     /// Every known device's class and every camera-source instance,
-    /// read once: for decisions made where the registry's locks must
-    /// not be taken (inside a database or store scan, H6 slice 5).
+    /// as of one moment: for decisions made where the registry's locks
+    /// must not be taken (inside a database or store scan, H6 slice
+    /// 5). Shared until the next change; a decision made from it must
+    /// check [`Self::is_current`] after reading the data it decides
+    /// over, since a device registered meanwhile isn't in it.
     #[must_use]
-    pub fn class_snapshot(&self) -> ClassSnapshot {
-        let mut ids: std::collections::HashSet<String> = self.read().keys().cloned().collect();
-        let rows = self.meta.list();
-        let mut owners: std::collections::HashSet<String> = self
+    pub fn class_snapshot(&self) -> Arc<ClassSnapshot> {
+        let generation = self.generation();
+        let mut cached = self.snapshot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(snapshot) = cached.as_ref().filter(|s| s.generation == generation) {
+            return Arc::clone(snapshot);
+        }
+        let mut classes: HashMap<String, DeviceClass> = self
             .read()
-            .values()
-            .map(|m| m.owner_instance.clone())
+            .iter()
+            .map(|(id, m)| (id.clone(), DeviceClass::derive(&m.info.capabilities)))
             .collect();
-        for (id, row) in rows {
-            ids.insert(id);
-            owners.extend(row.owner_instance);
-        }
-        ClassSnapshot {
-            classes: ids
-                .into_iter()
-                .map(|id| {
-                    let class = self.class_of(&id);
-                    (id, class)
-                })
-                .collect(),
-            cameras: owners
-                .into_iter()
-                .filter(|o| self.instance_is_camera(o))
-                .collect(),
-        }
+        let mut cameras = std::collections::HashSet::new();
+        self.meta.snapshot_into(&mut classes, &mut cameras);
+        let snapshot = Arc::new(ClassSnapshot {
+            classes,
+            cameras,
+            generation,
+        });
+        *cached = Some(Arc::clone(&snapshot));
+        snapshot
+    }
+
+    /// `true` while nothing has changed since `snapshot` was read.
+    #[must_use]
+    pub fn is_current(&self, snapshot: &ClassSnapshot) -> bool {
+        snapshot.generation == self.generation()
     }
 
     /// `true` when `instance_id` owns, or has ever registered, a camera
@@ -324,7 +346,12 @@ impl DeviceRegistry {
         self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
     fn write(&self) -> RwLockWriteGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>> {
-        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+        let guard = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+        // Under the lock: a snapshot that read the old generation then
+        // waits for this writer, so it is stale only if it is marked so.
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        guard
     }
 
     /// Register a device on behalf of `owner_instance`. Returns the
@@ -849,6 +876,33 @@ mod tests {
         let reopened =
             DeviceRegistry::with_meta(Arc::new(DeviceMetaStore::open(db).expect("reopen")));
         assert!(reopened.instance_is_camera("inst"), "offline, from the row");
+    }
+
+    /// H6 slice 5: a class snapshot is shared while nothing changes,
+    /// and goes stale (and is rebuilt) on a registration or an
+    /// override.
+    #[test]
+    fn class_snapshots_go_stale_on_any_change() {
+        use crate::auth::DeviceCategory;
+        let reg = DeviceRegistry::new();
+        let first = reg.class_snapshot();
+        assert!(reg.is_current(&first));
+        assert!(Arc::ptr_eq(&first, &reg.class_snapshot()), "shared");
+
+        let id = reg.register("u", "inst".into(), empty_info());
+        assert!(!reg.is_current(&first), "a registration");
+        let second = reg.class_snapshot();
+        assert!(reg.is_current(&second));
+        assert!(!second.class_of(&id).is_camera());
+        assert!(!second.instance_is_camera("inst"));
+
+        reg.set_category(&id, Some(DeviceCategory::Camera))
+            .expect("override");
+        assert!(!reg.is_current(&second), "an override");
+        let third = reg.class_snapshot();
+        assert!(third.class_of(&id).is_camera());
+        assert!(third.instance_is_camera("inst"));
+        assert_eq!(third.class_of(&id), reg.class_of(&id));
     }
 
     /// A re-registration whose floor can't be recorded drops the old

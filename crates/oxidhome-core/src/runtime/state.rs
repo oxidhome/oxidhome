@@ -525,6 +525,25 @@ impl EventRefusal {
         self.denies(crate::auth::Action::EventSubscribe, &resource, upstream)
     }
 
+    /// `true` when a list refuses reading `ev`'s bytes (`blob.read`
+    /// of its device, or of its source's blobs), as `read-events`
+    /// decides for the same row.
+    pub(crate) fn refuses_bytes<'a>(
+        &'a self,
+        ev: &crate::host_impl::plugin::oxidhome::plugin::events::Event,
+        upstream: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        if self.denies.is_empty() {
+            return false;
+        }
+        let resource = super::event_read::bytes_resource(
+            ev,
+            |d| self.devices.class_of(d),
+            self.devices.instance_is_camera(&ev.origin_instance_id),
+        );
+        self.denies(crate::auth::Action::BlobRead, &resource, upstream)
+    }
+
     /// `true` when this plugin's list, or one of `upstream`'s, refuses
     /// `action` on `resource`.
     pub(crate) fn denies<'a>(
@@ -2523,6 +2542,72 @@ mod tests {
     use crate::host_impl::plugin::oxidhome::plugin::events::{
         CustomEvent, EventPayload, StateChange,
     };
+
+    /// H6 slice 5: a `blob.read` deny over camera devices refuses the
+    /// bytes of a camera source's events at live delivery (its own
+    /// list or an upstream plugin's), but not the events themselves.
+    #[test]
+    fn a_blob_read_deny_refuses_live_event_bytes() {
+        use crate::auth::{Action, ActionSet, DenyRule, DeviceCategory, DeviceClass};
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
+        use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+        let devices = Arc::new(DeviceRegistry::new());
+        devices
+            .meta()
+            .observe(
+                "dev-00000000000000c1",
+                "cam",
+                DeviceClass::derive(&[CapabilitySpec::VideoStream]),
+            )
+            .expect("camera row");
+        let denies = Arc::new(crate::state::PluginDenyStore::detached());
+        let refusal = EventRefusal {
+            denies: Arc::clone(&denies),
+            devices,
+            plugin_id: "p.me".into(),
+        };
+        // No device: the bytes are the source's blobs.
+        let frame = |origin: &str| crate::host_impl::plugin::oxidhome::plugin::events::Event {
+            device: None,
+            timestamp: 0,
+            origin_plugin_id: "p.cam".into(),
+            origin_instance_id: origin.into(),
+            row_id: None,
+            call_id: None,
+            payload: EventPayload::StateChanged(StateChange {
+                capability: "camera".into(),
+                fields: vec![KeyValue {
+                    key: "frame".into(),
+                    value: Value::BytesVal(vec![1]),
+                }],
+            }),
+        };
+        let none: [String; 0] = [];
+        let upstream = ["p.caller".to_owned()];
+        assert!(!refusal.refuses_bytes(&frame("cam"), &none), "no list");
+        let rule = DenyRule {
+            actions: ActionSet::of(&[Action::BlobRead]),
+            categories: Some(vec![DeviceCategory::Camera]),
+            devices: None,
+            services: None,
+        };
+        denies.set("p.caller", vec![rule.clone()]).expect("deny");
+        assert!(
+            refusal.refuses_bytes(&frame("cam"), &upstream),
+            "upstream list"
+        );
+        assert!(!refusal.refuses_bytes(&frame("cam"), &none));
+        denies.set("p.me", vec![rule]).expect("deny");
+        assert!(refusal.refuses_bytes(&frame("cam"), &none), "camera source");
+        assert!(
+            !refusal.refuses_bytes(&frame("lamp"), &none),
+            "not a camera source"
+        );
+        assert!(
+            !refusal.refuses(&frame("cam"), &upstream),
+            "the event still goes"
+        );
+    }
 
     /// A storage op counts as in flight until its blocking closure
     /// ends, not until the guest call awaiting it is cancelled.

@@ -96,6 +96,9 @@ fn deny_everything() -> PluginDenyList {
     }])
 }
 
+/// The write a [`PluginDenyStore::change`] wraps; it runs at most once.
+pub type Commit<'a> = Box<dyn FnOnce() -> Result<(), PluginDenyError> + 'a>;
+
 impl PluginDenyStore {
     /// A store with no database, for states built outside an engine
     /// (tests).
@@ -228,17 +231,15 @@ impl PluginDenyStore {
         &self,
         plugin_id: &str,
         rules: Vec<DenyRule>,
-        wrap: impl FnOnce(Option<&[DenyRule]>, &mut dyn FnMut() -> Result<(), PluginDenyError>) -> R,
+        wrap: impl FnOnce(Option<&[DenyRule]>, Commit<'_>) -> R,
     ) -> Result<R, PluginDenyError> {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.get(plugin_id);
         self.check(plugin_id, &rules, current.is_some())?;
-        let mut rules = Some(rules);
-        let mut commit = || {
-            let rules = rules.take().unwrap_or_default();
-            self.commit_locked(plugin_id, rules)
-        };
-        Ok(wrap(current.as_deref(), &mut commit))
+        // Single-use: a second call can't turn the consumed list into
+        // an empty one (a reset).
+        let commit: Commit<'_> = Box::new(move || self.commit_locked(plugin_id, rules));
+        Ok(wrap(current.as_deref(), commit))
     }
 
     /// The limits on a change; the writer lock is held.

@@ -44,6 +44,8 @@ const MAX_LIST_PAGE_BYTES: usize = 1024 * 1024;
 /// page, bounding how long it holds the store lock under a sparse
 /// filter or grant.
 const LIST_SCAN_BUDGET: usize = 4096;
+/// Scans read again when devices change during one, before giving up.
+const SNAPSHOT_TRIES: usize = 3;
 /// Deny rows queued for the audit worker, process-wide. Past the
 /// limit a refusal is dropped (the worker traces how many).
 const DENY_AUDIT_QUEUE: usize = 64;
@@ -92,6 +94,36 @@ fn maybe_visible(
         || grants
             .iter()
             .any(|g| g.matches(&entry.owner_plugin, &entry.device_id, &entry.capability))
+}
+
+/// A `list-state` entry's [`Visibility`] for `plugin`, or `None` when
+/// it is left out; decided from `classes` (no registry lock), so it
+/// runs under the store's lock.
+fn decide(
+    ctx: &InvocationContext,
+    plugin: &PluginPrincipal<'_>,
+    installation_uuid: &str,
+    grants: &oxidhome_manifest::CapabilitiesSection,
+    classes: &crate::state::devices::ClassSnapshot,
+    entry: &DeviceState,
+) -> Option<Visibility> {
+    if !maybe_visible(
+        plugin.instance_id,
+        installation_uuid,
+        &grants.reads_state,
+        entry,
+    ) {
+        return None;
+    }
+    visibility(
+        ctx,
+        plugin,
+        installation_uuid,
+        classes.class_of(&entry.device_id),
+        classes.instance_is_camera(&entry.owner_instance),
+        entry,
+    )
+    .ok()
 }
 
 /// What `plugin`, reading within `ctx`, may see of `entry` (of a
@@ -521,43 +553,40 @@ impl host_state::Host for PluginState {
         let ctx = &invocation::current_or_host(&self.instance_id);
         let plugin = &self.principal();
         // Every entry is decided in full inside the scan, so one this
-        // plugin may not see never counts toward the page: the device
-        // classes are read once, before, since the registry's locks
-        // aren't taken under the store's.
-        let classes = if grants.reads_state.is_empty() {
-            crate::state::devices::ClassSnapshot::default()
-        } else {
-            self.devices.class_snapshot()
-        };
-        let decide = |e: &DeviceState| {
-            if !maybe_visible(plugin.instance_id, &install, &grants.reads_state, e) {
-                return None;
+        // plugin may not see never counts toward the page. The device
+        // classes are read before (the registry's locks aren't taken
+        // under the store's) and must still hold after: a camera
+        // registered meanwhile may have state in the page. Otherwise
+        // the page is read again.
+        let mut tries = 0;
+        let (page, classes) = loop {
+            let classes = self.devices.class_snapshot();
+            let decide = |e: &DeviceState| decide(ctx, plugin, &install, &grants, &classes, e);
+            let page = self.device_state.snapshot_page_capped(
+                after.as_deref(),
+                limit,
+                MAX_LIST_PAGE_BYTES,
+                crate::state::PageSizing::Estimate,
+                LIST_SCAN_BUDGET,
+                |e| {
+                    filter.device.as_ref().is_none_or(|d| *d == e.device_id)
+                        && filter
+                            .capability
+                            .as_ref()
+                            .is_none_or(|c| *c == e.capability)
+                        && decide(e).is_some()
+                },
+            );
+            if self.devices.is_current(&classes) {
+                break (page, classes);
             }
-            visibility(
-                ctx,
-                plugin,
-                &install,
-                classes.class_of(&e.device_id),
-                classes.instance_is_camera(&e.owner_instance),
-                e,
-            )
-            .ok()
+            tries += 1;
+            if tries == SNAPSHOT_TRIES {
+                return Err(WitError::Unavailable(
+                    "devices changed throughout list-state; try again".into(),
+                ));
+            }
         };
-        let page = self.device_state.snapshot_page_capped(
-            after.as_deref(),
-            limit,
-            MAX_LIST_PAGE_BYTES,
-            crate::state::PageSizing::Estimate,
-            LIST_SCAN_BUDGET,
-            |e| {
-                filter.device.as_ref().is_none_or(|d| *d == e.device_id)
-                    && filter
-                        .capability
-                        .as_ref()
-                        .is_none_or(|c| *c == e.capability)
-                    && decide(e).is_some()
-            },
-        );
         let next_cursor = page
             .resume_after
             .map(|after| self.device_state.seal_scan_position(&after));
@@ -565,7 +594,9 @@ impl host_state::Host for PluginState {
             .devices
             .iter()
             .flatten()
-            .filter_map(|e| decide(e).map(|vis| to_wit(e, vis)))
+            .filter_map(|e| {
+                decide(ctx, plugin, &install, &grants, &classes, e).map(|vis| to_wit(e, vis))
+            })
             .collect();
         Ok(StatePage {
             revision: page.revision,

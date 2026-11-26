@@ -26,6 +26,7 @@
 //! the life of the process: the floor only ever protects more.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use rusqlite::params;
@@ -119,6 +120,10 @@ pub struct DeviceMetaStore {
     /// `SQLite` commit: readers (every authorization) don't wait on an
     /// fsync.
     writer: Mutex<()>,
+    /// Bumped on every row change, under the `rows` write lock: a
+    /// [`ClassSnapshot`](super::devices::ClassSnapshot) taken before a
+    /// change can tell it is stale.
+    generation: AtomicU64,
 }
 
 impl Default for DeviceMetaStore {
@@ -175,6 +180,7 @@ impl DeviceMetaStore {
             rows: RwLock::new(HashMap::new()),
             index: RwLock::new(OwnerIndex::default()),
             writer: Mutex::new(()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -209,6 +215,7 @@ impl DeviceMetaStore {
             index: RwLock::new(OwnerIndex::build(&rows)),
             rows: RwLock::new(rows),
             writer: Mutex::new(()),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -236,6 +243,42 @@ impl DeviceMetaStore {
         rows
     }
 
+    /// How many row changes this store has made.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Apply every row onto `classes` (an id without an entry is
+    /// unregistered) and add every camera-source instance to
+    /// `cameras`: one read of each lock.
+    pub(crate) fn snapshot_into(
+        &self,
+        classes: &mut HashMap<String, DeviceClass>,
+        cameras: &mut std::collections::HashSet<String>,
+    ) {
+        for (id, row) in self
+            .rows
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+        {
+            let derived = classes
+                .get(id)
+                .copied()
+                .unwrap_or_else(DeviceClass::unregistered);
+            classes.insert(id.clone(), row.apply(derived));
+        }
+        cameras.extend(
+            self.index
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .cameras
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(o, _)| o.clone()),
+        );
+    }
+
     /// `true` when any device `instance_id` registered is (or was) a
     /// camera, by its floor or the operator's override.
     #[must_use]
@@ -252,6 +295,7 @@ impl DeviceMetaStore {
     /// row (writers only, holding the `rows` write lock).
     fn reindex(&self, before: Option<&DeviceMetaRow>, after: Option<&DeviceMetaRow>) {
         let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(row) = before {
             index.remove(row);
         }

@@ -82,7 +82,9 @@ pub use kv::{KvError, KvStore};
 pub use log_store::{
     HistoricalLogEvent, LogLevel, LogQuery, LogStore, LogStoreError, LogValue, SqliteLayer,
 };
-pub use plugin_deny::{PluginDenyError, PluginDenyList, PluginDenyStore};
+pub use plugin_deny::{
+    Commit as PluginDenyCommit, PluginDenyError, PluginDenyList, PluginDenyStore,
+};
 pub use retention::{
     AUDIT_RETENTION_ENV, EVENT_LOG_RETENTION_ENV, LOG_RETENTION_ENV, RetentionConfig, RetentionEnv,
     RetentionPolicy, RetentionTask, RetentionTasks,

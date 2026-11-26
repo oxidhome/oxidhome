@@ -1401,7 +1401,7 @@ impl PluginInstance {
         // these strings don't change for the lifetime of the instance.
         let refusal = self.store.data().event_refusal();
         let mut delivered = 0;
-        for (ev, upstream) in pending {
+        for (mut ev, upstream) in pending {
             if stop() {
                 break;
             }
@@ -1410,6 +1410,11 @@ impl PluginInstance {
             // earlier `on-event` ran) applies to it.
             if refusal.refuses(&ev, upstream.iter()) {
                 continue;
+            }
+            // A list refusing `blob.read` of its bytes withholds them,
+            // as `read-events` does.
+            if super::event_read::has_bytes(&ev) && refusal.refuses_bytes(&ev, upstream.iter()) {
+                super::event_read::withhold_bytes(&mut ev.payload);
             }
             let span = info_span!(
                 "plugin.on_event",

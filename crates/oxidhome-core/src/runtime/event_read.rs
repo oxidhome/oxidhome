@@ -60,6 +60,9 @@ const READ_SLOTS: usize = 4;
 /// Deadline for one call, waiting for a slot included.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Scans read again when devices change during one, before giving up.
+const SNAPSHOT_TRIES: usize = 3;
+
 static READS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(READ_SLOTS)));
 
 /// The marker a withheld `bytes-val` becomes.
@@ -69,13 +72,42 @@ fn withheld_marker(len: usize) -> Value {
     ))
 }
 
-fn withhold_bytes(payload: &mut EventPayload) {
+pub(super) fn withhold_bytes(payload: &mut EventPayload) {
     if let EventPayload::StateChanged(sc) = payload {
         for kv in &mut sc.fields {
             if let Value::BytesVal(b) = &kv.value {
                 kv.value = withheld_marker(b.len());
             }
         }
+    }
+}
+
+/// `true` when `event` carries a `bytes-val` field.
+pub(super) fn has_bytes(event: &Event) -> bool {
+    matches!(&event.payload, EventPayload::StateChanged(sc)
+        if sc.fields.iter().any(|kv| matches!(kv.value, Value::BytesVal(_))))
+}
+
+/// What reading `event`'s bytes reads: its device (camera bytes when
+/// its source instance is a camera source), or the source's blobs.
+pub(super) fn bytes_resource(
+    event: &Event,
+    class_of: impl FnOnce(&str) -> crate::auth::DeviceClass,
+    camera: bool,
+) -> crate::auth::Resource {
+    match event.device.as_deref() {
+        Some(d) => {
+            let class = class_of(d);
+            crate::auth::Resource::device(
+                d,
+                if camera {
+                    class.with_camera_bytes()
+                } else {
+                    class
+                },
+            )
+        }
+        None => crate::auth::Resource::blob(event.origin_instance_id.as_str(), "", camera),
     }
 }
 
@@ -134,7 +166,8 @@ impl RowAccess for Open {
 
 /// Read one page for a reader with `filters` as its subscriptions,
 /// skipping (before counting) the rows `access` hides and withholding
-/// the bytes it doesn't release.
+/// the bytes it doesn't release. A row any subscription may see is
+/// returned once, with its bytes when any of those may read them.
 fn read_page(
     log: &EventLog,
     after_id: u64,
@@ -145,21 +178,29 @@ fn read_page(
     let mut taken = 0usize;
     let mut size = 0usize;
     log.scan_after_cursor(after_id, SCAN_BUDGET, |event| {
-        let upstream = if is_gap_marker(event) {
-            None
-        } else {
-            match filters
+        let mut seen = is_gap_marker(event);
+        let mut bytes = false;
+        if !seen {
+            let with_bytes = has_bytes(event);
+            for (_, upstream) in filters
                 .iter()
-                .find(|(f, upstream)| filter_matches(f, event) && !access.refused(event, upstream))
+                .filter(|(f, up)| filter_matches(f, event) && !access.refused(event, up))
             {
-                Some((_, upstream)) => Some(upstream),
-                None => return ScanStep::Skip,
+                seen = true;
+                // Without bytes, the first subscription decides.
+                if !with_bytes || access.releases_bytes(event, upstream) {
+                    bytes = with_bytes;
+                    break;
+                }
             }
-        };
+            if !seen {
+                return ScanStep::Skip;
+            }
+        }
         if taken >= limit {
             return ScanStep::Full;
         }
-        if !upstream.is_some_and(|up| access.releases_bytes(event, up)) {
+        if !bytes {
             withhold_bytes(&mut event.payload);
         }
         let len = approx_size(event);
@@ -177,6 +218,29 @@ fn read_page(
     })
 }
 
+/// [`read_page`] with `access`'s classes read before the scan (the
+/// registry's locks aren't taken while it holds the database
+/// connection) and still current after it: a camera registered
+/// meanwhile may have published a row the scan saw. Otherwise the page
+/// is read again; `None` when devices kept changing.
+fn read_stable(
+    log: &EventLog,
+    after_id: u64,
+    limit: usize,
+    filters: &[(EventFilter, Arc<[String]>)],
+    devices: &crate::state::DeviceRegistry,
+    access: &mut HistoryAccess,
+) -> Option<Result<Result<ScanPage, CursorExpired>, EventLogError>> {
+    for _ in 0..SNAPSHOT_TRIES {
+        access.classes = devices.class_snapshot();
+        let page = read_page(log, after_id, limit, filters, access);
+        if devices.is_current(&access.classes) {
+            return Some(page);
+        }
+    }
+    None
+}
+
 /// [`RowAccess`] for a plugin's `read-events` (H6 slice 5). A row is
 /// hidden when a deny list (the plugin's, its subscription's upstream
 /// plugins', or this call's chain) refuses `event.subscribe` of its
@@ -187,7 +251,7 @@ fn read_page(
 /// instance, are withheld), as for its direct read.
 struct HistoryAccess {
     refusal: super::state::EventRefusal,
-    classes: crate::state::devices::ClassSnapshot,
+    classes: Arc<crate::state::devices::ClassSnapshot>,
     chain: Vec<String>,
     bytes: bool,
     ctx: crate::auth::InvocationContext,
@@ -216,21 +280,11 @@ impl RowAccess for HistoryAccess {
         if !self.bytes {
             return false;
         }
-        let camera = self.classes.instance_is_camera(&event.origin_instance_id);
-        let resource = match event.device.as_deref() {
-            Some(d) => {
-                let class = self.classes.class_of(d);
-                crate::auth::Resource::device(
-                    d,
-                    if camera {
-                        class.with_camera_bytes()
-                    } else {
-                        class
-                    },
-                )
-            }
-            None => crate::auth::Resource::blob(event.origin_instance_id.as_str(), "", camera),
-        };
+        let resource = bytes_resource(
+            event,
+            |d| self.classes.class_of(d),
+            self.classes.instance_is_camera(&event.origin_instance_id),
+        );
         if self.refusal.denies(
             crate::auth::Action::BlobRead,
             &resource,
@@ -278,6 +332,22 @@ impl PluginState {
         Ok(())
     }
 
+    /// What this plugin, reading within `ctx`, may see of history
+    /// rows; its classes are read with the scan ([`read_stable`]).
+    fn history_access(&self, ctx: &crate::auth::InvocationContext) -> HistoryAccess {
+        HistoryAccess {
+            refusal: self.event_refusal(),
+            classes: Arc::default(),
+            chain: ctx
+                .chain()
+                .iter()
+                .map(|h| h.caller_plugin.clone())
+                .collect(),
+            bytes: self.granted_capabilities.reads_event_bytes,
+            ctx: ctx.clone(),
+        }
+    }
+
     /// `host-events::read-events`; see the module docs.
     pub(super) async fn read_events_impl(
         &mut self,
@@ -291,20 +361,9 @@ impl PluginState {
             n => n.min(MAX_LIMIT),
         };
         let log = Arc::clone(&self.event_log);
+        let devices = Arc::clone(&self.devices);
         let subscriptions = &self.subscriptions;
-        let access = HistoryAccess {
-            refusal: self.event_refusal(),
-            // Read before the scan: the registry's locks aren't taken
-            // while the scan holds the database connection.
-            classes: self.devices.class_snapshot(),
-            chain: ctx
-                .chain()
-                .iter()
-                .map(|h| h.caller_plugin.clone())
-                .collect(),
-            bytes: self.granted_capabilities.reads_event_bytes,
-            ctx: ctx.clone(),
-        };
+        let mut access = self.history_access(&ctx);
         let read = async {
             // The permit moves into the closure, so a call cancelled
             // or timed out while its read runs still holds the slot
@@ -317,7 +376,7 @@ impl PluginState {
                 .collect();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                read_page(&log, after_id, limit, &filters, &access)
+                read_stable(&log, after_id, limit, &filters, &devices, &mut access)
             })
             .await
             .map(Some)
@@ -342,8 +401,13 @@ impl PluginState {
             }
         };
         let page = match read {
-            Ok(Ok(Ok(page))) => page,
-            Ok(Ok(Err(expired))) => {
+            Ok(None) => {
+                return Err(WitError::Unavailable(
+                    "devices changed throughout the history read; try again".into(),
+                ));
+            }
+            Ok(Some(Ok(Ok(page)))) => page,
+            Ok(Some(Ok(Err(expired)))) => {
                 tracing::debug!(
                     target: "host.events",
                     instance_id = %self.instance_id,
@@ -357,7 +421,7 @@ impl PluginState {
                     head_id: expired.head_id,
                 }));
             }
-            Ok(Err(err)) => {
+            Ok(Some(Err(err))) => {
                 tracing::error!(
                     target: "host.events",
                     instance_id = %self.instance_id,
@@ -493,6 +557,41 @@ mod tests {
         .expect("read")
         .expect("cursor");
         assert_eq!(p.events.len(), 3);
+    }
+
+    /// Releases bytes only to subscriptions without an upstream.
+    struct BytesWithoutUpstream;
+
+    impl RowAccess for BytesWithoutUpstream {
+        fn refused(&self, _: &Event, _: &[String]) -> bool {
+            false
+        }
+        fn releases_bytes(&self, _: &Event, upstream: &[String]) -> bool {
+            upstream.is_empty()
+        }
+    }
+
+    /// H6 slice 5: a row matched by several subscriptions keeps its
+    /// bytes when any of them may read them, whatever their order.
+    #[test]
+    fn bytes_go_out_when_any_matching_subscription_may_read_them() {
+        let log = log();
+        record(&log, &[camera("dev-1", vec![9])]);
+        let upstream: Arc<[String]> = Arc::from(["com.example.caller".to_owned()]);
+        for filters in [
+            [(all(), Arc::clone(&upstream)), (all(), Arc::from([]))],
+            [(all(), Arc::from([])), (all(), Arc::clone(&upstream))],
+        ] {
+            let p = read_page(&log, 0, 10, &filters, &BytesWithoutUpstream)
+                .expect("read")
+                .expect("cursor");
+            assert_eq!(p.events.len(), 1);
+            assert!(has_bytes(&p.events[0]), "bytes withheld");
+        }
+        let p = read_page(&log, 0, 10, &[(all(), upstream)], &BytesWithoutUpstream)
+            .expect("read")
+            .expect("cursor");
+        assert!(!has_bytes(&p.events[0]), "bytes released");
     }
 
     fn camera(device: &str, frame: Vec<u8>) -> Event {
