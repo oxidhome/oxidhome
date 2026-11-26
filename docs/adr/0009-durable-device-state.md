@@ -55,7 +55,6 @@ rule that a disk problem never stops live control, and it must not add disk work
 - Up to 250 ms of state changes (longer while the disk fails) can be lost on a crash. Clients whose cursors fall in
   that window resync.
 - Each boot uses 2^32 revisions, which keeps revisions below 2^53 for about two million restarts.
-- Installs that predate `reads_state` have no grant until an operator grants one.
 - Flush health (degraded, last error, pending keys) is reported by `readyz`, Connect `HealthService.Check` and
   `oxidhome://status`, and each flush stores a consistency marker (row count and a checksum over the meta row) so
   damage that still decodes starts a new history instead of keeping cursors valid.

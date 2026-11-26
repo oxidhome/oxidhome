@@ -133,8 +133,7 @@ pub struct CheckResponse {
     /// while event_log writes are failing and live events are delivered
     /// without a row id. Same value as `event_log` on
     /// `GET /api/v1/readyz`; details are on the authenticated MCP
-    /// `oxidhome://status` resource. Empty from a daemon that predates
-    /// the field.
+    /// `oxidhome://status` resource.
     ///
     /// Field 3: `event_log`
     #[serde(
@@ -149,8 +148,7 @@ pub struct CheckResponse {
     /// and control still work; changes since the last flush would be
     /// lost on a crash). Same value as `device_state` on
     /// `GET /api/v1/readyz`; details are on the authenticated MCP
-    /// `oxidhome://status` resource. Empty from a daemon that predates
-    /// the field.
+    /// `oxidhome://status` resource.
     ///
     /// Field 4: `device_state`
     #[serde(

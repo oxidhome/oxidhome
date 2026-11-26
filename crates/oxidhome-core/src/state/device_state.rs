@@ -1240,7 +1240,7 @@ impl DeviceStateStore {
 
     /// H9 round-14 finding 3: sign an all-devices-snapshot
     /// pagination cursor. Returns
-    /// `"<epoch>.<pinned_revision>.<after_device_id>.<hmac>"`
+    /// `"<epoch>.<boot>.<pinned_revision>.<after_device_id>.<hmac>"`
     /// where `hmac` is a 128-bit prefix of HMAC-SHA256 keyed
     /// on this store's per-process
     /// `StoreInner::cursor_secret`. Because the secret is
@@ -1347,18 +1347,7 @@ impl DeviceStateStore {
         let epoch = parts.next().ok_or(CursorError::Bad)?;
         let boot = parts.next().ok_or(CursorError::Bad)?;
         let rev = parts.next().ok_or(CursorError::Bad)?;
-        let Some(device) = parts.next() else {
-            // H2: a pre-H2 cursor (`<epoch>.<revision>.<device>.<mac>`)
-            // comes from an earlier daemon process: restart the resync
-            // (409) rather than report a client bug (400).
-            let legacy_mac_ok =
-                mac_hex.len() == 32 && mac_hex.bytes().all(|b| b.is_ascii_hexdigit());
-            if !epoch.is_empty() && boot.parse::<u64>().is_ok() && !rev.is_empty() && legacy_mac_ok
-            {
-                return Err(CursorError::EpochChanged);
-            }
-            return Err(CursorError::Bad);
-        };
+        let device = parts.next().ok_or(CursorError::Bad)?;
         let is_hex =
             |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit());
         if epoch.is_empty() || device.is_empty() || !is_hex(boot, 16) || !is_hex(mac_hex, 32) {

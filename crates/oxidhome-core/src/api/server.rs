@@ -1199,7 +1199,7 @@ struct AllDevicesStateParams {
 // H9 round-14 finding 3: cursor issue/verify moved into
 // `DeviceStateStore` — [`DeviceStateStore::issue_cursor`] and
 // [`DeviceStateStore::verify_cursor`]. Format is
-// `<epoch>.<pinned_revision>.<after_device_id>.<hmac>`
+// `<epoch>.<boot>.<pinned_revision>.<after_device_id>.<hmac>`
 // where `hmac` is HMAC-SHA256-128 keyed on a per-process
 // secret. The round-13 in-handler `DecodedCursor` was
 // forgeable — a client could construct any cursor from
@@ -3120,9 +3120,9 @@ async fn tail_events(
 
 /// H4: response header acknowledging an accepted `after_id` on the
 /// event tails (WebSocket 101 and Connect `TailEvents`), carrying the
-/// resolved cursor. Absent on live-only streams, on expired cursors
-/// (whose stream carries only `cursor_expired`), and on servers that
-/// predate cursor resume.
+/// resolved cursor. Absent on live-only streams and on cursors already
+/// expired at open (whose stream carries only `cursor_expired`); an
+/// accepted cursor can still expire later, mid-replay.
 pub(crate) const RESUME_AFTER_ID_HEADER: &str = "oxidhome-resume-after-id";
 
 /// Query string for `GET /api/v1/events/tail`.

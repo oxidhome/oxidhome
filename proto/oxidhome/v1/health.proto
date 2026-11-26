@@ -37,8 +37,7 @@ message CheckResponse {
   // while event_log writes are failing and live events are delivered
   // without a row id. Same value as `event_log` on
   // `GET /api/v1/readyz`; details are on the authenticated MCP
-  // `oxidhome://status` resource. Empty from a daemon that predates
-  // the field.
+  // `oxidhome://status` resource.
   string event_log = 3;
 
   // State of the durable device-state projection (H2): "ok", or
@@ -46,7 +45,6 @@ message CheckResponse {
   // and control still work; changes since the last flush would be
   // lost on a crash). Same value as `device_state` on
   // `GET /api/v1/readyz`; details are on the authenticated MCP
-  // `oxidhome://status` resource. Empty from a daemon that predates
-  // the field.
+  // `oxidhome://status` resource.
   string device_state = 4;
 }

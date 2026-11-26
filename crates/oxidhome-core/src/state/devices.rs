@@ -23,15 +23,12 @@
 //!
 //! Host-minted device ids are **deterministic** from the tuple
 //! `(installation_uuid, instance_id, local_id)` — SHA-256 truncated
-//! to 8 bytes, rendered as `dev-<16 hex chars>`. Pre-C1 the registry
-//! minted `dev-<n>` from an atomic counter, so every restart (and
-//! every fresh engine) renumbered every device and broke any
-//! external reference — audit rows citing a device id, API paths
-//! like `POST /api/v1/devices/{id}/command`, `logs query
-//! --field device_id=…`, and so on. C1 fixed restart aliasing;
-//! C1b closes the uninstall-reinstall aliasing that a reusable
-//! `plugin_id` still left open by minting a fresh installation UUID
-//! per install and threading it through the derivation.
+//! to 8 bytes, rendered as `dev-<16 hex chars>`, so a restart keeps
+//! every external reference (audit rows, API paths like
+//! `POST /api/v1/devices/{id}/command`, `logs query
+//! --field device_id=…`) valid. The installation UUID is fresh per
+//! install, so an uninstall + reinstall of the same `plugin_id`
+//! doesn't alias the old devices.
 //!
 //! With the deterministic shape, a plugin that re-registers the
 //! same `local_id` from the same `instance_id` gets the same
@@ -114,12 +111,7 @@ pub struct DeviceRegistry {
 /// registry gets its own persistence table).
 ///
 /// A leading domain-separation tag pins this hash to
-/// `oxidhome:device-id:v2` — bumped from v1 in C1b because the tuple
-/// shape changed (first field is now the installation UUID, not the
-/// plugin id). Ids from a pre-C1b install would collide with the new
-/// derivation otherwise. Pre-1.0 upgrade behaviour: existing device
-/// ids are re-minted at the first registration after upgrade; no
-/// external references outlive the upgrade window in practice yet.
+/// `oxidhome:device-id:v1`.
 ///
 /// SHA-256 truncated to 8 bytes = 64 bits of collision space. On a
 /// single host with ≤10^6 devices the birthday collision risk is
@@ -130,9 +122,8 @@ pub struct DeviceRegistry {
 pub fn stable_device_id(installation_uuid: &str, instance_id: &str, local_id: &str) -> DeviceId {
     let mut h = Sha256::new();
     // Domain-separation tag — locks this digest to the current
-    // encoding version. Bumped to v2 in C1b when the first field
-    // changed from `plugin_id` to `installation_uuid`.
-    let tag = b"oxidhome:device-id:v2";
+    // encoding version.
+    let tag = b"oxidhome:device-id:v1";
     #[allow(clippy::cast_possible_truncation)]
     h.update((tag.len() as u32).to_be_bytes());
     h.update(tag);
@@ -291,12 +282,8 @@ impl DeviceRegistry {
     /// [`PluginState`](crate::runtime::PluginState) for the
     /// fallback used by [`PluginInstance::load`](crate::PluginInstance::load).
     ///
-    /// C1 note: a repeat registration of the same tuple overwrites
-    /// the previous entry's `info`. That matches the pre-C1
-    /// behaviour (the atomic counter minted a fresh id for every
-    /// call, so overwrite couldn't happen, but a plugin
-    /// re-registering with a new capability set would just stack a
-    /// second entry — arguably worse). Callers that need to
+    /// A repeat registration of the same tuple overwrites the
+    /// previous entry's `info`. Callers that need to
     /// preserve the old entry should `update` explicitly; callers
     /// that intend a fresh registration should change the
     /// `local_id`.
@@ -575,6 +562,16 @@ mod tests {
             initial_state: Vec::new(),
             metadata: Vec::new(),
         }
+    }
+
+    /// Pins the `oxidhome:device-id:v1` derivation: a change to the
+    /// tag or framing changes every device id.
+    #[test]
+    fn stable_device_id_is_pinned() {
+        assert_eq!(
+            &*stable_device_id("inst-0", "alpha", "lamp"),
+            "dev-f552a6883bf64409"
+        );
     }
 
     /// `update`/`remove`/`get` must reject calls from a non-owner
