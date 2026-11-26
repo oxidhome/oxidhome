@@ -71,7 +71,8 @@ service PluginsService {
   // `PUT /api/v1/plugins/{plugin_id}/deny`.
   rpc SetPluginDeny(SetPluginDenyRequest) returns (SetPluginDenyResponse);
 
-  // Remove a plugin's deny list. `policy.manage`. Same shape as
+  // Remove a plugin's deny list (`*`: the global list over every
+  // plugin). `policy.manage`. Same shape as
   // `DELETE /api/v1/plugins/{plugin_id}/deny`.
   rpc ResetPluginDeny(ResetPluginDenyRequest) returns (ResetPluginDenyResponse);
 }

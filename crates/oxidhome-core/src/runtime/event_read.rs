@@ -18,7 +18,8 @@
 //!
 //! `bytes-val` fields are replaced by a `json-val` marker unless the
 //! plugin's permit covers them (`blob.read` on the event's device or
-//! source blobs, granted by `reads_event_bytes`:
+//! source blobs, granted by `reads_event_bytes`, and for camera bytes
+//! also `sensitive_event_bytes = ["camera"]`:
 //! [`crate::auth::event_bytes_permit`]). There is no
 //! own-event exemption as in H2: `event_log` doesn't record the
 //! publisher's installation, so an instance id reused by another
@@ -251,7 +252,8 @@ fn read_stable(
 /// plugins', or this call's chain) refuses `event.subscribe` of its
 /// device, as at delivery. Bytes go out when no list refuses
 /// `blob.read` of them, the plugin's permit covers them
-/// (`reads_event_bytes`, [`crate::auth::event_bytes_permit`]) and,
+/// (`reads_event_bytes`, plus `sensitive_event_bytes = ["camera"]` for
+/// camera bytes: [`crate::auth::event_bytes_permit`]) and,
 /// inside a token's
 /// invocation, the token may read them (`blob.read`, with no sensitive
 /// obligation: camera bytes, from a camera device or a camera-source
@@ -490,6 +492,67 @@ mod tests {
                 payload: payload.into(),
             }),
         }
+    }
+
+    /// H6 slice 5b: `read-events` releases a camera source's bytes only
+    /// with the plugin's `camera` grant, and under a token root holding
+    /// the camera grant still withholds them (its obligation can't be
+    /// met by a plugin read, Q6); other bytes need `reads_event_bytes`.
+    #[test]
+    fn history_bytes_follow_the_camera_grant() {
+        use crate::auth::{Actor, ActorKind, DeviceClass, Principal, SensitiveCategory, Transport};
+        use crate::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
+        use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
+        let devices = Arc::new(crate::state::DeviceRegistry::new());
+        devices
+            .meta()
+            .observe(
+                "dev-00000000000000c1",
+                "cam",
+                DeviceClass::derive(&[CapabilitySpec::VideoStream]),
+            )
+            .expect("camera row");
+        let denies = Arc::new(crate::state::PluginDenyStore::detached());
+        let frame = |origin: &str| Event {
+            payload: EventPayload::StateChanged(StateChange {
+                capability: "camera".into(),
+                fields: vec![KeyValue {
+                    key: "frame".into(),
+                    value: Value::BytesVal(vec![1]),
+                }],
+            }),
+            origin_instance_id: origin.into(),
+            ..custom("t", "{}")
+        };
+        let access =
+            |bytes: bool, camera: bool, ctx: crate::auth::InvocationContext| HistoryAccess {
+                refusal: crate::runtime::state::EventRefusal::for_test(
+                    Arc::clone(&denies),
+                    Arc::clone(&devices),
+                    "p.me",
+                    camera,
+                ),
+                classes: devices.class_snapshot(),
+                chain: Vec::new(),
+                bytes,
+                camera,
+                ctx,
+            };
+        let host = || crate::auth::InvocationContext::host_origin("me");
+        let none: [String; 0] = [];
+        assert!(!access(false, false, host()).releases_bytes(&frame("lamp"), &none));
+        assert!(access(true, false, host()).releases_bytes(&frame("lamp"), &none));
+        assert!(!access(true, false, host()).releases_bytes(&frame("cam"), &none));
+        assert!(access(true, true, host()).releases_bytes(&frame("cam"), &none));
+        let token = Actor::api("t", vec!["*".into()]).with_sensitive(vec![
+            crate::auth::SensitiveGrant::all(SensitiveCategory::Camera),
+        ]);
+        let rooted = crate::auth::InvocationContext::external(Principal::token(
+            ActorKind::Api,
+            &token,
+            Transport::Rest,
+        ));
+        assert!(!access(true, true, rooted).releases_bytes(&frame("cam"), &none));
     }
 
     /// H6 slice 4: the page budget counts an event's call id.

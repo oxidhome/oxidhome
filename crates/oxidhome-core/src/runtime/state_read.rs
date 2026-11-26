@@ -11,7 +11,8 @@
 //! refuse it, and when the read is part of an invocation rooted at a
 //! token, the token needs `device.read` on the device. `bytes-val`
 //! fields are replaced by a withheld marker unless `blob.read` is
-//! allowed the same way (a matching grant with `bytes = true`, and the
+//! allowed the same way (a matching grant with `bytes = true`, for
+//! camera bytes one with `sensitive = ["camera"]` too, and the
 //! root's `blob.read`; an allow that carries a sensitive obligation,
 //! camera bytes, withholds them too: a plugin read can't meet it).
 //! `get-state` answers `not-found` both for an unknown device and for

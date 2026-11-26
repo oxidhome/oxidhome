@@ -921,10 +921,13 @@ impl PluginInstance {
                 // plugin_id. Synthetic identity + manifest-
                 // requested caps. Explicitly opted into via
                 // `LoadMode::Dev` — never inferred from registry
-                // absence.
+                // absence. H6 slice 5b: no sensitive grant, which
+                // only an approved install holds.
                 (
                     Arc::<str>::from(manifest.plugin.id.as_str()),
-                    Arc::new(requested.clone()),
+                    Arc::new(crate::state::installed_plugins::without_sensitive(
+                        requested,
+                    )),
                 )
             }
         };

@@ -775,7 +775,8 @@ pub trait PluginsService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Remove a plugin's deny list. `policy.manage`. Same shape as
+    /// Remove a plugin's deny list (`*`: the global list over every
+    /// plugin). `policy.manage`. Same shape as
     /// `DELETE /api/v1/plugins/{plugin_id}/deny`.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).

@@ -641,10 +641,11 @@ pub fn network_rule_covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
 }
 
 /// `caps` without any sensitive grant: what a package installed without
-/// the owner's approval (a boot-scan backfill) is granted. A
+/// the owner's approval (a boot-scan backfill, a dev-time argv start)
+/// is granted. A
 /// `reads_state` entry that asked for one no longer equals the request,
 /// so it grants nothing (fail closed).
-fn without_sensitive(caps: &CapabilitiesSection) -> CapabilitiesSection {
+pub(crate) fn without_sensitive(caps: &CapabilitiesSection) -> CapabilitiesSection {
     let mut caps = caps.clone();
     caps.sensitive_event_bytes.clear();
     for grant in &mut caps.reads_state {
@@ -1678,7 +1679,7 @@ impl InstalledPluginRegistry {
                     && !duplicate_manifest_ids.contains(plugin_id.as_str())
                 {
                     let uuid = &live.installation_uuid;
-                    match tombstone_installation_row(&db, uuid) {
+                    match tombstone_installation_row(&db, uuid, &|_| Ok(())) {
                         Ok(()) => {
                             tombstoned += 1;
                             tracing::warn!(
@@ -2142,6 +2143,21 @@ impl InstalledPluginRegistry {
     ///
     /// See [`UninstallError`].
     pub fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
+        self.uninstall_with(plugin_id, &|_| Ok(()))
+    }
+
+    /// [`Self::uninstall`], running `also` in the transaction that
+    /// tombstones the installation row (H6 slice 5: deleting the
+    /// plugin's deny list with it).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::uninstall`]; `also` failing rolls the tombstone back.
+    pub fn uninstall_with(
+        &self,
+        plugin_id: &str,
+        also: &dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>,
+    ) -> Result<Arc<str>, UninstallError> {
         let plugins_root = self
             .plugins_root
             .as_ref()
@@ -2236,7 +2252,7 @@ impl InstalledPluginRegistry {
             }
         }
         if let Some(db) = &self.db {
-            tombstone_installation_row(db, &installation_uuid)?;
+            tombstone_installation_row(db, &installation_uuid, also)?;
         }
         if was_quarantined {
             self.quarantined
@@ -2921,17 +2937,24 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 
 /// Mark an installation row as uninstalled. Idempotent — a
 /// subsequent tombstone of the same UUID is a no-op (0 rows
-/// affected). The row remains for historical trace-back.
-fn tombstone_installation_row(db: &Db, installation_uuid: &str) -> Result<(), rusqlite::Error> {
+/// affected). The row remains for historical trace-back. `also` runs
+/// in the same transaction.
+fn tombstone_installation_row(
+    db: &Db,
+    installation_uuid: &str,
+    also: &dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>,
+) -> Result<(), rusqlite::Error> {
     db.write(|conn| {
-        conn.execute(
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE plugin_installation
                 SET uninstalled_ms = ?2
               WHERE installation_uuid = ?1
                 AND uninstalled_ms IS NULL",
             rusqlite::params![installation_uuid, now_ms()],
         )?;
-        Ok(())
+        also(&tx)?;
+        tx.commit()
     })
 }
 

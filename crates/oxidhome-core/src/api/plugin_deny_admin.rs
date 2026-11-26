@@ -22,7 +22,7 @@ use super::network_admin::GrantActor;
 use super::token_admin::{AdminError, SelectorSpec};
 use crate::auth::DenyRule;
 use crate::state::plugin_deny::is_deny_key;
-use crate::state::{AuditLog, PluginDenyError, PluginDenyStore};
+use crate::state::{AuditLog, PluginDenyError, PluginDenyStore, UninstallError};
 
 /// Audit `path` of a deny list change:
 /// `<surface>.plugin.deny.<set|reset>/<plugin_id>/<detail>`, the detail
@@ -207,25 +207,22 @@ fn change_in(
     }
 }
 
-/// Delete `plugin_id`'s deny list once the plugin is uninstalled, so a
-/// reinstall starts with none. Audited as
+/// Run `uninstall`, which deletes `plugin_id`'s deny list `old` with
+/// the tombstone of its installation, audited as
 /// `uninstall.plugin.deny.reset/<plugin_id>/<detail>` under the
-/// uninstall's caller (`ctx`; the host when there is none). With
-/// `expected`, only that list (the one read before the tombstone) is
-/// deleted: a list the owner set for a reinstall in between stays. No
-/// list, no row.
+/// uninstall's caller (`ctx`; the host when there is none).
 ///
 /// # Errors
 ///
-/// Storing or auditing failed; the list then still applies until the
-/// next start removes it ([`crate::Engine`] startup).
-pub(crate) fn forget_on_uninstall(
+/// `uninstall`'s; the audit intent failing refuses the uninstall
+/// ([`UninstallError::Io`]) before it runs.
+pub(crate) fn audited_uninstall<T>(
     audit: &AuditLog,
-    store: &PluginDenyStore,
     ctx: Option<&crate::auth::InvocationContext>,
     plugin_id: &str,
-    expected: Option<&crate::state::PluginDenyList>,
-) -> anyhow::Result<()> {
+    old: &[DenyRule],
+    uninstall: impl FnOnce() -> Result<T, UninstallError>,
+) -> Result<T, UninstallError> {
     let by = match ctx {
         Some(ctx) => GrantActor::of("uninstall", ctx),
         None => GrantActor {
@@ -235,23 +232,29 @@ pub(crate) fn forget_on_uninstall(
             call_id: None,
         },
     };
-    store.change(plugin_id, Vec::new(), |old, commit| {
-        let Some(old) = old else {
-            return Ok(());
-        };
-        if expected.is_some_and(|e| !std::ptr::eq(e.as_ptr(), old.as_ptr())) {
-            return Ok(());
-        }
-        let path = audit_path(&by, plugin_id, old, &[]);
-        audited_call(
-            audit,
-            by.actor_kind,
-            &by.token_id,
-            &path,
-            by.call_id.as_deref(),
-            || Ok(commit()?),
-        )
-    })?
+    let path = audit_path(&by, plugin_id, old, &[]);
+    let mut failed = None;
+    let result = audited_call(
+        audit,
+        by.actor_kind,
+        &by.token_id,
+        &path,
+        by.call_id.as_deref(),
+        || {
+            uninstall().map_err(|err| {
+                let msg = anyhow::anyhow!("{err}");
+                failed = Some(err);
+                msg
+            })
+        },
+    );
+    match (result, failed) {
+        (Ok(done), _) => Ok(done),
+        (Err(_), Some(err)) => Err(err),
+        (Err(err), None) => Err(UninstallError::Io(std::io::Error::other(format!(
+            "auditing the deny list deletion: {err:#}"
+        )))),
+    }
 }
 
 /// `oxidhome plugin deny`: replace the deny list of `plugin_id` in the

@@ -511,6 +511,23 @@ pub(crate) struct EventRefusal {
 }
 
 impl EventRefusal {
+    /// A refusal over `devices` and `denies` for `plugin_id`, in tests
+    /// outside this module.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        denies: Arc<crate::state::PluginDenyStore>,
+        devices: Arc<DeviceRegistry>,
+        plugin_id: &str,
+        camera_bytes: bool,
+    ) -> Self {
+        Self {
+            denies,
+            devices,
+            plugin_id: plugin_id.to_owned(),
+            camera_bytes,
+        }
+    }
+
     /// `true` when a list refuses `ev`; `upstream` names the plugins
     /// whose calls led to the subscription or read.
     pub(crate) fn refuses<'a>(

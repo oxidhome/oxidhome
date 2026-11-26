@@ -177,7 +177,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `effective` rules, as in `plugins.list`), `sensitive` (the \
              categories approved at install), and the list of \
              currently-running instances with their state. \
-             `content_digest`, `installation_uuid` and `network` are \
+             `content_digest`, `installation_uuid`, `network` and `sensitive` are \
              `None` for a dev-time argv-driven start with no installation \
              row. Read-only; gated on `plugins:list`. Same wire shape as \
              `oxidhome://plugins/{plugin_id}`. Returns `INVALID_PARAMS` if \

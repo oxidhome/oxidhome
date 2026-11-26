@@ -457,7 +457,6 @@ impl Engine {
             crate::state::PluginDenyStore::open(Arc::clone(&db))
                 .context("loading plugin deny lists")?,
         );
-        forget_deny_lists_of_uninstalled_plugins(&db, &plugin_denies, &audit_log);
         Ok(Self {
             plugin_denies,
             tls: Arc::new(network::TlsClient::new(Arc::new(tls_pins))),
@@ -829,10 +828,6 @@ impl Engine {
         // the tombstoned uuid. `installation_uuid_for` returns
         // the uuid from either map so the purges always run.
         let installation_uuid = self.installed_plugins.installation_uuid_for(plugin_id);
-        // The deny list the uninstall removes: read before the
-        // tombstone, so a list the owner sets for a reinstall racing
-        // this one is not the one deleted.
-        let deny_list = self.plugin_denies.get(plugin_id);
         if let Some(uuid) = &installation_uuid {
             self.kv.purge_installation(uuid).map_err(|err| {
                 crate::state::UninstallError::Io(std::io::Error::other(format!(
@@ -862,33 +857,30 @@ impl Engine {
         // uninstall). The reverse — tombstone-then-
         // purge — would strand blob bytes silently on any purge
         // failure (the pre-fix behaviour).
-        if let Err(err) = self.installed_plugins.uninstall(plugin_id) {
+        // H6 slice 5: the owner's deny list over the plugin goes with
+        // it, deleted in the tombstone's transaction (so a reinstall
+        // starts with none, and a failed uninstall keeps it), under the
+        // deny store's writer lock (so a list set for a racing
+        // reinstall after the tombstone stays).
+        let ctx = crate::auth::invocation::current();
+        let uninstalled = self
+            .plugin_denies
+            .forget_with(plugin_id, |old, delete| match old {
+                None => self.installed_plugins.uninstall(plugin_id),
+                Some(old) => crate::api::plugin_deny_admin::audited_uninstall(
+                    &self.audit_log,
+                    ctx.as_ref(),
+                    plugin_id,
+                    old,
+                    || self.installed_plugins.uninstall_with(plugin_id, delete),
+                ),
+            });
+        if let Err(err) = uninstalled {
             // Still installed: its instances may pin again.
             if let Some(uuid) = &installation_uuid {
                 self.tls.pins().unretire(uuid);
             }
             return Err(err);
-        }
-        // H6 slice 5: the owner's deny list over the plugin goes with
-        // it, so a reinstall starts with none. After the tombstone, so
-        // a failed uninstall never leaves an installed plugin without
-        // its list; a delete that fails here leaves the list in place
-        // (stricter, never wider) until the next start removes it.
-        if let Some(list) = &deny_list
-            && let Err(err) = crate::api::plugin_deny_admin::forget_on_uninstall(
-                &self.audit_log,
-                &self.plugin_denies,
-                crate::auth::invocation::current().as_ref(),
-                plugin_id,
-                Some(list),
-            )
-        {
-            tracing::error!(
-                target: "auth.plugin",
-                plugin_id,
-                error = %format!("{err:#}"),
-                "deleting the uninstalled plugin's deny list failed; retried at the next start",
-            );
         }
         // Phase 8.2: the certificates its instances trusted on first use
         // go with it, so a reinstall under the same instance id trusts
@@ -1847,48 +1839,6 @@ fn purge_tls_pins_audited(
 /// Phase 8.2: finish the TLS pin purges of installations the registry
 /// has tombstoned (an uninstall whose purge failed or was cut short, or
 /// a plugin removed while the host was down), audited as the host.
-/// H6 slice 5: finish the deny list deletions an uninstall left
-/// undone: a plugin with no live installation whose list predates its
-/// latest uninstall. A list set after the uninstall (for a plugin not
-/// installed yet) stays, as does the global one.
-fn forget_deny_lists_of_uninstalled_plugins(
-    db: &Db,
-    denies: &crate::state::PluginDenyStore,
-    audit_log: &AuditLog,
-) {
-    let ids = db.read(|conn| -> Result<Vec<String>, rusqlite::Error> {
-        let mut stmt = conn.prepare(
-            "SELECT d.plugin_id FROM plugin_deny d \
-             WHERE d.plugin_id <> '*' \
-             AND NOT EXISTS (SELECT 1 FROM plugin_installation i \
-                 WHERE i.plugin_id = d.plugin_id AND i.uninstalled_ms IS NULL) \
-             AND EXISTS (SELECT 1 FROM plugin_installation i \
-                 WHERE i.plugin_id = d.plugin_id AND i.uninstalled_ms >= d.updated_ms)",
-        )?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.collect()
-    });
-    let ids = match ids {
-        Ok(ids) => ids,
-        Err(err) => {
-            tracing::error!(target: "auth.plugin", error = %err, "listing stale plugin deny lists failed");
-            return;
-        }
-    };
-    for id in ids {
-        if let Err(err) =
-            crate::api::plugin_deny_admin::forget_on_uninstall(audit_log, denies, None, &id, None)
-        {
-            tracing::error!(
-                target: "auth.plugin",
-                plugin_id = %id,
-                error = %format!("{err:#}"),
-                "removing an uninstalled plugin's deny list failed",
-            );
-        }
-    }
-}
-
 fn purge_tls_pins_of_removed_installations(
     db: &Db,
     pins: &crate::state::TlsPinStore,
@@ -1994,10 +1944,8 @@ mod tests {
 
     /// H6 slice 5: uninstalling a plugin deletes the owner's deny list
     /// over it (audited), so a reinstall starts with none; the global
-    /// list and other plugins' lists stay. A racing reinstall's list is
-    /// kept, and a deletion left undone is finished at the next start.
+    /// list and other plugins' lists stay; a failed uninstall keeps it.
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn uninstall_deletes_the_plugins_deny_list() {
         use crate::auth::{Action, ActionSet, DenyRule};
         let base = std::env::temp_dir().join(format!(
@@ -2061,54 +2009,32 @@ mod tests {
             .expect("reinstall");
         assert!(denies.get("example.fenced").is_none());
 
-        // Only the list read before the tombstone is deleted: one the
-        // owner set in between (for a racing reinstall) stays.
+        // A failed uninstall keeps the list; a list set after the
+        // uninstall (for the next install) stays.
         denies.set("example.fenced", rule()).expect("set");
-        let old = denies.get("example.fenced").expect("list");
-        denies.set("example.fenced", rule()).expect("replace");
-        crate::api::plugin_deny_admin::forget_on_uninstall(
-            &engine.audit_log(),
-            &denies,
-            None,
-            "example.fenced",
-            Some(&old),
-        )
-        .expect("forget");
-        assert!(
-            denies.get("example.fenced").is_some(),
-            "the newer list stays"
-        );
-
-        // A deletion an uninstall didn't finish is finished at the
-        // next start; a list set after the uninstall is kept.
+        engine
+            .uninstall_plugin("example.fenced")
+            .expect("uninstall");
+        assert!(engine.uninstall_plugin("example.fenced").is_err());
+        denies.set("example.fenced", rule()).expect("set after");
+        assert!(engine.uninstall_plugin("example.fenced").is_err());
+        assert!(denies.get("example.fenced").is_some());
+        // The deletion is durable: a reopen loads no list for it.
+        denies.set("example.fenced", Vec::new()).expect("reset");
+        engine
+            .installed_plugins()
+            .install(&source)
+            .expect("reinstall");
+        denies.set("example.fenced", rule()).expect("set");
         engine
             .uninstall_plugin("example.fenced")
             .expect("uninstall");
         drop(denies);
         drop(engine);
-        let state = base.join("state");
-        let conn =
-            rusqlite::Connection::open(state.join(crate::state::db::DB_FILE_NAME)).expect("db");
-        conn.execute_batch(
-            "INSERT INTO plugin_deny (plugin_id, definition, updated_ms) VALUES \
-               ('example.fenced', '[{\"actions\":[\"state.read\"]}]', 1000), \
-               ('example.after', '[{\"actions\":[\"state.read\"]}]', 9000); \
-             UPDATE plugin_installation SET uninstalled_ms = 5000 \
-               WHERE plugin_id = 'example.fenced'; \
-             INSERT INTO plugin_installation (installation_uuid, plugin_id, version, \
-               installed_ms, uninstalled_ms) VALUES ('inst-after', 'example.after', '0.1.0', \
-               1000, 2000);",
-        )
-        .expect("seed");
-        drop(conn);
-        let engine = Engine::with_state_dir(&state).expect("reopen");
+        let engine = Engine::with_state_dir(&base.join("state")).expect("reopen");
         let denies = engine.plugin_denies();
-        assert!(denies.get("example.fenced").is_none(), "finished at start");
-        assert!(
-            denies.get("example.after").is_some(),
-            "set after the uninstall"
-        );
-        assert!(denies.get("example.other").is_some(), "never installed");
+        assert!(denies.get("example.fenced").is_none());
+        assert!(denies.get("example.other").is_some());
         assert!(denies.get("*").is_some());
         drop(engine);
         let _ = std::fs::remove_dir_all(&base);
