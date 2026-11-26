@@ -489,9 +489,9 @@ pub const AUDIT_METHOD: &str = AUDIT_METHOD_LOCAL;
 /// What is wrong, for a 4xx / `invalid_argument`.
 pub fn check_sensitive_approval(approved: &[String]) -> Result<(), String> {
     for (i, name) in approved.iter().enumerate() {
-        if name.parse::<crate::auth::SensitiveCategory>().is_err() {
+        if !oxidhome_manifest::SENSITIVE_READ_CATEGORIES.contains(&name.as_str()) {
             return Err(format!(
-                "approve_sensitive: `{name}` is not a sensitive category (lock, opener, alarm, camera)"
+                "approve_sensitive: `{name}` is not a sensitive category a plugin can be granted (only `camera`)"
             ));
         }
         if approved[..i].contains(name) {

@@ -640,6 +640,14 @@ pub fn network_rule_covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
     crate::runtime::network_rule_covers(wide, narrow)
 }
 
+/// The sensitive categories `caps` requests that `approved` doesn't list.
+fn unapproved_sensitive(caps: &CapabilitiesSection, approved: &[String]) -> Vec<String> {
+    caps.sensitive_requests()
+        .into_iter()
+        .filter(|c| !approved.contains(c))
+        .collect()
+}
+
 /// `caps` without any sensitive grant: what a package installed without
 /// the owner's approval (a boot-scan backfill, a dev-time argv start)
 /// is granted. A `reads_state` entry that asks for one is dropped (fail
@@ -1895,6 +1903,16 @@ impl InstalledPluginRegistry {
         if dest.exists() {
             return Err(InstallError::AlreadyInstalled { plugin_id }.into());
         }
+        // H6 slice 5b: refuse an unapproved sensitive request before
+        // copying anything; the staged manifest is checked again below.
+        let unapproved = unapproved_sensitive(&manifest.capabilities, approved_sensitive);
+        if !unapproved.is_empty() {
+            return Err(InstallError::SensitiveNotApproved {
+                plugin_id,
+                categories: unapproved,
+            }
+            .into());
+        }
 
         // C1b review F3: SQL INSERT first, FS copy second.
         //
@@ -1999,12 +2017,7 @@ impl InstalledPluginRegistry {
         // H6 slice 5b: a sensitive grant the staged manifest requests
         // (the one the grant is derived from) needs the owner's
         // approval, or nothing is installed.
-        let unapproved: Vec<String> = staged_manifest
-            .capabilities
-            .sensitive_requests()
-            .into_iter()
-            .filter(|c| !approved_sensitive.contains(c))
-            .collect();
+        let unapproved = unapproved_sensitive(&staged_manifest.capabilities, approved_sensitive);
         if !unapproved.is_empty() {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(InstallError::SensitiveNotApproved {
@@ -2140,19 +2153,23 @@ impl InstalledPluginRegistry {
     ///
     /// See [`UninstallError`].
     pub fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
-        self.uninstall_with(plugin_id, &|_| Ok(()))
+        self.uninstall_with(plugin_id, None, &|_| Ok(()))
     }
 
-    /// [`Self::uninstall`], running `also` in the transaction that
-    /// tombstones the installation row (H6 slice 5: deleting the
-    /// plugin's deny list with it).
+    /// [`Self::uninstall`] of installation `expected` (when given),
+    /// running `also` in the transaction that tombstones a live
+    /// installation row (H6 slice 5: deleting the plugin's deny list
+    /// with it).
     ///
     /// # Errors
     ///
-    /// As [`Self::uninstall`]; `also` failing rolls the tombstone back.
+    /// As [`Self::uninstall`], and [`UninstallError::NotInstalled`] when
+    /// the plugin is now another installation; `also` failing rolls the
+    /// tombstone back.
     pub fn uninstall_with(
         &self,
         plugin_id: &str,
+        expected: Option<&str>,
         also: &dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>,
     ) -> Result<Arc<str>, UninstallError> {
         let plugins_root = self
@@ -2189,6 +2206,9 @@ impl InstalledPluginRegistry {
             } else {
                 return Err(UninstallError::NotInstalled(plugin_id.to_string()));
             };
+        if expected.is_some_and(|uuid| uuid != &*installation_uuid) {
+            return Err(UninstallError::NotInstalled(plugin_id.to_string()));
+        }
         // **Path safety: use the stored paths, not a recomputed
         // `plugins_root.join(plugin_id)`.** `install` validates ids
         // before they enter the registry, and `scan` skips
@@ -2935,23 +2955,37 @@ fn is_unique_constraint(err: &rusqlite::Error) -> bool {
 /// Mark an installation row as uninstalled. Idempotent — a
 /// subsequent tombstone of the same UUID is a no-op (0 rows
 /// affected). The row remains for historical trace-back. `also` runs
-/// in the same transaction.
+/// in the same transaction when a live row was tombstoned, at
+/// `synchronous = FULL` (it deletes a deny list, which must not come
+/// back after an acknowledged uninstall).
 fn tombstone_installation_row(
     db: &Db,
     installation_uuid: &str,
     also: &dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>,
 ) -> Result<(), rusqlite::Error> {
     db.write(|conn| {
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE plugin_installation
-                SET uninstalled_ms = ?2
-              WHERE installation_uuid = ?1
-                AND uninstalled_ms IS NULL",
-            rusqlite::params![installation_uuid, now_ms()],
-        )?;
-        also(&tx)?;
-        tx.commit()
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let result = (|| {
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                "UPDATE plugin_installation
+                    SET uninstalled_ms = ?2
+                  WHERE installation_uuid = ?1
+                    AND uninstalled_ms IS NULL",
+                rusqlite::params![installation_uuid, now_ms()],
+            )?;
+            if changed > 0 {
+                also(&tx)?;
+            }
+            tx.commit()
+        })();
+        if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+            tracing::warn!(
+                error = %err,
+                "failed to restore synchronous = NORMAL; connection stays at FULL",
+            );
+        }
+        result
     })
 }
 
@@ -5496,7 +5530,15 @@ config-schema = "ui/config.schema.json"
             "round-10 F1: invalid-UI dir with no SQL row must still be quarantined",
         );
 
-        reg.uninstall(plugin_id).expect("uninstall must succeed");
+        // H6 slice 5: no live row is tombstoned, so the deny list
+        // delete riding the tombstone doesn't run.
+        let ran = std::cell::Cell::new(false);
+        reg.uninstall_with(plugin_id, None, &|_| {
+            ran.set(true);
+            Ok(())
+        })
+        .expect("uninstall must succeed");
+        assert!(!ran.get(), "no row, no deny list delete");
         assert!(
             !plugins_root.join(plugin_id).exists(),
             "one uninstall must remove the orphan dir",

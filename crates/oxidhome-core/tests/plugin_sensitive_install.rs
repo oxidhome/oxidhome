@@ -182,6 +182,17 @@ async fn sensitive_grants_are_approved_at_install_over_rest() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // A token-only category is no plugin grant.
+    let (status, body) = api_status(
+        &f.router,
+        &f.owner,
+        "POST",
+        "/api/v1/plugins",
+        json!({"source_dir": source, "approve_sensitive": ["camera", "lock"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!installed(&f.engine));
 
     let (status, body) = api_status(&f.router, &f.owner, "POST", "/api/v1/plugins", approve).await;
     assert_eq!(status, StatusCode::OK, "{body}");

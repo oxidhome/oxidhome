@@ -827,27 +827,36 @@ impl Engine {
         // the KV rows + blob dirs permanently stranded under
         // the tombstoned uuid. `installation_uuid_for` returns
         // the uuid from either map so the purges always run.
-        let installation_uuid = self.installed_plugins.installation_uuid_for(plugin_id);
+        if self.installed_plugins.plugins_root().is_none() {
+            return Err(crate::state::UninstallError::NoPluginsRoot);
+        }
+        // The rest is bound to this installation: one a racing install
+        // publishes meanwhile is not the one removed.
+        let Some(installation_uuid) = self.installed_plugins.installation_uuid_for(plugin_id)
+        else {
+            return Err(crate::state::UninstallError::NotInstalled(
+                plugin_id.to_owned(),
+            ));
+        };
         // H6 slice 5: the owner's deny list over the plugin goes with
         // it, deleted in the tombstone's transaction (so a reinstall
         // starts with none, and a failed uninstall keeps it), under the
         // deny store's writer lock (so a list set for a racing
         // reinstall after the tombstone stays). Its audit intent comes
-        // before any purge, and only for an installed plugin.
+        // before any purge. A quarantined directory with no installation
+        // row tombstones nothing, so its removal keeps the list.
         let ctx = crate::auth::invocation::current();
+        let has_row = &*installation_uuid != crate::state::installed_plugins::NO_SQL_ROW_UUID;
         self.plugin_denies.forget_with(plugin_id, |old, delete| {
-            let remove =
-                || self.purge_and_tombstone(plugin_id, installation_uuid.as_deref(), delete);
+            let remove = || self.purge_and_tombstone(plugin_id, &installation_uuid, delete);
             match old {
-                Some(old) if installation_uuid.is_some() => {
-                    crate::api::plugin_deny_admin::audited_uninstall(
-                        &self.audit_log,
-                        ctx.as_ref(),
-                        plugin_id,
-                        old,
-                        remove,
-                    )
-                }
+                Some(old) if has_row => crate::api::plugin_deny_admin::audited_uninstall(
+                    &self.audit_log,
+                    ctx.as_ref(),
+                    plugin_id,
+                    old,
+                    remove,
+                ),
                 _ => remove(),
             }
         })?;
@@ -856,14 +865,12 @@ impl Engine {
         // nothing it didn't see itself. After the tombstone, so a failed
         // uninstall never leaves a live installation without its pins; a
         // purge that fails here (or never ran) is finished at startup.
-        if let Some(uuid) = &installation_uuid
-            && let Err(err) = purge_tls_pins_audited(
-                self.tls.pins(),
-                &self.audit_log,
-                crate::auth::invocation::current().as_ref(),
-                uuid,
-            )
-        {
+        if let Err(err) = purge_tls_pins_audited(
+            self.tls.pins(),
+            &self.audit_log,
+            crate::auth::invocation::current().as_ref(),
+            &installation_uuid,
+        ) {
             tracing::error!(
                 target: "host.network",
                 plugin_id,
@@ -879,43 +886,42 @@ impl Engine {
     fn purge_and_tombstone(
         &self,
         plugin_id: &str,
-        installation_uuid: Option<&str>,
+        uuid: &str,
         delete: crate::state::plugin_deny::DeleteRow<'_>,
     ) -> Result<(), crate::state::UninstallError> {
-        if let Some(uuid) = installation_uuid {
-            self.kv.purge_installation(uuid).map_err(|err| {
-                crate::state::UninstallError::Io(std::io::Error::other(format!(
-                    "H2 KV purge failed for install {uuid}: {err}"
-                )))
-            })?;
-            self.blobs.purge_installation(uuid).map_err(|err| {
-                crate::state::UninstallError::Io(std::io::Error::other(format!(
-                    "H2 blob purge failed for install {uuid}: {err}"
-                )))
-            })?;
-            // ADR-0001: the purges above covered every removed
-            // sandbox's storage too.
-            sandbox_purge::forget_installation(&self.db, uuid).map_err(|err| {
-                crate::state::UninstallError::Io(std::io::Error::other(format!(
-                    "clearing sandbox removal markers for install {uuid} failed: {err}"
-                )))
-            })?;
-            self.sandboxes.forget_removals_of(uuid);
-            // Phase 8.2: no pin write still in flight lands after the
-            // purge below.
-            self.tls.pins().retire(uuid);
-        }
+        self.kv.purge_installation(uuid).map_err(|err| {
+            crate::state::UninstallError::Io(std::io::Error::other(format!(
+                "H2 KV purge failed for install {uuid}: {err}"
+            )))
+        })?;
+        self.blobs.purge_installation(uuid).map_err(|err| {
+            crate::state::UninstallError::Io(std::io::Error::other(format!(
+                "H2 blob purge failed for install {uuid}: {err}"
+            )))
+        })?;
+        // ADR-0001: the purges above covered every removed
+        // sandbox's storage too.
+        sandbox_purge::forget_installation(&self.db, uuid).map_err(|err| {
+            crate::state::UninstallError::Io(std::io::Error::other(format!(
+                "clearing sandbox removal markers for install {uuid} failed: {err}"
+            )))
+        })?;
+        self.sandboxes.forget_removals_of(uuid);
+        // Phase 8.2: no pin write still in flight lands after the
+        // purge below.
+        self.tls.pins().retire(uuid);
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
         // row live with empty state (recoverable by re-running
         // uninstall). The reverse — tombstone-then-
         // purge — would strand blob bytes silently on any purge
         // failure (the pre-fix behaviour).
-        if let Err(err) = self.installed_plugins.uninstall_with(plugin_id, delete) {
+        if let Err(err) = self
+            .installed_plugins
+            .uninstall_with(plugin_id, Some(uuid), delete)
+        {
             // Still installed: its instances may pin again.
-            if let Some(uuid) = installation_uuid {
-                self.tls.pins().unretire(uuid);
-            }
+            self.tls.pins().unretire(uuid);
             return Err(err);
         }
         Ok(())
