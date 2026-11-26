@@ -557,7 +557,7 @@ fn check_sensitive_grants(
             .find(|c| !crate::manifest::SENSITIVE_READ_CATEGORIES.contains(&c.as_str()))
         {
             format!("`{bad}` is not a sensitive category of bytes (only `camera`)")
-        } else if list.len() > crate::manifest::SENSITIVE_READ_CATEGORIES.len() {
+        } else if list.iter().enumerate().any(|(i, c)| list[..i].contains(c)) {
             "a category is listed twice".to_owned()
         } else if let Err(why) = usable {
             why.to_owned()

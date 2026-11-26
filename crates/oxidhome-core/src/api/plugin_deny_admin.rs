@@ -120,7 +120,7 @@ fn audit_path(by: &GrantActor, plugin_id: &str, old: &[DenyRule], new: &[DenyRul
 ///
 /// # Errors
 ///
-/// `plugin_id` is not a plugin id.
+/// `plugin_id` is neither a plugin id nor `*`.
 pub fn plugin_deny(
     store: &PluginDenyStore,
     plugin_id: String,
@@ -210,17 +210,21 @@ fn change_in(
 /// Delete `plugin_id`'s deny list once the plugin is uninstalled, so a
 /// reinstall starts with none. Audited as
 /// `uninstall.plugin.deny.reset/<plugin_id>/<detail>` under the
-/// uninstall's caller (`ctx`; the host when there is none). No list, no
-/// row.
+/// uninstall's caller (`ctx`; the host when there is none). With
+/// `expected`, only that list (the one read before the tombstone) is
+/// deleted: a list the owner set for a reinstall in between stays. No
+/// list, no row.
 ///
 /// # Errors
 ///
-/// Storing or auditing failed; the list then still applies.
+/// Storing or auditing failed; the list then still applies until the
+/// next start removes it ([`crate::Engine`] startup).
 pub(crate) fn forget_on_uninstall(
     audit: &AuditLog,
     store: &PluginDenyStore,
     ctx: Option<&crate::auth::InvocationContext>,
     plugin_id: &str,
+    expected: Option<&crate::state::PluginDenyList>,
 ) -> anyhow::Result<()> {
     let by = match ctx {
         Some(ctx) => GrantActor::of("uninstall", ctx),
@@ -235,6 +239,9 @@ pub(crate) fn forget_on_uninstall(
         let Some(old) = old else {
             return Ok(());
         };
+        if expected.is_some_and(|e| !std::ptr::eq(e.as_ptr(), old.as_ptr())) {
+            return Ok(());
+        }
         let path = audit_path(&by, plugin_id, old, &[]);
         audited_call(
             audit,

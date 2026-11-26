@@ -640,6 +640,19 @@ pub fn network_rule_covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
     crate::runtime::network_rule_covers(wide, narrow)
 }
 
+/// `caps` without any sensitive grant: what a package installed without
+/// the owner's approval (a boot-scan backfill) is granted. A
+/// `reads_state` entry that asked for one no longer equals the request,
+/// so it grants nothing (fail closed).
+fn without_sensitive(caps: &CapabilitiesSection) -> CapabilitiesSection {
+    let mut caps = caps.clone();
+    caps.sensitive_event_bytes.clear();
+    for grant in &mut caps.reads_state {
+        grant.sensitive.clear();
+    }
+    caps
+}
+
 fn intersect_by_eq<T: Clone + PartialEq>(a: &[T], b: &[T]) -> Vec<T> {
     a.iter().filter(|x| b.contains(x)).cloned().collect()
 }
@@ -1581,7 +1594,10 @@ impl InstalledPluginRegistry {
                         continue;
                     }
                 };
-                let grant_arc = Arc::new(manifest.capabilities.clone());
+                // H6 slice 5b: nobody approved a sensitive grant for a
+                // package found on disk; it gets none (an install
+                // through the API approves them).
+                let grant_arc = Arc::new(without_sensitive(&manifest.capabilities));
                 backfills.push(InstalledPlugin {
                     plugin_id: Arc::clone(&id_arc),
                     installation_uuid: Arc::clone(&uuid),
@@ -3756,6 +3772,68 @@ wasm = "plugin.wasm"
             "backfilled UUID must persist across scans",
         );
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// H6 slice 5b: a package found on disk was approved by nobody,
+    /// so its backfilled grant holds no sensitive grant; an install
+    /// refuses one the request doesn't approve, before any side
+    /// effect.
+    #[test]
+    fn sensitive_grants_need_an_approved_install() {
+        let root = tempdir("sensitive-backfill");
+        let plugins_root = root.join("plugins");
+        let manifest = r#"manifest_version = 1
+[plugin]
+id = "example.nvr"
+name = "NVR"
+version = "0.1.0"
+world = "plugin"
+sdk_version = "0.1.0"
+[runtime]
+wasm = "plugin.wasm"
+[capabilities]
+subscribes_events = true
+sensitive_event_bytes = ["camera"]
+[[capabilities.reads_state]]
+plugin = "*"
+capabilities = ["*"]
+bytes = true
+sensitive = ["camera"]
+"#;
+        let plugin_dir = plugins_root.join("example.nvr");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("manifest.toml"), manifest).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        let db = fresh_db();
+        let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
+        let row = &reg.list()[0];
+        assert!(row.sensitive_grants().is_empty(), "{row:?}");
+        let effective = effective_capabilities(
+            &toml::from_str::<PluginManifest>(manifest)
+                .unwrap()
+                .capabilities,
+            &row.granted_capabilities,
+        );
+        assert_eq!(effective.reads_state, []);
+        assert_eq!(effective.sensitive_event_bytes, Vec::<String>::new());
+        reg.uninstall("example.nvr").expect("uninstall");
+
+        let source = root.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("manifest.toml"), manifest).unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        let err = reg.install(&source).unwrap_err();
+        assert!(
+            matches!(&err, InstallError::SensitiveNotApproved { categories, .. } if categories == &["camera"]),
+            "{err:?}"
+        );
+        assert!(reg.list().is_empty());
+        assert!(!plugins_root.join("example.nvr").exists());
+        let installed = reg
+            .install_approved(&source, &["camera".to_owned()])
+            .expect("approved");
+        assert_eq!(installed.sensitive_grants(), ["camera"]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

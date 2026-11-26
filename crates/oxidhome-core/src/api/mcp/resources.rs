@@ -138,7 +138,8 @@ pub(super) fn list_resources() -> Vec<Resource> {
                 "JSON list of every plugin known to the host: installed manifests \
                  plus running-but-not-installed instances, each with its live \
                  instance count and, when installed, its `network` rules \
-                 (`requested`, `granted`, `effective`). Same body as the \
+                 (`requested`, `granted`, `effective`) and `sensitive` \
+                 categories granted. Same body as the \
                  `plugins.list` tool; the offline `oxidhome plugin list` shows \
                  the same rules for installed plugins.",
             )
@@ -224,7 +225,7 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
             .with_description(
                 "JSON detail for a single installed plugin — version, manifest \
                  digest, singleton flag, `network` rules (`requested`, `granted`, \
-                 `effective`), plus live instances. Same body as the \
+                 `effective`), `sensitive` categories granted, plus live instances. Same body as the \
                  `plugins.show` tool.",
             )
             .with_mime_type("application/json"),
@@ -1141,6 +1142,9 @@ pub(super) struct PluginDetail {
     /// Phase 8.5: requested / granted / effective network rules;
     /// `None` on the not-installed path.
     pub(super) network: Option<crate::state::NetworkGrants>,
+    /// H6 slice 5b: the sensitive categories the grant holds; `None`
+    /// on the not-installed path.
+    pub(super) sensitive: Option<Vec<String>>,
     pub(super) instances: Vec<PluginInstanceDetail>,
 }
 
@@ -1175,6 +1179,9 @@ pub(super) fn plugins_detail_body(engine: &Engine, id: &str) -> Option<PluginDet
         network: installed
             .as_ref()
             .map(crate::state::InstalledPlugin::network_grants),
+        sensitive: installed
+            .as_ref()
+            .map(crate::state::InstalledPlugin::sensitive_grants),
         instances,
     })
 }

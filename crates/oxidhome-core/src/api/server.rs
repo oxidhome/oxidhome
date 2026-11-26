@@ -1039,7 +1039,7 @@ impl IntoResponse for PluginDenyApiError {
 /// list over every plugin. `policy.manage`.
 ///
 /// # Errors
-/// - `400` not a plugin id.
+/// - `400` neither a plugin id nor `*`.
 /// - `403` not the owner.
 async fn get_plugin_deny(
     Extension(ctx): Extension<InvocationContext>,
@@ -1100,7 +1100,7 @@ async fn set_plugin_deny(
 /// list over the plugin. `policy.manage`.
 ///
 /// # Errors
-/// - `400` not a plugin id.
+/// - `400` neither a plugin id nor `*`.
 /// - `403` not the owner.
 async fn reset_plugin_deny(
     Extension(ctx): Extension<InvocationContext>,
@@ -2398,13 +2398,33 @@ impl IntoResponse for PluginSchemaError {
 /// `approve_sensitive` (H6 slice 5b) lists the sensitive categories
 /// the owner approves for the plugin's grants (only `camera` exists
 /// for plugins today). A manifest requesting one not listed is refused
-/// with `403 {"error": "sensitive_not_approved", "categories": [...]}`
+/// with `403 {"error": "sensitive_not_approved", "plugin_id": ..., "categories": [...]}`
 /// and nothing is installed; approving any needs `policy.manage`.
-#[derive(Deserialize)]
+///
+/// An object only: a derived struct would also take the positional
+/// `["/dir", ["camera"]]` as an approval.
 struct InstallBody {
+    source_dir: std::path::PathBuf,
+    approve_sensitive: Vec<String>,
+}
+
+/// [`InstallBody`]'s object form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallObject {
     source_dir: std::path::PathBuf,
     #[serde(default)]
     approve_sensitive: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for InstallBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: InstallObject = super::token_admin::from_object(deserializer)?;
+        Ok(Self {
+            source_dir: o.source_dir,
+            approve_sensitive: o.approve_sensitive,
+        })
+    }
 }
 
 #[derive(Serialize)]

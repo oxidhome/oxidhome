@@ -379,8 +379,9 @@ const INITIAL_SCHEMA: &str = "
     ) WITHOUT ROWID;
 
     -- The owner's deny list over a plugin (`state::plugin_deny`), by
-    -- plugin id: it outlives an uninstall, and every running instance
-    -- of the plugin is held to it from its next decision on.
+    -- plugin id (`*`: the global list over every plugin). Uninstalling
+    -- the plugin deletes its row; every running instance is held to a
+    -- list from its next decision on.
     CREATE TABLE plugin_deny (
         plugin_id   TEXT PRIMARY KEY NOT NULL,
         definition  BLOB NOT NULL,

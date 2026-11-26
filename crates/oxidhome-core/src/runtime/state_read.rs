@@ -800,6 +800,32 @@ mod tests {
             visibility(&ctx, &plugin, "inst-p.me", class, true, &e, true),
             Ok(Visibility::Withheld)
         );
+        // H6 slice 5b: a camera-approved plugin under a token holding
+        // the camera grant still gets them withheld: the token's allow
+        // carries an obligation a plugin read can't meet (Q6).
+        let approved = [StateGrant {
+            sensitive: vec!["camera".into()],
+            ..grant("*", &["*"], &["*"], true)
+        }];
+        let plugin = PluginPrincipal {
+            reads_state: &approved,
+            ..plugin
+        };
+        let host = InvocationContext::host_origin("me");
+        assert_eq!(
+            visibility(&host, &plugin, "inst-p.me", class, true, &e, true),
+            Ok(Visibility::Full),
+            "the plugin's own grant"
+        );
+        let camera = actor.with_sensitive(vec![crate::auth::SensitiveGrant::all(
+            crate::auth::SensitiveCategory::Camera,
+        )]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &camera, Transport::Rest));
+        assert_eq!(
+            visibility(&ctx, &plugin, "inst-p.me", class, true, &e, true),
+            Ok(Visibility::Withheld)
+        );
     }
 
     #[test]

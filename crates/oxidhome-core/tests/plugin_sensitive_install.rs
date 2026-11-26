@@ -7,11 +7,13 @@
 #[path = "support.rs"]
 mod support;
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use oxidhome_core::Engine;
-use oxidhome_core::api::build_router;
+use oxidhome_core::api::{MCP_ENDPOINT, build_router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -159,6 +161,17 @@ async fn sensitive_grants_are_approved_at_install_over_rest() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(!installed(&f.engine));
+    // A positional body is refused, not read as an approval.
+    let (status, _) = api_status(
+        &f.router,
+        &f.owner,
+        "POST",
+        "/api/v1/plugins",
+        json!([source, ["camera"]]),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}");
+    assert!(!installed(&f.engine));
     // An unknown category is refused.
     let (status, body) = api_status(
         &f.router,
@@ -228,4 +241,153 @@ async fn sensitive_grants_are_approved_at_install_over_connect() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list["plugins"][0]["sensitive"], json!(["camera"]), "{list}");
+}
+
+// ── MCP plumbing (Streamable HTTP, one SSE frame per call) ─────────
+
+fn mcp_request(bearer: &str) -> axum::http::request::Builder {
+    Request::builder()
+        .method("POST")
+        .uri(MCP_ENDPOINT)
+        .header(header::HOST, "localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json, text/event-stream")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+}
+
+async fn first_sse_data(response: axum::response::Response) -> Value {
+    let mut body = response.into_body();
+    let mut buf = String::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(30), body.frame())
+            .await
+            .expect("timed out waiting for SSE frame")
+            .expect("stream ended")
+            .expect("frame read error");
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        buf.push_str(&String::from_utf8_lossy(&data));
+        for line in buf.lines() {
+            if let Some(payload) = line.strip_prefix("data:")
+                && !payload.trim().is_empty()
+                && let Ok(value) = serde_json::from_str(payload.trim())
+            {
+                return value;
+            }
+        }
+    }
+}
+
+async fn mcp_session(router: &axum::Router, bearer: &str) -> String {
+    let init = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "plugin-sensitive-test", "version": "0"}
+        }
+    });
+    let response = router
+        .clone()
+        .oneshot(
+            mcp_request(bearer)
+                .body(Body::from(init.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("session id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = first_sse_data(response).await;
+    let notified = router
+        .clone()
+        .oneshot(
+            mcp_request(bearer)
+                .header("mcp-session-id", &session)
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(notified.status(), StatusCode::ACCEPTED);
+    session
+}
+
+async fn mcp_call(
+    router: &axum::Router,
+    bearer: &str,
+    session: &str,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
+    let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+    let response = router
+        .clone()
+        .oneshot(
+            mcp_request(bearer)
+                .header("mcp-session-id", session)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "MCP {method}");
+    first_sse_data(response).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sensitive_grants_are_approved_at_install_over_mcp() {
+    let f = fixture("sensitive-install-mcp");
+    let source = f.source.path().display().to_string();
+    let install = |bearer: &str, session: &str, id: u64, arguments: Value| {
+        let (router, bearer, session) = (f.router.clone(), bearer.to_owned(), session.to_owned());
+        let params = json!({"name": "plugins.install", "arguments": arguments});
+        async move { mcp_call(&router, &bearer, &session, id, "tools/call", params).await }
+    };
+    let owner = mcp_session(&f.router, &f.owner).await;
+    let refused = install(&f.owner, &owner, 2, json!({"source_dir": source})).await;
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    assert_eq!(
+        refused["result"]["structuredContent"],
+        json!({"kind": "sensitive_not_approved", "plugin_id": PLUGIN_ID, "categories": ["camera"]}),
+        "{refused}"
+    );
+    assert!(!installed(&f.engine));
+    let approve = json!({"source_dir": source, "approve_sensitive": ["camera"]});
+    let installer = mcp_session(&f.router, &f.installer).await;
+    let denied = install(&f.installer, &installer, 2, approve.clone()).await;
+    assert!(denied["error"].is_object(), "{denied}");
+    assert!(!installed(&f.engine));
+    let ok = install(&f.owner, &owner, 3, approve).await;
+    assert_eq!(
+        ok["result"]["structuredContent"]["sensitive"],
+        json!(["camera"]),
+        "{ok}"
+    );
+    let shown = mcp_call(
+        &f.router,
+        &f.owner,
+        &owner,
+        4,
+        "tools/call",
+        json!({"name": "plugins.show", "arguments": {"plugin_id": PLUGIN_ID}}),
+    )
+    .await;
+    assert_eq!(
+        shown["result"]["structuredContent"]["sensitive"],
+        json!(["camera"]),
+        "{shown}"
+    );
 }

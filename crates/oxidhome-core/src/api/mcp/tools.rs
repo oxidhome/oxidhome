@@ -153,8 +153,9 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `plugin_id`, `installed`, `version` (when installed), \
              `instance_count`, and `network` (when installed): the rules the \
              manifest `requested`, the operator `granted`, and the `effective` \
-             rules instances get (the grant narrowed by containment). \
-             Read-only; gated on `plugins:list`. Same wire \
+             rules instances get (the grant narrowed by containment), and \
+             `sensitive` (when installed): the sensitive categories approved \
+             at install. Read-only; gated on `plugins:list`. Same wire \
              shape as `oxidhome://plugins` — a client that reads the resource \
              and one that calls this tool see identical row bodies.",
             Arc::new(plugins_list_schema()),
@@ -173,7 +174,8 @@ pub(super) fn list_tools() -> Vec<Tool> {
              installed contents), `installation_uuid` (host-minted per-install \
              identity — a reinstall of the same `plugin_id` produces a \
              different UUID), `network` (`requested` / `granted` / \
-             `effective` rules, as in `plugins.list`), and the list of \
+             `effective` rules, as in `plugins.list`), `sensitive` (the \
+             categories approved at install), and the list of \
              currently-running instances with their state. \
              `content_digest`, `installation_uuid` and `network` are \
              `None` for a dev-time argv-driven start with no installation \
@@ -274,7 +276,8 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `plugin_installation` registry row. REFUSES if any supervised instance is \
              still running — call `plugins.stop` first. SENSITIVE + DESTRUCTIVE: gated \
              on `plugins:uninstall`; reinstall of the same `plugin_id` starts with an \
-             empty per-instance keyspace and a fresh `installation_uuid`.",
+             empty per-instance keyspace, a fresh `installation_uuid` and no deny list \
+             (the owner's list over the plugin is deleted with it).",
             Arc::new(plugins_uninstall_schema()),
         )
         .with_title("Uninstall plugin")
@@ -345,8 +348,8 @@ pub(super) fn list_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "plugins.reset_deny",
-            "Remove the owner's deny list over a plugin, undoing `plugins.set_deny`. \
-             Owner only (`policy.manage`); audited with the old list.",
+            "Remove the owner's deny list over a plugin (`*`: the global list over \
+             every plugin), undoing `plugins.set_deny`. Owner only (`policy.manage`); audited with the old list.",
             Arc::new(plugins_reset_deny_schema()),
         )
         .with_title("Reset plugin deny list")
@@ -3599,7 +3602,7 @@ async fn plugins_install_call(
                     "plugin_id": plugin_id,
                     "categories": categories,
                 })),
-                domain_kind: None,
+                domain_kind: Some("sensitive_not_approved"),
             };
         }
         Err(crate::state::InstallError::NoPluginsRoot) => {

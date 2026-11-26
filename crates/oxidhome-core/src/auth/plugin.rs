@@ -669,12 +669,18 @@ mod tests {
         let d = authorize_plugin(&host, &p, Action::BlobRead, &cam);
         assert!(d.allow);
         assert_eq!(d.obligations, crate::auth::Obligations::default());
-        // A token root's camera allow carries an obligation, which the
-        // caller can't meet; a token without the camera grant is
-        // refused.
-        let owner = ctx_for(&Actor::api("t", vec!["*".into()]));
-        let d = authorize_plugin(&owner, &p, Action::BlobRead, &cam);
+        // A token without the camera grant is refused; one holding it
+        // allows with a sensitive obligation, which the plugin read
+        // can't meet, so its callers withhold the bytes (Q6).
+        let wildcard_root = ctx_for(&Actor::api("t", vec!["*".into()]));
+        let d = authorize_plugin(&wildcard_root, &p, Action::BlobRead, &cam);
         assert_eq!(d.reason.audit_label(), Some("sensitive:camera"));
+        let camera_root = ctx_for(&Actor::api("t", vec!["*".into()]).with_sensitive(vec![
+            crate::auth::SensitiveGrant::all(SensitiveCategory::Camera),
+        ]));
+        let d = authorize_plugin(&camera_root, &p, Action::BlobRead, &cam);
+        assert!(d.allow);
+        assert!(!d.obligations.sensitive.is_empty(), "{d:?}");
 
         // Event bytes: `reads_event_bytes`, then the camera grant.
         let cam_device = Resource::device(
