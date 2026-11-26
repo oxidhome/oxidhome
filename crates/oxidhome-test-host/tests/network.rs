@@ -600,16 +600,16 @@ fn dropping_server() -> SocketAddr {
 async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     let host = TestHost::new().unwrap();
     let cut = dropping_server();
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    };
+    let (trickle, connected) = trickling_server();
+    // Freed after the other servers started, so none of them takes it.
+    let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = closing.local_addr().unwrap();
     let ok = TcpServer::http(move |path| match path {
         "/to-closed" => http_redirect(&format!("http://{closed}/")),
         "/to-ftp" => http_redirect("ftp://cam.lan/x"),
         _ => http_ok("hello"),
     });
-    let (trickle, connected) = trickling_server();
+    drop(closing);
     let results = probe(
         &host,
         "sdk",

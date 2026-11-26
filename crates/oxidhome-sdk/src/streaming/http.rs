@@ -312,12 +312,13 @@ impl Deadline {
         }
     }
 
-    /// A pollable that is ready when the deadline passes.
-    fn timer(self) -> Result<Expiry, Error> {
-        Ok(Expiry {
-            timer: monotonic_clock::subscribe_duration(nanos(self.left()?)),
+    /// Its timer, started now: one per exchange, shared by every phase.
+    fn timer(self) -> Expiry {
+        let left = self.at.saturating_duration_since(Instant::now());
+        Expiry {
+            timer: monotonic_clock::subscribe_duration(nanos(left)),
             deadline: self,
-        })
+        }
     }
 }
 
@@ -337,24 +338,33 @@ impl Expiry {
         }
         self.deadline.left().map(drop)
     }
+
+    /// The time left before the request is handed to the host; an
+    /// error (nothing sent) once there is none.
+    fn left_before_dispatch(&self) -> Result<Duration, Error> {
+        let not_sent = Error::TotalTimeout {
+            limit: self.deadline.limit,
+            dispatched: false,
+        };
+        if self.timer.ready() {
+            return Err(not_sent);
+        }
+        self.deadline.left().map_err(|_| not_sent)
+    }
 }
 
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Wait until `ready` is, or `deadline` passes (an error).
-fn wait(ready: &Pollable, deadline: Option<Deadline>) -> Result<(), Error> {
-    let Some(deadline) = deadline else {
+/// Wait until `ready` is; an error if `expiry` passes first, or with it.
+fn wait(ready: &Pollable, expiry: Option<&Expiry>) -> Result<(), Error> {
+    let Some(expiry) = expiry else {
         ready.block();
         return Ok(());
     };
-    let expiry = deadline.timer()?;
-    if poll(&[ready, &expiry.timer]).contains(&0) {
-        Ok(())
-    } else {
-        Err(deadline.expired())
-    }
+    poll(&[ready, &expiry.timer]);
+    expiry.check()
 }
 
 /// A request to send. Build it with [`Request::get`] / [`Request::new`]
@@ -476,8 +486,8 @@ impl Request {
     /// [`Error::Http`] (`HTTP-request-denied`).
     pub fn send(self) -> Result<Response, Error> {
         let max_body = self.max_body;
-        let deadline = Deadline::after(self.total_timeout);
-        let (head, url) = self.exchange(deadline)?;
+        let expiry = Deadline::after(self.total_timeout).map(Deadline::timer);
+        let (head, url) = self.exchange(expiry.as_ref())?;
         let Head {
             status,
             headers,
@@ -485,7 +495,7 @@ impl Request {
             _response,
             _upload,
         } = head;
-        let body = read_body(incoming, max_body, deadline)?;
+        let body = read_body(incoming, max_body, expiry.as_ref())?;
         Ok(Response {
             status,
             headers,
@@ -505,8 +515,8 @@ impl Request {
     ///
     /// As [`Request::send`], except [`Error::BodyTooLarge`].
     pub fn send_streaming(self) -> Result<StreamingResponse, Error> {
-        let deadline = Deadline::after(self.total_timeout);
-        let (head, url) = self.exchange(deadline)?;
+        let expiry = Deadline::after(self.total_timeout).map(Deadline::timer);
+        let (head, url) = self.exchange(expiry.as_ref())?;
         let Head {
             status,
             headers,
@@ -534,11 +544,11 @@ impl Request {
 
     /// Send the request, following redirects, until a response that
     /// isn't one to follow; return its head and URL.
-    fn exchange(mut self, deadline: Option<Deadline>) -> Result<(Head, Url), Error> {
+    fn exchange(mut self, expiry: Option<&Expiry>) -> Result<(Head, Url), Error> {
         let mut url = Url::parse(&self.url)?;
         let mut hops = 0u8;
         loop {
-            let head = self.start(&url, deadline).map_err(|error| {
+            let head = self.start(&url, expiry).map_err(|error| {
                 if hops == 0 {
                     error
                 } else {
@@ -596,7 +606,7 @@ impl Request {
     }
 
     /// Send one request and wait for the response head.
-    fn start(&self, url: &Url, deadline: Option<Deadline>) -> Result<Head, Error> {
+    fn start(&self, url: &Url, expiry: Option<&Expiry>) -> Result<Head, Error> {
         let headers = Fields::new();
         for (name, value) in &self.headers {
             headers.append(name, value).map_err(|e| {
@@ -633,21 +643,19 @@ impl Request {
         request
             .set_path_with_query(Some(&url.path_and_query))
             .map_err(|()| fail("path"))?;
-        let (connect, first_byte) = match deadline {
-            None => (self.timeout, self.timeout),
-            Some(deadline) => {
-                // Not handed to the host yet: nothing went out.
-                let left = deadline.left().map_err(|_| Error::TotalTimeout {
-                    limit: deadline.limit,
-                    dispatched: false,
-                })?;
-                let connect = left.saturating_sub((left / 10).min(CONNECT_MARGIN));
-                (self.timeout.min(connect), self.timeout.min(left))
+        // The total timeout bounds the rest itself; only the connect
+        // timeout is kept inside it (see `CONNECT_MARGIN`).
+        let connect = match expiry {
+            None => self.timeout,
+            Some(expiry) => {
+                let left = expiry.left_before_dispatch()?;
+                self.timeout
+                    .min(left.saturating_sub((left / 10).min(CONNECT_MARGIN)))
             }
         };
         let options = RequestOptions::new();
         let _ = options.set_connect_timeout(Some(nanos(connect)));
-        let _ = options.set_first_byte_timeout(Some(nanos(first_byte)));
+        let _ = options.set_first_byte_timeout(Some(nanos(self.timeout)));
         let _ = options.set_between_bytes_timeout(Some(nanos(self.timeout)));
 
         let outgoing = request.body().map_err(|()| fail("body"))?;
@@ -660,7 +668,7 @@ impl Request {
         // answered anyway (a `413` mid-upload); the write error itself
         // adds nothing.
         let written = match outgoing.write() {
-            Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout, deadline)?,
+            Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout, expiry)?,
             Err(()) => Written::Broken(None),
         };
         let (early, upload) = match written {
@@ -680,7 +688,7 @@ impl Request {
 
         let response = match early {
             Some(response) => response,
-            None => take_response(&pending, deadline)?,
+            None => take_response(&pending, expiry)?,
         };
         let status = response.status();
         let headers = {
@@ -711,12 +719,12 @@ struct Head {
     _upload: Option<OutgoingBody>,
 }
 
-/// Wait (until `deadline`, if any) for the response and take it.
+/// Wait (until `expiry`, if any) for the response and take it.
 fn take_response(
     pending: &FutureIncomingResponse,
-    deadline: Option<Deadline>,
+    expiry: Option<&Expiry>,
 ) -> Result<IncomingResponse, Error> {
-    wait(&pending.subscribe(), deadline)?;
+    wait(&pending.subscribe(), expiry)?;
     pending
         .get()
         .ok_or_else(|| internal("response not ready"))?
@@ -735,7 +743,7 @@ enum Written {
     Broken(Option<IncomingResponse>),
 }
 
-/// Write `body` and flush it, by `deadline` if any. A response that
+/// Write `body` and flush it, before `expiry` if any. A response that
 /// arrives while the write is blocked is taken: a refusal (`413`) stops
 /// the upload, since such a server may never read the rest; an early
 /// `1xx`/`2xx` doesn't, since such a server may still be reading it, but
@@ -748,18 +756,17 @@ fn write_body(
     body: &[u8],
     pending: &FutureIncomingResponse,
     timeout: Duration,
-    deadline: Option<Deadline>,
+    expiry: Option<&Expiry>,
 ) -> Result<Written, Error> {
     let writable = stream.subscribe();
     let answered = pending.subscribe();
-    let expiry = deadline.map(Deadline::timer).transpose()?;
     let mut early = None;
     let mut rest = body;
     let mut flushed = false;
     loop {
         // Checked before every write: a server that keeps reading would
         // otherwise never reach the wait below.
-        if let Some(expiry) = &expiry {
+        if let Some(expiry) = expiry {
             expiry.check()?;
         }
         let Ok(room) = stream.check_write() else {
@@ -771,7 +778,7 @@ fn write_body(
                 .is_some()
                 .then(|| monotonic_clock::subscribe_duration(nanos(timeout)));
             let mut waits = vec![&writable, stall.as_ref().unwrap_or(&answered)];
-            waits.extend(expiry.as_ref().map(|e| &e.timer));
+            waits.extend(expiry.map(|e| &e.timer));
             let ready = poll(&waits);
             if ready.contains(&0) {
                 continue;
@@ -820,12 +827,12 @@ fn read_error(err: &crate::bindings::wasi::io::error::Error) -> Error {
     }
 }
 
-/// Read a whole response body, refusing more than `max_body` bytes, by
-/// `deadline` if any.
+/// Read a whole response body, refusing more than `max_body` bytes,
+/// before `expiry` if any.
 fn read_body(
     incoming: IncomingBody,
     max_body: usize,
-    deadline: Option<Deadline>,
+    expiry: Option<&Expiry>,
 ) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
     {
@@ -833,16 +840,15 @@ fn read_body(
             .stream()
             .map_err(|()| internal("response stream already taken"))?;
         let ready = stream.subscribe();
-        let expiry = deadline.map(Deadline::timer).transpose()?;
         loop {
             // Checked before every read: a server that keeps a little
             // data ready would otherwise never reach the wait below.
-            if let Some(expiry) = &expiry {
+            if let Some(expiry) = expiry {
                 expiry.check()?;
             }
             let room = max_body.saturating_sub(body.len()) as u64 + 1;
             match stream.read(room.min(READ_CHUNK)) {
-                Ok(chunk) if chunk.is_empty() => match &expiry {
+                Ok(chunk) if chunk.is_empty() => match expiry {
                     Some(expiry) => {
                         if !poll(&[&ready, &expiry.timer]).contains(&0) {
                             return Err(expiry.deadline.expired());
@@ -876,7 +882,9 @@ fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<Resul
     Some(
         std::str::from_utf8(location)
             .map(str::to_owned)
-            .map_err(|_| Error::InvalidRedirect(String::from_utf8_lossy(location).into_owned())),
+            .map_err(|_| {
+                Error::InvalidRedirect(redact_userinfo(&String::from_utf8_lossy(location)))
+            }),
     )
 }
 
@@ -1199,11 +1207,17 @@ impl Url {
         {
             return Err(invalid());
         }
-        Ok(Self {
+        let url = Self {
             https,
             authority: authority.to_owned(),
             path_and_query,
-        })
+        };
+        // A port that isn't one (`:abc`, `:99999`, `:`) would otherwise
+        // only fail at the host, after earlier hops went out.
+        if url.origin().1.is_none() {
+            return Err(invalid());
+        }
+        Ok(url)
     }
 
     /// Resolve a `Location` against this URL (RFC 3986 §5.2, for the
@@ -1356,6 +1370,9 @@ mod tests {
             "http://user@h/",
             "http://h /",
             "http://h/a b",
+            "http://h:abc/",
+            "http://h:99999/",
+            "http://h:/",
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }
@@ -1440,7 +1457,6 @@ mod tests {
         assert!(url("http://[::1]/").same_origin(&url("http://[::1]:80/")));
         assert!(url("https://[fd00::1]/a").same_origin(&url("https://[fd00:0:0:0:0:0:0:1]:443/b")));
         assert!(url("https://h:0443/a").same_origin(&url("https://h/b")));
-        assert!(!url("https://h:x/a").same_origin(&url("https://h:x/b")));
     }
 
     #[test]
@@ -1566,6 +1582,10 @@ mod tests {
         assert!(matches!(
             redirect_location(307, &headers(b"/\xff")),
             Some(Err(Error::InvalidRedirect(_)))
+        ));
+        assert!(matches!(
+            redirect_location(302, &headers(b"https://u:secret@cam.lan/\xff")),
+            Some(Err(Error::InvalidRedirect(l))) if !l.contains("secret")
         ));
     }
 
