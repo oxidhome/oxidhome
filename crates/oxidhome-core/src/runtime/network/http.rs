@@ -383,7 +383,22 @@ fn connect_error(err: &std::io::Error) -> HttpErrorCode {
             HttpErrorCode::DestinationUnavailable
         }
         ErrorKind::TimedOut => HttpErrorCode::ConnectionTimeout,
+        _ if address_family_unsupported(err) => HttpErrorCode::DestinationUnavailable,
         _ => HttpErrorCode::ConnectionRefused,
+    }
+}
+
+/// Whether the host can't use the destination's address family, as
+/// upstream tells it apart.
+fn address_family_unsupported(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
     }
 }
 
@@ -777,6 +792,11 @@ mod tests {
         ));
         assert!(matches!(
             super::connect_error(&Error::from(ErrorKind::HostUnreachable)),
+            ErrorCode::DestinationUnavailable
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            super::connect_error(&Error::from_raw_os_error(libc::EAFNOSUPPORT)),
             ErrorCode::DestinationUnavailable
         ));
     }

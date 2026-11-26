@@ -85,7 +85,9 @@ pub const MAX_REDIRECTS: u8 = 5;
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 /// Default [`Request::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Most bytes of request headers the host takes (names and values).
+/// The host's budget for a request's headers: each name once and every
+/// value, plus a few dozen bytes of bookkeeping for each, so the headers
+/// that fit are somewhat less than this.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Headers `wasi:http` refuses from a plugin: hop-by-hop headers, and
 /// `host`, which the host sets from the URL. [`Request::header`] drops
@@ -140,6 +142,9 @@ pub enum Error {
     TotalTimeout {
         /// The limit that was exceeded.
         limit: Duration,
+        /// Whether the request had been handed to the host by then (it
+        /// may have reached the server).
+        dispatched: bool,
     },
     /// More redirects than [`Request::max_redirects`].
     #[error("more than {limit} redirects")]
@@ -184,7 +189,8 @@ impl Error {
     /// connect or the TLS handshake failed (including a connection cut
     /// during the handshake, which the host reports as
     /// `TLS-protocol-error`). Any failure after that may have come after
-    /// the server read the request, and so may a [`Error::TotalTimeout`].
+    /// the server read the request, and so may a [`Error::TotalTimeout`]
+    /// once the request was dispatched.
     /// After a redirect it is always `true`: an earlier request reached
     /// its server.
     #[must_use]
@@ -192,8 +198,8 @@ impl Error {
         match self {
             Error::InvalidUrl(_) | Error::Request(_) => false,
             Error::Http(code) => !nothing_sent(code),
+            Error::TotalTimeout { dispatched, .. } => *dispatched,
             Error::BodyTooLarge { .. }
-            | Error::TotalTimeout { .. }
             | Error::TooManyRedirects { .. }
             | Error::InsecureRedirect(_)
             | Error::InvalidRedirect(_)
@@ -287,8 +293,13 @@ impl Deadline {
         })
     }
 
+    /// The error once the deadline has passed, after the request was
+    /// handed to the host.
     fn expired(self) -> Error {
-        Error::TotalTimeout { limit: self.limit }
+        Error::TotalTimeout {
+            limit: self.limit,
+            dispatched: true,
+        }
     }
 
     /// The time left; an error once there is none.
@@ -302,8 +313,29 @@ impl Deadline {
     }
 
     /// A pollable that is ready when the deadline passes.
-    fn timer(self) -> Result<Pollable, Error> {
-        Ok(monotonic_clock::subscribe_duration(nanos(self.left()?)))
+    fn timer(self) -> Result<Expiry, Error> {
+        Ok(Expiry {
+            timer: monotonic_clock::subscribe_duration(nanos(self.left()?)),
+            deadline: self,
+        })
+    }
+}
+
+/// A deadline's timer. The deadline has passed once either the timer
+/// fired or the clock says so: a test host's virtual clock moves the
+/// clock without the timers, and the other way round.
+struct Expiry {
+    timer: Pollable,
+    deadline: Deadline,
+}
+
+impl Expiry {
+    /// An error once the deadline has passed.
+    fn check(&self) -> Result<(), Error> {
+        if self.timer.ready() {
+            return Err(self.deadline.expired());
+        }
+        self.deadline.left().map(drop)
     }
 }
 
@@ -317,8 +349,8 @@ fn wait(ready: &Pollable, deadline: Option<Deadline>) -> Result<(), Error> {
         ready.block();
         return Ok(());
     };
-    let timer = deadline.timer()?;
-    if poll(&[ready, &timer]).contains(&0) {
+    let expiry = deadline.timer()?;
+    if poll(&[ready, &expiry.timer]).contains(&0) {
         Ok(())
     } else {
         Err(deadline.expired())
@@ -410,6 +442,11 @@ impl Request {
     /// Bound the whole exchange, from the call to [`Request::send`] until
     /// the body has arrived (redirects included), or until the response
     /// head has arrived for [`Request::send_streaming`]. None by default.
+    ///
+    /// The host's connect timeout is then kept up to 10 % (at most
+    /// 500 ms) short of the time left, so a server that can't be reached
+    /// fails as `connection-timeout` (nothing sent) rather than as
+    /// [`Error::TotalTimeout`] (maybe sent).
     #[must_use]
     pub fn total_timeout(mut self, limit: Duration) -> Self {
         self.total_timeout = Some(limit);
@@ -512,7 +549,7 @@ impl Request {
                 }
             })?;
             let location = match redirect_location(head.status, &head.headers) {
-                Some(location) if self.max_redirects > 0 => location,
+                Some(location) if self.max_redirects > 0 => location?,
                 // The final response.
                 _ => return Ok((head, url)),
             };
@@ -599,7 +636,11 @@ impl Request {
         let (connect, first_byte) = match deadline {
             None => (self.timeout, self.timeout),
             Some(deadline) => {
-                let left = deadline.left()?;
+                // Not handed to the host yet: nothing went out.
+                let left = deadline.left().map_err(|_| Error::TotalTimeout {
+                    limit: deadline.limit,
+                    dispatched: false,
+                })?;
                 let connect = left.saturating_sub((left / 10).min(CONNECT_MARGIN));
                 (self.timeout.min(connect), self.timeout.min(left))
             }
@@ -716,6 +757,11 @@ fn write_body(
     let mut rest = body;
     let mut flushed = false;
     loop {
+        // Checked before every write: a server that keeps reading would
+        // otherwise never reach the wait below.
+        if let Some(expiry) = &expiry {
+            expiry.check()?;
+        }
         let Ok(room) = stream.check_write() else {
             return Ok(Written::Broken(early));
         };
@@ -725,7 +771,7 @@ fn write_body(
                 .is_some()
                 .then(|| monotonic_clock::subscribe_duration(nanos(timeout)));
             let mut waits = vec![&writable, stall.as_ref().unwrap_or(&answered)];
-            waits.extend(expiry.as_ref());
+            waits.extend(expiry.as_ref().map(|e| &e.timer));
             let ready = poll(&waits);
             if ready.contains(&0) {
                 continue;
@@ -741,9 +787,7 @@ fn write_body(
                 early = Some(response);
                 continue;
             }
-            if let Some(deadline) = deadline {
-                return Err(deadline.expired());
-            }
+            // The deadline: the check above reports it.
             continue;
         }
         if rest.is_empty() {
@@ -793,14 +837,16 @@ fn read_body(
         loop {
             // Checked before every read: a server that keeps a little
             // data ready would otherwise never reach the wait below.
-            if let Some(deadline) = deadline {
-                deadline.left()?;
+            if let Some(expiry) = &expiry {
+                expiry.check()?;
             }
             let room = max_body.saturating_sub(body.len()) as u64 + 1;
             match stream.read(room.min(READ_CHUNK)) {
                 Ok(chunk) if chunk.is_empty() => match &expiry {
                     Some(expiry) => {
-                        poll(&[&ready, expiry]);
+                        if !poll(&[&ready, &expiry.timer]).contains(&0) {
+                            return Err(expiry.deadline.expired());
+                        }
                     }
                     None => ready.block(),
                 },
@@ -820,15 +866,18 @@ fn read_body(
     Ok(body)
 }
 
-fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<String> {
+/// The `Location` of a redirect response; an error for one that isn't
+/// UTF-8.
+fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<Result<String, Error>> {
     if !matches!(status, 301 | 302 | 303 | 307 | 308) {
         return None;
     }
-    headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("location"))
-        .and_then(|(_, v)| std::str::from_utf8(v).ok())
-        .map(str::to_owned)
+    let location = find_header(headers, "location")?;
+    Some(
+        std::str::from_utf8(location)
+            .map(str::to_owned)
+            .map_err(|_| Error::InvalidRedirect(String::from_utf8_lossy(location).into_owned())),
+    )
 }
 
 /// The first value of header `name` (case-insensitive) in `headers`.
@@ -863,7 +912,7 @@ impl Response {
         find_header(&self.headers, name)
     }
 
-    /// Every header, in the order received.
+    /// Every header; the values of a repeated name come together.
     #[must_use]
     pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
@@ -930,7 +979,7 @@ impl StreamingResponse {
         find_header(&self.headers, name)
     }
 
-    /// Every header, in the order received.
+    /// Every header; the values of a repeated name come together.
     #[must_use]
     pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
@@ -1459,6 +1508,10 @@ mod tests {
             Error::Http(ErrorCode::TlsProtocolError),
             Error::Http(ErrorCode::TlsCertificateError),
             Error::Http(ErrorCode::DnsTimeout),
+            Error::TotalTimeout {
+                limit: Duration::ZERO,
+                dispatched: false,
+            },
         ] {
             assert!(!not_sent.may_have_reached_server(), "{not_sent:?}");
         }
@@ -1470,6 +1523,7 @@ mod tests {
             Error::Http(ErrorCode::InternalError(None)),
             Error::TotalTimeout {
                 limit: Duration::from_secs(1),
+                dispatched: true,
             },
             Error::BodyTooLarge { limit: 1 },
             Error::InvalidRedirect("mailto:x".into()),
@@ -1499,7 +1553,19 @@ mod tests {
         let past = Deadline::after(Some(Duration::ZERO)).expect("deadline");
         assert!(matches!(
             past.left(),
-            Err(Error::TotalTimeout { limit }) if limit.is_zero()
+            Err(Error::TotalTimeout { limit, dispatched: true }) if limit.is_zero()
+        ));
+    }
+
+    #[test]
+    fn only_redirects_with_a_location_are_followed() {
+        let headers = |v: &[u8]| vec![("Location".to_owned(), v.to_vec())];
+        assert!(redirect_location(200, &headers(b"/x")).is_none());
+        assert!(redirect_location(302, &[]).is_none());
+        assert!(matches!(redirect_location(302, &headers(b"/x")), Some(Ok(l)) if l == "/x"));
+        assert!(matches!(
+            redirect_location(307, &headers(b"/\xff")),
+            Some(Err(Error::InvalidRedirect(_)))
         ));
     }
 
