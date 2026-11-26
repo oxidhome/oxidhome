@@ -207,6 +207,46 @@ fn change_in(
     }
 }
 
+/// Delete `plugin_id`'s deny list once the plugin is uninstalled, so a
+/// reinstall starts with none. Audited as
+/// `uninstall.plugin.deny.reset/<plugin_id>/<detail>` under the
+/// uninstall's caller (`ctx`; the host when there is none). No list, no
+/// row.
+///
+/// # Errors
+///
+/// Storing or auditing failed; the list then still applies.
+pub(crate) fn forget_on_uninstall(
+    audit: &AuditLog,
+    store: &PluginDenyStore,
+    ctx: Option<&crate::auth::InvocationContext>,
+    plugin_id: &str,
+) -> anyhow::Result<()> {
+    let by = match ctx {
+        Some(ctx) => GrantActor::of("uninstall", ctx),
+        None => GrantActor {
+            surface: "uninstall",
+            actor_kind: "host",
+            token_id: "-".to_owned(),
+            call_id: None,
+        },
+    };
+    store.change(plugin_id, Vec::new(), |old, commit| {
+        let Some(old) = old else {
+            return Ok(());
+        };
+        let path = audit_path(&by, plugin_id, old, &[]);
+        audited_call(
+            audit,
+            by.actor_kind,
+            &by.token_id,
+            &path,
+            by.call_id.as_deref(),
+            || Ok(commit()?),
+        )
+    })?
+}
+
 /// `oxidhome plugin deny`: replace the deny list of `plugin_id` in the
 /// offline `store` (`None` or empty removes it), audited as the CLI.
 /// The daemon loads it when it next starts.

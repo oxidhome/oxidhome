@@ -864,6 +864,24 @@ impl Engine {
             }
             return Err(err);
         }
+        // H6 slice 5: the owner's deny list over the plugin goes with
+        // it, so a reinstall starts with none. After the tombstone, so
+        // a failed uninstall never leaves an installed plugin without
+        // its list; a delete that fails here leaves the list in place
+        // (stricter, never wider) for the owner to reset.
+        if let Err(err) = crate::api::plugin_deny_admin::forget_on_uninstall(
+            &self.audit_log,
+            &self.plugin_denies,
+            crate::auth::invocation::current().as_ref(),
+            plugin_id,
+        ) {
+            tracing::error!(
+                target: "auth.plugin",
+                plugin_id,
+                error = %format!("{err:#}"),
+                "deleting the uninstalled plugin's deny list failed; reset it by hand",
+            );
+        }
         // Phase 8.2: the certificates its instances trusted on first use
         // go with it, so a reinstall under the same instance id trusts
         // nothing it didn't see itself. After the tombstone, so a failed
@@ -1920,6 +1938,76 @@ mod tests {
                 && r.actor_kind == "host"),
             "pin purge audit row"
         );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H6 slice 5: uninstalling a plugin deletes the owner's deny list
+    /// over it (audited), so a reinstall starts with none; the global
+    /// list and other plugins' lists stay.
+    #[test]
+    fn uninstall_deletes_the_plugins_deny_list() {
+        use crate::auth::{Action, ActionSet, DenyRule};
+        let base = std::env::temp_dir().join(format!(
+            "oxidhome-deny-uninstall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        ));
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("manifest.toml"),
+            "manifest_version = 1\n[plugin]\nid = \"example.fenced\"\nname = \"F\"\n\
+             version = \"0.1.0\"\nworld = \"plugin\"\nsdk_version = \"0.1.0\"\n\
+             [runtime]\nwasm = \"plugin.wasm\"\n",
+        )
+        .unwrap();
+        std::fs::write(source.join("plugin.wasm"), b"\0asm\x01\x00\x00\x00").unwrap();
+        let engine = Engine::with_state_dir(&base.join("state")).expect("engine");
+        let rule = || {
+            vec![DenyRule {
+                actions: ActionSet::of(&[Action::StateRead]),
+                categories: None,
+                devices: None,
+                services: None,
+            }]
+        };
+        let denies = engine.plugin_denies();
+        // Set before the install: it applies once installed.
+        denies.set("example.fenced", rule()).expect("set");
+        denies.set("example.other", rule()).expect("set");
+        denies.set("*", rule()).expect("set");
+        engine
+            .installed_plugins()
+            .install(&source)
+            .expect("install");
+        assert!(denies.get("example.fenced").is_some());
+
+        engine
+            .uninstall_plugin("example.fenced")
+            .expect("uninstall");
+        assert!(denies.get("example.fenced").is_none());
+        assert!(denies.get("example.other").is_some());
+        assert!(denies.get("*").is_some());
+        let rows = engine
+            .audit_log()
+            .query(&crate::state::AuditQuery::default(), 64)
+            .expect("audit");
+        assert!(
+            rows.iter().any(|r| r
+                .path
+                .starts_with("uninstall.plugin.deny.reset/example.fenced/")
+                && r.decision == "allow"),
+            "{rows:?}"
+        );
+        // Reinstalled, it starts with none.
+        engine
+            .installed_plugins()
+            .install(&source)
+            .expect("reinstall");
+        assert!(denies.get("example.fenced").is_none());
         drop(engine);
         let _ = std::fs::remove_dir_all(&base);
     }
