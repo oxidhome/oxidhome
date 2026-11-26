@@ -1294,6 +1294,16 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             &Resource::pre_check(ResourceKind::Plugin),
         )?;
         let req = request.to_owned_message();
+        // Proto JSON skips unknown fields, so a misspelled `deny` reads
+        // as an empty list: refuse it rather than reset the list.
+        if req.deny.is_empty() {
+            return Err(rpc_err(
+                &ctx,
+                ConnectError::invalid_argument(
+                    "`deny` must not be empty; ResetPluginDeny removes a list",
+                ),
+            ));
+        }
         let specs = req.deny.into_iter().map(selector_spec).collect();
         let (plugin_id, deny) = self
             .change_plugin_deny(&ctx, req.plugin_id, Some(specs))

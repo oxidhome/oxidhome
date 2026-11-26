@@ -748,7 +748,8 @@ pub trait PluginsService: Send + Sync + 'static {
     /// call reaches another, may not do (`service.call`, `state.read`,
     /// `blob.read`, `event.subscribe`), whatever its manifest grants. The
     /// plugin need not be installed; running instances apply it at once.
-    /// An empty list removes it. `policy.manage`. Same shape as
+    /// An empty list is refused (a misspelled field decodes as one):
+    /// `ResetPluginDeny` removes a list. `policy.manage`. Same shape as
     /// `PUT /api/v1/plugins/{plugin_id}/deny`.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
