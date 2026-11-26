@@ -319,6 +319,7 @@ interface events {
     origin-plugin-id: string,
     origin-instance-id: string,
     row-id: option<u64>,
+    call-id: option<string>,
     payload: event-payload,
   }
 

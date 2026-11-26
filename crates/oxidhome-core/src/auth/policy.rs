@@ -611,14 +611,7 @@ pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
             deny: ext
                 .deny
                 .into_iter()
-                .map(|d| {
-                    d.into_parts()
-                        .map(|(actions, categories, devices)| DenyRule {
-                            actions,
-                            categories,
-                            devices,
-                        })
-                })
+                .map(crate::auth::role::SelectorWire::into_deny)
                 .collect::<Option<Vec<_>>>()?,
         },
     })
@@ -705,6 +698,25 @@ mod tests {
         // `deny_unknown_fields` guards against a typo silently
         // pinning the token to nothing.
         assert!(parse_policy(br#"{"scope":["logs:read"]}"#).is_none());
+        // A deny that could never match what it names (H6 slice 4).
+        assert!(
+            parse_policy(
+                br#"{"scopes":["*"],"deny":[{"actions":["device.command"],"services":["acme.notify"]}]}"#
+            )
+            .is_none()
+        );
+        let p = parse_policy(
+            br#"{"scopes":["*"],"deny":[{"actions":["*"],"services":["acme.notify"]}]}"#,
+        )
+        .expect("narrowed wildcard");
+        assert_eq!(p.deny[0].actions, crate::auth::role::SERVICE_NARROWABLE);
+        // A device deny naming `service.call`, which it could never match.
+        assert!(
+            parse_policy(
+                br#"{"scopes":["*"],"deny":[{"actions":["service.call"],"category":["lock"]}]}"#,
+            )
+            .is_none()
+        );
         // Unknown field inside a constraint blob — same
         // rationale.
         assert!(parse_policy(br#"{"scopes":[],"constraints":{"t":{"unknown":true}}}"#).is_none());
@@ -777,7 +789,12 @@ mod tests {
                 ][..]
             )
         );
-        assert_eq!(policy.deny[1].actions, crate::auth::ActionSet::ALL);
+        // A device selector never matches a service: a narrowed `*` is
+        // every action but `service.call`.
+        assert_eq!(
+            policy.deny[1].actions,
+            crate::auth::ActionSet::ALL.without(crate::auth::role::SERVICE_NARROWABLE)
+        );
         assert_eq!(parse_policy(&policy.to_json()), Some(policy.clone()));
         // A role-only policy keeps the object shape.
         let role_only = TokenPolicy {

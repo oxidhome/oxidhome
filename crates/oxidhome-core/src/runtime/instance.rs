@@ -1409,7 +1409,15 @@ impl PluginInstance {
                 instance_id = %data.instance_id,
                 plugin_id = %data.manifest.plugin.id,
             );
-            async {
+            // H6 slice 4: a reaction to an event an attributable
+            // invocation published records that call id as
+            // `caused_by`. Attribution only: the reaction is
+            // host-rooted and runs with this instance's own grants.
+            let reaction = ev
+                .call_id
+                .as_deref()
+                .map(|cause| crate::auth::InvocationContext::reacting_to(&data.instance_id, cause));
+            let call = async {
                 self.arm_watchdog();
                 self.bindings
                     .call_on_event(&mut self.store, &ev)
@@ -1417,8 +1425,11 @@ impl PluginInstance {
                     .map_err(anyhow::Error::from)
                     .context("invoking plugin on-event")
             }
-            .instrument(span)
-            .await?;
+            .instrument(span);
+            match reaction {
+                Some(ctx) => crate::auth::invocation::CURRENT.scope(ctx, call).await?,
+                None => call.await?,
+            }
             delivered += 1;
         }
         Ok(delivered)
@@ -1777,6 +1788,7 @@ mod merge_queues_tests {
 
     fn ev(topic: &str, row_id: Option<u64>) -> Event {
         Event {
+            call_id: None,
             device: None,
             timestamp: 0,
             payload: EventPayload::Custom(CustomEvent {

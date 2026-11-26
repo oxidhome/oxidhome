@@ -100,6 +100,7 @@ fn approx_size(event: &Event) -> usize {
         + event.device.as_ref().map_or(0, String::len)
         + event.origin_plugin_id.len()
         + event.origin_instance_id.len()
+        + event.call_id.as_ref().map_or(0, String::len)
         + payload
 }
 
@@ -263,11 +264,39 @@ mod tests {
             origin_plugin_id: "example.pub".into(),
             origin_instance_id: "pub".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: payload.into(),
             }),
         }
+    }
+
+    /// H6 slice 4: the page budget counts an event's call id.
+    #[test]
+    fn page_size_counts_the_call_id() {
+        let plain = custom("t", "{}");
+        let attributed = Event {
+            call_id: Some(format!("call-{:032x}", 1)),
+            ..plain.clone()
+        };
+        assert_eq!(approx_size(&attributed), approx_size(&plain) + 37);
+    }
+
+    /// H6 slice 4: a plugin's history page returns each event's call
+    /// id as recorded.
+    #[test]
+    fn history_pages_carry_the_call_id() {
+        let log = log();
+        let attributed = Event {
+            call_id: Some(format!("call-{:032x}", 7)),
+            ..custom("t.a", "1")
+        };
+        record(&log, &[attributed, custom("t.b", "2")]);
+        let p = page(&log, 0, 10, &[all()], true);
+        let calls: Vec<Option<&str>> = p.events.iter().map(|e| e.call_id.as_deref()).collect();
+        let expected = format!("call-{:032x}", 7);
+        assert_eq!(calls, vec![Some(expected.as_str()), None]);
     }
 
     fn camera(device: &str, frame: Vec<u8>) -> Event {
@@ -277,6 +306,7 @@ mod tests {
             origin_plugin_id: "example.pub".into(),
             origin_instance_id: "pub".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "camera".into(),
                 fields: vec![KeyValue {

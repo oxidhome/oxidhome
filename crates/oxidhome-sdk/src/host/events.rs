@@ -275,6 +275,7 @@ mod tests {
 
     fn event(row_id: Option<u64>) -> Event {
         Event {
+            call_id: None,
             device: None,
             timestamp: 0,
             origin_plugin_id: String::new(),

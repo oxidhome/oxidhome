@@ -1067,6 +1067,7 @@ fn resolution_entry(
         return None;
     }
     Some(AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

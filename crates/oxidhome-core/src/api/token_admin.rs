@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use super::bootstrap::{ADMIN_TOKEN_LABEL, audited_call};
 use super::sensitive_admin::check_devices;
-use crate::auth::role::{NARROWABLE, OWNER_LABEL, SCOPED, is_role_name};
+use crate::auth::role::{
+    NARROWABLE, OWNER_LABEL, SCOPED, SERVICE_NARROWABLE, is_role_name, is_service_pattern,
+};
 use crate::auth::{
     Action, ActionSet, DenyRule, DeviceCategory, RoleDef, RoleGrant, SensitiveCategory,
     SensitiveGrant, TokenPolicy, parse_policy,
@@ -84,6 +86,11 @@ pub struct SelectorSpec {
     /// Device ids or `prefix*` patterns; absent for every device.
     #[serde(default)]
     pub devices: Option<Vec<String>>,
+    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+    /// literal or `prefix*`) for `service.call`; not combined with
+    /// `category` or `devices`.
+    #[serde(default)]
+    pub services: Option<Vec<String>>,
 }
 
 /// Why a mint was refused.
@@ -246,24 +253,31 @@ fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
     specs
         .iter()
         .map(|spec| {
-            let (actions, categories, devices) = selector(spec, "deny")?;
-            if actions.contains(Action::ServiceCall) && spec.actions.iter().all(|a| a != "*") {
-                return Err(invalid(
-                    "`service.call` is not checked for tokens (a service hop is governed by \
-                     the calling plugin's `consumes_services` grant); deny `device.command` \
-                     instead",
-                ));
-            }
+            let (_, categories, devices, services) = selector(spec, "deny")?;
+            let to_devices = categories.is_some() || devices.is_some();
+            // A narrowed `*` means what the selector can match; a named
+            // action it can never match is refused.
+            let actions =
+                crate::auth::role::deny_actions(&spec.actions, services.is_some(), to_devices)
+                    .ok_or_else(|| {
+                        invalid(if services.is_some() {
+                            "a deny entry narrowed to services can only name service.call"
+                        } else {
+                            "a deny entry narrowed to devices can't name service.call (narrow it \
+                             with `services` instead)"
+                        })
+                    })?;
             Ok(DenyRule {
                 actions,
                 categories,
                 devices,
+                services,
             })
         })
         .collect()
 }
 
-type Selector = (ActionSet, Option<Vec<DeviceCategory>>, Option<Vec<String>>);
+type Selector = crate::auth::role::SelectorParts;
 
 /// Validate one grant or deny entry (`what` names it in errors).
 fn selector(spec: &SelectorSpec, what: &str) -> Result<Selector, AdminError> {
@@ -308,7 +322,33 @@ fn selector(spec: &SelectorSpec, what: &str) -> Result<Selector, AdminError> {
             Some(list.clone())
         }
     };
-    Ok((actions, categories, devices))
+    let services = match &spec.services {
+        None => None,
+        Some(list) if list.is_empty() => {
+            return Err(invalid(format!(
+                "a {what} entry's `services` must not be empty"
+            )));
+        }
+        Some(_) if categories.is_some() || devices.is_some() => {
+            return Err(invalid(format!(
+                "a {what} entry narrows to devices (`category`, `devices`) or to `services`, \
+                 not both"
+            )));
+        }
+        Some(list) => {
+            check_len("services", list)?;
+            if let Some(bad) = list.iter().find(|p| !is_service_pattern(p)) {
+                return Err(invalid(format!(
+                    "service pattern `{bad}` must be `<plugin>` or `<plugin>/<local-id>`, each \
+                     half literal or ending in a single `*`: the plugin half a reverse-DNS \
+                     plugin id (`a-z`, `0-9`, `-` labels joined by `.`), the local-id half 1-64 \
+                     of `a-z`, `0-9`, `.`, `_`, `-` starting with a letter or digit"
+                )));
+            }
+            Some(list.clone())
+        }
+    };
+    Ok((actions, categories, devices, services))
 }
 
 /// Mint a token for `req`, audited as `surface` (`cli`, `api`,
@@ -600,31 +640,48 @@ pub fn build_role(spec: &RoleSpec) -> Result<Vec<u8>, AdminError> {
     check_len("sensitive categories", &spec.sensitive)?;
     let mut grants = Vec::with_capacity(spec.grants.len());
     for g in &spec.grants {
-        let (actions, categories, devices) = selector(g, "grant")?;
+        let (actions, categories, devices, services) = selector(g, "grant")?;
+        let wildcard = g.actions.iter().any(|a| a == "*");
+        // Actions named beside `*` must fit the selector too.
+        let explicit = ActionSet::parse(g.actions.iter().map(String::as_str).filter(|a| *a != "*"))
+            .map_err(|e| invalid(format!("{e}")))?;
         let narrowed = categories.is_some() || devices.is_some();
-        if narrowed && !g.actions.iter().any(|a| a == "*") && !NARROWABLE.contains_all(actions) {
-            let names = actions.without(NARROWABLE).names().join(", ");
+        if narrowed && !NARROWABLE.contains_all(explicit) {
+            let names = explicit.without(NARROWABLE).names().join(", ");
             return Err(invalid(format!(
                 "a grant narrowed to devices can only name device.list, device.read and \
                  device.command, not {names}"
             )));
         }
-        let actions = if g.actions.iter().any(|a| a == "*") {
-            actions.intersection(if narrowed { NARROWABLE } else { SCOPED })
-        } else if SCOPED.contains_all(actions) {
-            actions
-        } else {
-            let names = actions.without(SCOPED).names().join(", ");
+        if services.is_some() && !SERVICE_NARROWABLE.contains_all(explicit) {
+            let names = explicit.without(SERVICE_NARROWABLE).names().join(", ");
+            return Err(invalid(format!(
+                "a grant narrowed to services can only name service.call, not {names}"
+            )));
+        }
+        if !SCOPED.contains_all(explicit) {
+            let names = explicit.without(SCOPED).names().join(", ");
             return Err(invalid(format!(
                 "a role can't grant {names}: no scope grants it (the owner holds \
-                 token.manage and policy.manage; plugins' manifests govern service.call and \
-                 state.read)"
+                 token.manage and policy.manage; plugins' manifests govern state.read)"
             )));
+        }
+        let actions = if wildcard {
+            actions.intersection(if services.is_some() {
+                SERVICE_NARROWABLE
+            } else if narrowed {
+                NARROWABLE
+            } else {
+                SCOPED
+            })
+        } else {
+            actions
         };
         grants.push(RoleGrant {
             actions,
             categories,
             devices,
+            services,
         });
     }
     let mut sensitive: Vec<SensitiveCategory> = Vec::new();
@@ -863,6 +920,7 @@ mod tests {
             actions: vec!["device.command".into()],
             category: None,
             devices: Some(vec!["dev-a1*".into()]),
+            services: None,
         }];
         r.sensitive = vec!["camera".into()];
         let m = mint(&tokens, &audit, "cli", "cli", None, &r).expect("mint");
@@ -920,6 +978,7 @@ mod tests {
                         actions: vec!["*".into()],
                         category: Some(vec![]),
                         devices: None,
+                        services: None,
                     }],
                     ..req("x", &["resident"])
                 },
@@ -931,6 +990,7 @@ mod tests {
                         actions: vec!["*".into()],
                         category: None,
                         devices: Some(vec!["kitchen".into()]),
+                        services: None,
                     }],
                     ..req("x", &["resident"])
                 },
@@ -939,20 +999,10 @@ mod tests {
             (
                 MintRequest {
                     deny: vec![SelectorSpec {
-                        actions: vec!["service.call".into()],
-                        category: None,
-                        devices: None,
-                    }],
-                    ..req("x", &["resident"])
-                },
-                "not checked for tokens",
-            ),
-            (
-                MintRequest {
-                    deny: vec![SelectorSpec {
                         actions: vec!["*".into()],
                         category: Some(vec!["light".into(); MAX_LIST + 1]),
                         devices: None,
+                        services: None,
                     }],
                     ..req("x", &["resident"])
                 },
@@ -968,6 +1018,93 @@ mod tests {
         }
         assert_eq!(tokens.count().unwrap(), 0);
         assert_eq!(audit.count().unwrap(), 0);
+    }
+
+    /// H6 slice 4: a `services` selector names only `service.call`,
+    /// stands alone and names well-formed patterns.
+    #[test]
+    fn service_selectors_are_validated() {
+        let (tokens, audit) = stores();
+        let cases: Vec<(MintRequest, &str)> = vec![
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["device.read".into()],
+                        category: None,
+                        devices: None,
+                        services: Some(vec!["acme.notify".into()]),
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "can only name service.call",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["service.call".into()],
+                        category: Some(vec!["lock".into()]),
+                        devices: None,
+                        services: Some(vec!["acme.notify".into()]),
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "not both",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["service.call".into()],
+                        category: None,
+                        devices: None,
+                        services: Some(vec!["acme/x*y".into()]),
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "service pattern",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["service.call".into()],
+                        category: Some(vec!["lock".into()]),
+                        devices: None,
+                        services: None,
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "can't name service.call",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["*".into(), "device.command".into()],
+                        category: None,
+                        devices: None,
+                        services: Some(vec!["acme.notify".into()]),
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "can only name service.call",
+            ),
+        ];
+        for (r, needle) in cases {
+            let err = mint(&tokens, &audit, "cli", "cli", None, &r).expect_err("refused");
+            assert!(
+                matches!(&err, AdminError::Invalid(m) if m.contains(needle)),
+                "{r:?}: {err}"
+            );
+        }
+        let ok = MintRequest {
+            deny: vec![SelectorSpec {
+                actions: vec!["*".into()],
+                category: None,
+                devices: None,
+                services: Some(vec!["zwave.*/door".into()]),
+            }],
+            ..req("x", &["resident"])
+        };
+        let m = mint(&tokens, &audit, "cli", "cli", None, &ok).expect("minted");
+        assert_eq!(m.summary.deny, vec!["service.call{zwave.*/door}"]);
     }
 
     #[test]
@@ -1048,13 +1185,28 @@ mod tests {
             ),
             (
                 "x",
-                r#"{"grants":[{"actions":["service.call"]}]}"#,
-                "can't grant service.call",
+                r#"{"grants":[{"actions":["state.read"]}]}"#,
+                "can't grant state.read",
             ),
             (
                 "x",
-                r#"{"deny":[{"actions":["service.call"]}]}"#,
-                "not checked for tokens",
+                r#"{"grants":[{"actions":["device.read"],"services":["acme.notify"]}]}"#,
+                "can only name service.call",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["service.call"],"services":[]}]}"#,
+                "must not be empty",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["*","device.command"],"services":["acme.notify"]}]}"#,
+                "can only name service.call",
+            ),
+            (
+                "x",
+                r#"{"grants":[{"actions":["*","token.manage"]}]}"#,
+                "can't grant token.manage",
             ),
             ("x", r#"{"sensitive":["door"]}"#, "unknown"),
             (

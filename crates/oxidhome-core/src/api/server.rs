@@ -3378,6 +3378,11 @@ pub(crate) struct WireEvent {
     /// Instance id of the publishing plugin instance. Same host-
     /// populated / immutable contract as `origin_plugin_id`.
     origin_instance_id: String,
+    /// H6 slice 4: call id of the invocation that published the event,
+    /// when it traces back to an external request (look it up with
+    /// `GET /api/v1/audit?call_id=…`). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
     payload: WireEventPayload,
 }
 
@@ -3504,6 +3509,7 @@ impl WireEvent {
             topic,
             origin_plugin_id: event.origin_plugin_id.clone(),
             origin_instance_id: event.origin_instance_id.clone(),
+            call_id: event.call_id.clone(),
             payload,
         }
     }
@@ -3825,6 +3831,10 @@ pub(crate) struct WireHistoricalEvent {
     instance_id: String,
     plugin_id: String,
     topic: String,
+    /// H6 slice 4: the publishing invocation's call id; see
+    /// [`WireEvent`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<String>,
     payload: WireEventPayload,
 }
 
@@ -3843,6 +3853,7 @@ impl WireHistoricalEvent {
             origin_plugin_id: row.plugin_id.clone(),
             origin_instance_id: row.instance_id.clone(),
             row_id: Some(row.id),
+            call_id: None,
             payload: row.payload,
         };
         // Reuse the tail-side payload projection so a single
@@ -3856,6 +3867,7 @@ impl WireHistoricalEvent {
             instance_id: row.instance_id,
             plugin_id: row.plugin_id,
             topic: row.topic,
+            call_id: row.call_id,
             payload: wire.payload,
         }
     }
@@ -3890,6 +3902,10 @@ struct AuditParams {
     /// Exact `level` match (H6 slice 2): `level=warn` lists the rows
     /// allowed sensitive actions wrote.
     level: Option<String>,
+    /// Exact `caused_by` match (H6 slice 4): with an external request's
+    /// call id, the rows of every `on-event` reaction it caused, however
+    /// deep the chain.
+    caused_by: Option<String>,
     /// Cursor for lossless pagination. Opaque `"<intent_ms>:<id>"`
     /// string returned as `next_cursor` on the previous page.
     /// Callers should not construct it by hand — pass the previous
@@ -3933,6 +3949,7 @@ async fn query_audit(
         path: params.path,
         call_id: params.call_id,
         level: params.level,
+        caused_by: params.caused_by,
         before,
         // F3 self-exclusion: hide the query's own pending intent
         // row from its results.
@@ -4053,6 +4070,10 @@ struct WireAuditEntry {
     /// wrote; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
+    /// H6 slice 4: on an `on-event` reaction's rows, the call id of
+    /// the external request the reaction traces back to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caused_by: Option<String>,
 }
 
 impl WireAuditEntry {
@@ -4079,6 +4100,7 @@ impl WireAuditEntry {
             command_id: row.command_id,
             command_outcome: row.command_outcome,
             level: row.level,
+            caused_by: row.caused_by,
         }
     }
 }
@@ -4577,6 +4599,7 @@ mod tests {
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
                 row_id: None,
+                call_id: None,
                 payload: EventPayload::Button(input),
             };
             let wire = WireEvent::from_host(
@@ -4607,6 +4630,7 @@ mod tests {
             origin_plugin_id: "com.example.publisher".into(),
             origin_instance_id: "publisher-42".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "automation.morning".into(),

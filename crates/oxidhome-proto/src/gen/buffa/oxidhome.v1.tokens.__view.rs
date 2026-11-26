@@ -422,6 +422,13 @@ pub struct SelectorView<'a> {
     ///
     /// Field 3: `devices`
     pub devices: ::buffa::RepeatedView<'a, &'a str>,
+    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+    /// literal or `prefix*`) the entry is narrowed to; empty for every
+    /// service. Narrows `service.call` only and excludes `category` and
+    /// `devices`.
+    ///
+    /// Field 4: `services`
+    pub services: ::buffa::RepeatedView<'a, &'a str>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
@@ -485,6 +492,17 @@ impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
                 )?;
                 view.devices.push(__elem);
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.services.push(__elem);
+            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -510,6 +528,7 @@ impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
             actions: self.actions.iter().map(|s| s.to_string()).collect(),
             category: self.category.iter().map(|s| s.to_string()).collect(),
             devices: self.devices.iter().map(|s| s.to_string()).collect(),
+            services: self.services.iter().map(|s| s.to_string()).collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -528,6 +547,9 @@ impl<'a> ::buffa::ViewEncode<'a> for SelectorView<'a> {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         for v in &self.devices {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        for v in &self.services {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
@@ -549,6 +571,9 @@ impl<'a> ::buffa::ViewEncode<'a> for SelectorView<'a> {
         }
         for v in &self.devices {
             ::buffa::types::put_string_field(3u32, v, buf);
+        }
+        for v in &self.services {
+            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -579,6 +604,9 @@ impl<'__a> ::serde::Serialize for SelectorView<'__a> {
         }
         if !self.devices.is_empty() {
             __map.serialize_entry("devices", &*self.devices)?;
+        }
+        if !self.services.is_empty() {
+            __map.serialize_entry("services", &*self.services)?;
         }
         __map.end()
     }
@@ -691,6 +719,16 @@ impl SelectorOwnedView {
     #[must_use]
     pub fn devices(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().devices
+    }
+    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+    /// literal or `prefix*`) the entry is narrowed to; empty for every
+    /// service. Narrows `service.call` only and excludes `category` and
+    /// `devices`.
+    ///
+    /// Field 4: `services`
+    #[must_use]
+    pub fn services(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().services
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<SelectorView<'static>>>
@@ -1565,7 +1603,9 @@ pub struct TokenView<'a> {
     ///
     /// Field 7: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2013,7 +2053,9 @@ impl TokenOwnedView {
     pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().sensitive
     }
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     #[must_use]
@@ -2440,13 +2482,17 @@ pub struct RoleView<'a> {
     pub role_id: &'a str,
     /// Field 2: `name`
     pub name: &'a str,
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     pub grants: ::buffa::RepeatedView<'a, &'a str>,
     /// Field 4: `sensitive`
     pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     pub deny: ::buffa::RepeatedView<'a, &'a str>,
@@ -2833,7 +2879,9 @@ impl RoleOwnedView {
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     #[must_use]
@@ -2845,7 +2893,9 @@ impl RoleOwnedView {
     pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().sensitive
     }
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     #[must_use]

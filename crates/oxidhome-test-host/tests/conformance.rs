@@ -574,6 +574,7 @@ async fn event_delivery<B: Backend>() {
         origin_plugin_id: "test.publisher".into(),
         origin_instance_id: "publisher".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: "test.ping".into(),
             payload: "{}".into(),

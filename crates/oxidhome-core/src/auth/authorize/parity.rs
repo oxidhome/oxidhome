@@ -1353,11 +1353,13 @@ fn deny_list_beats_every_grant() {
             actions: ActionSet::of(&[Action::DeviceCommand]),
             categories: Some(vec![DeviceCategory::Alarm]),
             devices: None,
+            services: None,
         },
         DenyRule {
             actions: ActionSet::of(&[Action::HostLogs]),
             categories: None,
             devices: None,
+            services: None,
         },
     ];
     for owner in [false, true] {

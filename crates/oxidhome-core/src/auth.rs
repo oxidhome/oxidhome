@@ -43,7 +43,8 @@ pub mod role;
 pub mod sensitive;
 
 pub use authorize::{
-    Action, AuditLevel, Authority, Decision, Obligations, Reason, Resource, ResourceKind, authorize,
+    Action, AuditLevel, Authority, CONSUMES_SERVICES_GRANT, Decision, Obligations, Reason,
+    Resource, ResourceKind, ServiceResource, authorize, authorize_hop,
 };
 pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};

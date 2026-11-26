@@ -620,6 +620,7 @@ fn record_intent_call(
     call_id: Option<&str>,
 ) -> anyhow::Result<u64> {
     let entry = AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

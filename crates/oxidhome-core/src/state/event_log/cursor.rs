@@ -150,6 +150,7 @@ impl HistoricalEvent {
             origin_plugin_id: self.plugin_id,
             origin_instance_id: self.instance_id,
             row_id: Some(self.id),
+            call_id: self.call_id,
             payload: self.payload,
         }
     }
@@ -245,6 +246,7 @@ mod tests {
             origin_plugin_id: "example.test".into(),
             origin_instance_id: "inst".into(),
             row_id: None,
+            call_id: None,
         }
     }
 

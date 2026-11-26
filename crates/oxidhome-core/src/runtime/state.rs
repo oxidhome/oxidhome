@@ -1570,6 +1570,16 @@ impl host_events::Host for PluginState {
         let mut ev = ev;
         ev.origin_plugin_id = self.manifest.plugin.id.clone();
         ev.origin_instance_id = self.instance_id.clone();
+        // H6 slice 4: attribution, host-stamped like the origin. The
+        // external request the publishing invocation traces back to: its
+        // own call id, or for a reaction the call id it reacts to, so a
+        // chain of reactions stays findable under the request's call
+        // id even when a link in it audits nothing. `None` for the
+        // host's own work (`init`, `tick`), so timer-driven events
+        // don't pull their reactions into the audit ledger.
+        ev.call_id = crate::auth::invocation::current()
+            .filter(crate::auth::InvocationContext::is_attributable)
+            .map(|ctx| ctx.caused_by().unwrap_or(ctx.call_id()).to_owned());
 
         // C4 review P2 F2: serialize the payload ONCE, cap on the
         // exact bytes that will hit disk, then hand the same
@@ -2764,6 +2774,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: Vec::new(),
@@ -2778,6 +2789,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: capability.into(),
                 fields: Vec::new(),
@@ -2793,6 +2805,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Button(ButtonEvent::Pressed),
         }
     }
@@ -2804,6 +2817,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: String::new(),
@@ -2880,6 +2894,54 @@ mod tests {
         // C2b: host stamped the origin from the publisher's identity.
         assert_eq!(ev.origin_instance_id, "alpha");
         assert_eq!(ev.origin_plugin_id, "test.fixture");
+    }
+
+    /// H6 slice 4: the host stamps `call_id` with the external request
+    /// an event traces back to: the publishing call's own id, the cause
+    /// a reaction reacts to (so chains of reactions keep the request's
+    /// id), and nothing for the host's own work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_events_publish_stamps_the_originating_request() {
+        use crate::auth::invocation::CURRENT;
+        use crate::auth::{ActorKind, InvocationContext, Principal, Transport};
+        let registry = Arc::new(DeviceRegistry::new());
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe_all();
+        let mut state = shared_state("alpha", registry, bus);
+        let mut publish = async |ctx: Option<InvocationContext>| {
+            let mut forged = custom_event("t");
+            forged.call_id = Some("call-forged".into());
+            match ctx {
+                Some(ctx) => {
+                    CURRENT
+                        .scope(ctx, host_events::Host::publish_event(&mut state, forged))
+                        .await
+                }
+                None => host_events::Host::publish_event(&mut state, forged).await,
+            }
+            .expect("publish");
+            sub.receiver
+                .try_recv()
+                .expect("event delivered")
+                .expect_event()
+                .call_id
+        };
+        let actor = Actor::api("tok", vec!["*".into()]);
+        let root =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+        let root_id = root.call_id().to_owned();
+        assert_eq!(publish(Some(root)).await.as_deref(), Some(root_id.as_str()));
+        let reaction = InvocationContext::reacting_to("alpha", &root_id);
+        assert_ne!(reaction.call_id(), root_id);
+        assert_eq!(
+            publish(Some(reaction)).await.as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            publish(Some(InvocationContext::host_origin("alpha"))).await,
+            None
+        );
+        assert_eq!(publish(None).await, None);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3197,6 +3259,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(events::CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),
@@ -3626,6 +3689,25 @@ mod tests {
             matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("one-of")),
             "got {err:?}",
         );
+        assert!(services.list().is_empty(), "registry must be untouched");
+
+        // H6 slice 4: a local-id outside the service grammar (no `*`,
+        // no `/`, lower-case) is refused before anything registers.
+        for local_id in ["send*", "a/b", "Svc", "", "-svc"] {
+            let err = host_services::Host::register_service(
+                &mut state,
+                ServiceInfo {
+                    local_id: local_id.into(),
+                    ..info(None)
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, WitError::InvalidArgument(ref msg) if msg.contains("local-id")),
+                "{local_id}: {err:?}",
+            );
+        }
         assert!(services.list().is_empty(), "registry must be untouched");
 
         let id = host_services::Host::register_service(&mut state, info(None))
@@ -4095,6 +4177,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "test".into(),
@@ -4270,6 +4353,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "escape-test".into(),
@@ -4303,6 +4387,7 @@ mod tests {
             origin_plugin_id: "x".repeat(MAX_EVENT_PAYLOAD_BYTES),
             origin_instance_id: "y".repeat(MAX_EVENT_PAYLOAD_BYTES),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(
                 crate::host_impl::plugin::oxidhome::plugin::events::CustomEvent {
                     topic: "tiny".into(),

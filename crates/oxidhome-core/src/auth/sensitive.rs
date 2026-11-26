@@ -305,6 +305,7 @@ impl SensitiveGuard {
             command_id: None,
             command_outcome: None,
             level: Some(AUDIT_LEVEL_WARN.to_owned()),
+            caused_by: None,
         };
         // A command's row commits durably before the command runs:
         // a lock that moved must not lose its record to a power cut.

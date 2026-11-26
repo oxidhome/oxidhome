@@ -65,6 +65,11 @@ message Selector {
   // Device ids or `prefix*` patterns the entry is narrowed to; empty
   // for every device.
   repeated string devices = 3;
+  // Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+  // literal or `prefix*`) the entry is narrowed to; empty for every
+  // service. Narrows `service.call` only and excludes `category` and
+  // `devices`.
+  repeated string services = 4;
 }
 
 message CreateTokenResponse {
@@ -93,7 +98,9 @@ message Token {
   repeated string scopes = 6;
   // `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
   repeated string sensitive = 7;
-  // Deny entries as `actions@categories[devices]`.
+  // Deny entries as `actions@categories[devices]`, or `actions{services}`
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string deny = 8;
   // Unix ms.
   int64 created_ms = 9;
@@ -117,10 +124,14 @@ message RoleDefinition {
 message Role {
   string role_id = 1;
   string name = 2;
-  // Grants as `actions@categories[devices]`.
+  // Grants as `actions@categories[devices]`, or `actions{services}`
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string grants = 3;
   repeated string sensitive = 4;
-  // Denies as `actions@categories[devices]`.
+  // Denies as `actions@categories[devices]`, or `actions{services}`
+  // for one narrowed to services (comma-separated patterns; the
+  // pattern grammar admits no comma, space or brace).
   repeated string deny = 5;
   // Ids of the live tokens holding the role.
   repeated string tokens = 6;

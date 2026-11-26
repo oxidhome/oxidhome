@@ -1707,6 +1707,8 @@ fn wit_event_to_proto(mut event: WitEvent, gate: &BytesGate) -> ProtoEvent {
         // code paths that don't hit the durable log — matches the
         // proto3 default and the field's docstring.
         row_id: event.row_id.unwrap_or(0),
+        // H6 slice 4: host-stamped attribution, as on REST.
+        call_id: event.call_id,
         payload,
         ..Default::default()
     }
@@ -1741,6 +1743,7 @@ fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
         actions: s.actions,
         category: none_if_empty(s.category),
         devices: none_if_empty(s.devices),
+        services: none_if_empty(s.services),
     }
 }
 
@@ -2140,6 +2143,7 @@ async fn connect_auth_middleware(
                 // offending key (and field, on a field-level
                 // refusal) in `required_scope`.
                 let entry = crate::state::AuditEntry {
+                    caused_by: None,
                     id: 0,
                     intent_ms: 0,
                     finalized_ms: None,
@@ -2202,6 +2206,7 @@ async fn connect_auth_middleware(
     // (F1) Pre-audit intent — same shape as the JSON middleware.
     // Fail-closed on ledger error.
     let intent = crate::state::AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,
@@ -2338,6 +2343,45 @@ fn connect_error_response(err: ConnectError, req_headers: &HeaderMap) -> AxumRes
 #[cfg(test)]
 mod command_report_tests {
     use super::*;
+
+    /// H6 slice 4: a Connect event carries the host-stamped call id,
+    /// and leaves it unset when the host started the work.
+    #[test]
+    fn events_carry_their_call_id() {
+        use crate::host_impl::plugin::oxidhome::plugin::events::{CustomEvent, EventPayload};
+        let engine = Engine::new().expect("engine");
+        let gate = BytesGate::deny_all(&engine);
+        let event = |call_id: Option<&str>| WitEvent {
+            device: None,
+            timestamp: 1,
+            payload: EventPayload::Custom(CustomEvent {
+                topic: "t".into(),
+                payload: "{}".into(),
+            }),
+            origin_plugin_id: "p".into(),
+            origin_instance_id: "i".into(),
+            row_id: Some(7),
+            call_id: call_id.map(str::to_owned),
+        };
+        let proto = wit_event_to_proto(event(Some("call-0123")), &gate);
+        assert_eq!(proto.call_id.as_deref(), Some("call-0123"));
+        assert_eq!(proto.row_id, 7);
+        assert_eq!(wit_event_to_proto(event(None), &gate).call_id, None);
+    }
+
+    /// H6 slice 4: a Connect role or token selector keeps its
+    /// `services` narrowing (dropping it would widen the grant).
+    #[test]
+    fn selectors_carry_services() {
+        let spec = selector_spec(ProtoSelector {
+            actions: vec!["service.call".into()],
+            services: vec!["acme.notify/push".into()],
+            ..ProtoSelector::default()
+        });
+        assert_eq!(spec.services, Some(vec!["acme.notify/push".to_owned()]));
+        assert_eq!(spec.category, None);
+        assert_eq!(selector_spec(ProtoSelector::default()).services, None);
+    }
 
     /// M7 + H5: Connect withholds a `completed` report's `bytes-val`
     /// state from a caller without `blobs:read`.

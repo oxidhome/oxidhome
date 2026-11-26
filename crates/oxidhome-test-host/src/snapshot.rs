@@ -1642,6 +1642,7 @@ mod tests {
             command_id: None,
             command_outcome: Some("rejected".into()),
             level: Some("warn".into()),
+            caused_by: None,
         };
         assert_eq!(
             render_audit_row(&row),

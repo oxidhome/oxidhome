@@ -936,6 +936,7 @@ fn new_audit_entry(
         command_id: None,
         command_outcome: None,
         level: None,
+        caused_by: None,
     }
 }
 

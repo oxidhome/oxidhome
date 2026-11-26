@@ -161,8 +161,9 @@ pub fn complete_command(command_id: &str, reply: &CommandResult) -> Result<(), E
 /// - [`Error::PermissionDenied`] when the manifest's
 ///   `[capabilities] declares_services` didn't authorize the
 ///   service's `name`.
-/// - [`Error::InvalidArgument`] when `local_id` collides with
-///   another live service registered by this instance.
+/// - [`Error::InvalidArgument`] when `local_id` isn't 1-64 of `a-z`,
+///   `0-9`, `.`, `_`, `-` starting with a letter or digit, or collides
+///   with another live service registered by this instance.
 pub fn register_service(service: impl Into<ServiceInfo>) -> Result<ServiceId, Error> {
     host_services::register_service(&service.into())
 }
@@ -256,7 +257,8 @@ pub fn resolve_service(
 ///
 /// [`Error::NotFound`] (no such service),
 /// [`Error::PermissionDenied`] (no matching `consumes_services`
-/// grant), [`Error::InvalidArgument`] (same-instance target,
+/// grant, or, for work a token started, the token may not call this
+/// service), [`Error::InvalidArgument`] (same-instance target,
 /// A→…→A cycle, a command the target doesn't declare, or `args`
 /// that violate its `params` schema), [`Error::Internal`] (the
 /// target's reply violates its `returns` schema),
@@ -324,6 +326,7 @@ pub fn publish_state_change(
         // overwrites `None` with the durable `event_log` id
         // before broadcasting.
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: capability.into(),
             fields,
@@ -348,6 +351,7 @@ pub fn publish_custom_event(
         origin_plugin_id: String::new(),
         origin_instance_id: String::new(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: topic.into(),
             payload: payload.into(),

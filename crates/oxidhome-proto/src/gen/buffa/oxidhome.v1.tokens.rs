@@ -287,6 +287,18 @@ pub struct Selector {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub devices: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
+    /// literal or `prefix*`) the entry is narrowed to; empty for every
+    /// service. Narrows `service.call` only and excludes `category` and
+    /// `devices`.
+    ///
+    /// Field 4: `services`
+    #[serde(
+        rename = "services",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub services: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -297,6 +309,7 @@ impl ::core::fmt::Debug for Selector {
             .field("actions", &self.actions)
             .field("category", &self.category)
             .field("devices", &self.devices)
+            .field("services", &self.services)
             .finish()
     }
 }
@@ -336,6 +349,9 @@ impl ::buffa::Message for Selector {
         for v in &self.devices {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
+        for v in &self.services {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -354,6 +370,9 @@ impl ::buffa::Message for Selector {
         }
         for v in &self.devices {
             ::buffa::types::put_string_field(3u32, v, buf);
+        }
+        for v in &self.services {
+            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -401,6 +420,17 @@ impl ::buffa::Message for Selector {
                 )?;
                 self.devices.push(__elem);
             }
+            4u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.services.push(__elem);
+            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -412,6 +442,7 @@ impl ::buffa::Message for Selector {
         self.actions.clear();
         self.category.clear();
         self.devices.clear();
+        self.services.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -913,7 +944,9 @@ pub struct Token {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Deny entries as `actions@categories[devices]`.
+    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 8: `deny`
     #[serde(
@@ -1475,7 +1508,9 @@ pub struct Role {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Grants as `actions@categories[devices]`.
+    /// Grants as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 3: `grants`
     #[serde(
@@ -1491,7 +1526,9 @@ pub struct Role {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Denies as `actions@categories[devices]`.
+    /// Denies as `actions@categories[devices]`, or `actions{services}`
+    /// for one narrowed to services (comma-separated patterns; the
+    /// pattern grammar admits no comma, space or brace).
     ///
     /// Field 5: `deny`
     #[serde(

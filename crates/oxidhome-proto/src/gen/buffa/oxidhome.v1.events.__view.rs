@@ -769,6 +769,15 @@ pub struct EventView<'a> {
     ///
     /// Field 9: `row_id`
     pub row_id: u64,
+    /// H6: call id (`call-<32 hex>`) of the external request this event
+    /// traces back to (the publishing call's own, or for an `on-event`
+    /// reaction the one it reacts to). Unset for work the host started
+    /// on its own. **Host-populated**; attribution only, it grants
+    /// nothing. Mirror of WIT `event.call-id`; follow it into the audit
+    /// ledger with `GET /api/v1/audit?call_id=` / `?caused_by=`.
+    ///
+    /// Field 10: `call_id`
+    pub call_id: ::core::option::Option<&'a str>,
     pub payload: ::core::option::Option<
         super::super::__buffa::view::oneof::event::Payload<'a>,
     >,
@@ -836,6 +845,13 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.row_id = ::buffa::types::decode_uint64(&mut cur)?;
+            }
+            10u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                view.call_id = Some(::buffa::types::borrow_str(&mut cur)?);
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -988,6 +1004,7 @@ impl<'a> ::buffa::MessageView<'a> for EventView<'a> {
             origin_plugin_id: self.origin_plugin_id.to_string(),
             origin_instance_id: self.origin_instance_id.to_string(),
             row_id: self.row_id,
+            call_id: self.call_id.map(|s| s.to_string()),
             payload: match self.payload.as_ref() {
                 ::core::option::Option::Some(v) => {
                     ::core::option::Option::Some(
@@ -1100,6 +1117,9 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         if self.row_id != 0u64 {
             size += 1u64 + ::buffa::types::uint64_encoded_len(self.row_id) as u64;
         }
+        if let Some(ref v) = self.call_id {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -1162,6 +1182,9 @@ impl<'a> ::buffa::ViewEncode<'a> for EventView<'a> {
         if self.row_id != 0u64 {
             ::buffa::types::put_uint64_field(9u32, self.row_id, buf);
         }
+        if let Some(ref v) = self.call_id {
+            ::buffa::types::put_string_field(10u32, v, buf);
+        }
         self.__buffa_unknown_fields.write_to(buf);
     }
 }
@@ -1205,6 +1228,9 @@ impl<'__a> ::serde::Serialize for EventView<'__a> {
                     "rowId",
                     &::buffa::json_helpers::ProtoJson(&self.row_id),
                 )?;
+        }
+        if let ::core::option::Option::Some(__v) = self.call_id {
+            __map.serialize_entry("callId", __v)?;
         }
         if let ::core::option::Option::Some(ref __ov) = self.payload {
             match __ov {
@@ -1361,6 +1387,18 @@ impl EventOwnedView {
     #[must_use]
     pub fn row_id(&self) -> u64 {
         self.0.reborrow().row_id
+    }
+    /// H6: call id (`call-<32 hex>`) of the external request this event
+    /// traces back to (the publishing call's own, or for an `on-event`
+    /// reaction the one it reacts to). Unset for work the host started
+    /// on its own. **Host-populated**; attribution only, it grants
+    /// nothing. Mirror of WIT `event.call-id`; follow it into the audit
+    /// ledger with `GET /api/v1/audit?call_id=` / `?caused_by=`.
+    ///
+    /// Field 10: `call_id`
+    #[must_use]
+    pub fn call_id(&self) -> ::core::option::Option<&'_ str> {
+        self.0.reborrow().call_id
     }
     /// Oneof `payload`.
     #[must_use]

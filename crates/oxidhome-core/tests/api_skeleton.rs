@@ -1502,6 +1502,7 @@ async fn events_tail_ws_round_trip_with_real_listener() {
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
                 row_id: None,
+                call_id: None,
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "api-e2e.toggle".into(),
                     payload: String::new(),
@@ -3579,6 +3580,7 @@ async fn connect_events_tail_streams_a_custom_event() {
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
                 row_id: None,
+                call_id: None,
                 payload: EventPayload::Custom(CustomEvent {
                     topic: "connect-e2e.toggle".into(),
                     payload: String::new(),
@@ -3696,6 +3698,7 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
                 origin_plugin_id: String::new(),
                 origin_instance_id: String::new(),
                 row_id: None,
+                call_id: None,
                 payload: EventPayload::StateChanged(StateChange {
                     capability: "switch".into(),
                     fields: vec![KeyValue {
@@ -3802,6 +3805,7 @@ async fn events_query_returns_recorded_rows_with_durable_ids() {
         origin_plugin_id: "com.example.recorder".into(),
         origin_instance_id: "recorder-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: "history.first".into(),
             payload: "{}".into(),
@@ -3813,6 +3817,7 @@ async fn events_query_returns_recorded_rows_with_durable_ids() {
         origin_plugin_id: "com.example.recorder".into(),
         origin_instance_id: "recorder-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::Custom(CustomEvent {
             topic: "history.second".into(),
             payload: "{}".into(),
@@ -3909,6 +3914,7 @@ async fn events_query_after_id_returns_only_newer_rows() {
             origin_plugin_id: "com.example.cursor".into(),
             origin_instance_id: "cur-a".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: format!("cursor.{i}"),
                 payload: "{}".into(),
@@ -3977,6 +3983,7 @@ async fn events_query_state_changed_exposes_fields() {
         origin_plugin_id: "com.example.switch".into(),
         origin_instance_id: "sw-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: "switch".into(),
             fields: vec![KeyValue {
@@ -4046,6 +4053,7 @@ async fn publisher_order_sequencer_preserves_row_id_order() {
             origin_plugin_id: "com.example.seq".into(),
             origin_instance_id: "seq-a".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: format!("seq.{id}"),
                 payload: String::new(),

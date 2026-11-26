@@ -89,14 +89,27 @@
 //! so a refused call spends no refcount and cannot influence
 //! `remove-service` timing.
 //!
-//! **Delegation audit (H6)**: when the invocation is rooted at an
-//! external principal (REST / Connect / MCP), every hop is written to
-//! the audit ledger with the root's `token_id` / `actor_kind`, the
-//! root's `call_id`, and the context JSON (root, executing actor,
-//! chain). Allowed hops use the same two-phase intent/finalize contract
-//! as API requests and fail closed if the intent cannot be written;
-//! grant refusals are single-shot `deny` rows. Host-origin chains
-//! (`init`, `tick`, `on-event`) are traced but not audited.
+//! **Root authority (H6 slice 4)**: the grant gate is one half of the
+//! hop decision. [`crate::auth::authorize_hop`] combines it with the
+//! root's own authority: when the invocation is rooted at an external
+//! principal, the root must hold `service.call` on the target (the
+//! `services:call` scope, or a role grant whose `services` selector
+//! covers it) and none of its denies may match. A narrow token can't
+//! have a script call services on its behalf that the token itself
+//! wasn't given. Host-rooted work is decided by the grant alone.
+//!
+//! **Delegation audit (H6)**: when the invocation is attributable
+//! (rooted at an external principal, or an `on-event` reaction to an
+//! event such an invocation published), every hop is written to the
+//! audit ledger with the root's `token_id` / `actor_kind`, the
+//! root's `call_id`, `caused_by` for a reaction, and the context JSON
+//! (root, executing actor, chain). Allowed hops use the same two-phase
+//! intent/finalize contract as API requests and fail closed if the
+//! intent cannot be written; refusals are single-shot `deny` rows
+//! whose `required_scope` names what was missing (`consumes_services`
+//! for the plugin's grant, `services:call` or `deny` for the root).
+//! Other host-origin chains (`init`, `tick`, reactions to unattributed
+//! events) are traced but not audited.
 //!
 //! The finalize goes through the H5 command journal (it can come from a
 //! `Drop` when the caller is cancelled, and the journal is drained at
@@ -109,7 +122,8 @@ use std::time::Duration;
 
 use oxidhome_manifest::ServiceGrant;
 
-use crate::auth::invocation::{self, DelegationHop, InvocationContext};
+use crate::auth::invocation::{self, DelegationHop, InvocationContext, audit_cap};
+use crate::auth::{Action, CONSUMES_SERVICES_GRANT, Resource, authorize_hop};
 use crate::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use crate::host_impl::plugin::oxidhome::plugin::types::{Error as WitError, KeyValue, ServiceId};
 use crate::state::{AuditEntry, AuditLog, ServiceRegistry};
@@ -240,8 +254,9 @@ pub async fn call_service_from_host_in(
 /// owner_instance, local_id, command)`, and hops to the owning
 /// instance's supervisor via `instances`.
 ///
-/// `audit` receives one row per hop of an externally-rooted invocation
-/// (H6); `None` disables hop auditing (unit tests only). `journal` (the
+/// `audit` receives one row per hop of an attributable invocation (H6:
+/// externally rooted, or a reaction to an attributed event); `None`
+/// disables hop auditing (unit tests only). `journal` (the
 /// engine's pending-command table) finalizes the hop rows; without one
 /// the finalize is a detached blocking write.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -318,7 +333,7 @@ pub(crate) async fn call_service(
         target_service: target_local_id.clone(),
     });
     let hop_audit = audit
-        .filter(|_| callee_ctx.root().is_external())
+        .filter(|_| callee_ctx.is_attributable())
         .map(|log| HopAudit::new(Arc::clone(log), journal.cloned(), &callee_ctx, &command));
 
     // H6: refuse work the root has already given up on — before the
@@ -379,7 +394,47 @@ pub(crate) async fn call_service(
         &target_local_id,
         &command,
     );
-    if !(matches_requested && matches_granted) {
+    // H6 slice 4: the hop decision — the plugin's grant above, plus
+    // the root's own permit and denies when the root is external.
+    let decision = authorize_hop(
+        &callee_ctx,
+        Action::ServiceCall,
+        // The command is caller-supplied and unchecked until after
+        // authorization: bound it before it's copied or echoed.
+        &Resource::service(
+            target_plugin_id.as_str(),
+            target_instance.as_str(),
+            target_local_id.as_str(),
+            audit_cap(&command),
+        ),
+        CONSUMES_SERVICES_GRANT,
+        matches_requested && matches_granted,
+    );
+    if decision.allow {
+        // `service.call` targets carry no sensitive category yet, so
+        // an allowed hop has no obligations to meet. When services can
+        // be marked sensitive, the charge is made here, at dispatch.
+        debug_assert!(decision.obligations.sensitive.is_empty());
+    } else if matches_requested && matches_granted {
+        // The plugin may make the call; the root may not have it made.
+        // The reason stays in the audit row.
+        if let Some(hop_audit) = hop_audit {
+            hop_audit
+                .record_denied(
+                    wait_until,
+                    decision.reason.audit_label().unwrap_or("no-permit"),
+                )
+                .await;
+        }
+        return Err(WitError::PermissionDenied(format!(
+            "caller `{caller_instance}` refused: invocation `{}` was not granted \
+             `service.call` on target `{target_plugin_id}` service `{target_local_id}` \
+             command `{}` by its root principal (a token needs `services:call` or a \
+             role grant naming the service for every hop it causes)",
+            callee_ctx.call_id(),
+            audit_cap(&command),
+        )));
+    } else {
         // Wording notes: this error also flows through
         // `call_service_from_host`, which passes explicit slices
         // and has no "manifest" behind it — the guidance below
@@ -398,17 +453,20 @@ pub(crate) async fn call_service(
             (true, true) => unreachable!("both matched but guard fired"),
         };
         if let Some(hop_audit) = hop_audit {
-            hop_audit.record_denied(wait_until).await;
+            hop_audit
+                .record_denied(wait_until, CONSUMES_SERVICES_GRANT)
+                .await;
         }
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: {failed_clause} a matching \
              `consumes_services` selector for target \
              `{target_plugin_id}` instance `{target_instance}` service \
-             `{target_local_id}` command `{command}` (caller_instance \
+             `{target_local_id}` command `{}` (caller_instance \
              `{caller_instance}` must match too). For plugin callers, add \
              a matching `[[capabilities.consumes_services]]` entry to the \
              caller's manifest and ensure the operator's granted copy \
-             authorizes the same selector"
+             authorizes the same selector",
+            audit_cap(&command),
         )));
     }
 
@@ -650,8 +708,9 @@ impl std::fmt::Debug for ResultCheck {
 
 /// The [`SERVICE_CALL_RESULT_AUDIT_METHOD`] row for a service call's
 /// `result` that reached the callee's supervisor after the caller
-/// stopped waiting. `None` for host-origin invocations, which stay out
-/// of the ledger as their hops do.
+/// stopped waiting. `None` for invocations that aren't attributable
+/// (host-origin work other than a reaction to an attributed event),
+/// which stay out of the ledger as their hops do.
 ///
 /// `result` is the reply after its schema check: an `Err` (the callee
 /// ran but broke its `returns`) is `failed` / `internal` with outcome
@@ -662,7 +721,7 @@ pub(crate) fn late_result_entry(
     result: Result<&CommandResult, &WitError>,
 ) -> Option<AuditEntry> {
     let root = callee_ctx.root();
-    if !root.is_external() {
+    if !callee_ctx.is_attributable() {
         return None;
     }
     let path = hop_path(callee_ctx, command)?;
@@ -700,6 +759,7 @@ pub(crate) fn late_result_entry(
         command_id: None,
         level: None,
         command_outcome: Some(outcome.to_owned()),
+        caused_by: callee_ctx.caused_by().map(str::to_owned),
     })
 }
 
@@ -716,7 +776,7 @@ fn result_columns(result: &CommandResult) -> (Option<&'static str>, Option<&'sta
 }
 
 /// Audit writer for one delegated hop (H6). Built only for
-/// externally-rooted invocations.
+/// attributable invocations ([`InvocationContext::is_attributable`]).
 #[derive(Clone)]
 struct HopAudit {
     log: Arc<AuditLog>,
@@ -752,8 +812,8 @@ impl HopAudit {
             invocation: Some(callee_ctx.audit_json()),
             command_id: None,
             command_outcome: None,
-
             level: None,
+            caused_by: callee_ctx.caused_by().map(str::to_owned),
         };
         Self {
             log,
@@ -767,11 +827,11 @@ impl HopAudit {
     /// a plugin looping on refused calls could queue blocking ledger
     /// writes without bound. The refusal itself never depends on the
     /// write.
-    async fn record_denied(self, wait_until: tokio::time::Instant) {
+    async fn record_denied(self, wait_until: tokio::time::Instant, label: &str) {
         let Self { log, mut entry, .. } = self;
         entry.status = 403;
         entry.decision = "deny".into();
-        entry.required_scope = Some("consumes_services".into());
+        entry.required_scope = Some(label.to_owned());
         let write = tokio::task::spawn_blocking(move || log.record_completed(&entry));
         match tokio::time::timeout_at(wait_until, write).await {
             Ok(Ok(Ok(_))) => {}
@@ -1447,5 +1507,171 @@ mod tests {
         assert_eq!(inv["root"]["transport"], "rest");
         assert_eq!(inv["chain"][0]["caller"], "alpha");
         assert_eq!(inv["chain"][0]["instance"], "beta");
+    }
+
+    /// H6 slice 4: the root's permit is asked on every hop, not just
+    /// the first. A token that may call `ring` of `com.example.alpha`
+    /// (the first hop) can't have alpha's wasm call beta's `ring`,
+    /// although alpha's own grant allows it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inner_hop_needs_the_roots_permit_too() {
+        use crate::auth::{
+            Action, ActionSet, Actor, ActorKind, Principal, RoleDef, RoleGrant, Transport,
+        };
+        use crate::state::{AuditQuery, Db};
+
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+        let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
+        let grants = [grant_any("com.example.beta", "ring", "kick")];
+        let actor = Actor::api("tok-scene", Vec::new()).with_roles(vec![Arc::new(RoleDef {
+            id: "role-0123456789abcdef".into(),
+            name: "scene".into(),
+            grants: vec![RoleGrant {
+                actions: ActionSet::of(&[Action::ServiceCall]),
+                categories: None,
+                devices: None,
+                services: Some(vec!["com.example.alpha/ring".into()]),
+            }],
+            sensitive: Vec::new(),
+            deny: Vec::new(),
+        })]);
+        // The first hop (driver → alpha) is already on the chain.
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+                .delegate(DelegationHop {
+                    caller_instance: "driver".into(),
+                    target_plugin: "com.example.alpha".into(),
+                    target_instance: "alpha".into(),
+                    target_service: "ring".into(),
+                });
+        let call_id = ctx.call_id().to_owned();
+        let err = invocation::CURRENT
+            .scope(
+                ctx,
+                call_service(
+                    &services,
+                    &instances,
+                    Some(&audit),
+                    None,
+                    "alpha".into(),
+                    &grants,
+                    &grants,
+                    target.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("the root may not call beta");
+        assert!(matches!(err, WitError::PermissionDenied(_)), "got {err:?}");
+        assert_msg_contains(&err, "root principal");
+        assert_eq!(services.active_call_count(&target), 0);
+        let rows = audit
+            .query(
+                &AuditQuery {
+                    call_id: Some(call_id),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].required_scope.as_deref(), Some("no-permit"));
+        assert_eq!(rows[0].token_id, "tok-scene");
+
+        // A wildcard command grant lets an unchecked, oversized command
+        // name reach the root check: the refusal doesn't echo it whole.
+        let any = [grant_any("com.example.beta", "ring", "*")];
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
+                .delegate(DelegationHop {
+                    caller_instance: "driver".into(),
+                    target_plugin: "com.example.alpha".into(),
+                    target_instance: "alpha".into(),
+                    target_service: "ring".into(),
+                });
+        let err = invocation::CURRENT
+            .scope(
+                ctx,
+                call_service(
+                    &services,
+                    &instances,
+                    Some(&audit),
+                    None,
+                    "alpha".into(),
+                    &any,
+                    &any,
+                    target.clone(),
+                    "x".repeat(100_000),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("still refused");
+        let WitError::PermissionDenied(msg) = &err else {
+            panic!("got {err:?}")
+        };
+        assert!(msg.len() < 1_000, "{} bytes", msg.len());
+    }
+
+    /// H6 slice 4: a reaction to an attributed event is host-rooted —
+    /// the plugin's own grant decides — but audited, with `caused_by`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reaction_hops_are_audited_with_caused_by() {
+        use crate::state::{AuditQuery, Db};
+
+        let services = Arc::new(ServiceRegistry::new());
+        let target = services
+            .register(
+                "beta".into(),
+                "com.example.beta".into(),
+                fixture_info("ring"),
+            )
+            .expect("register");
+        let instances = Arc::new(InstanceRegistry::new());
+        let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
+        let ctx = InvocationContext::reacting_to("alpha", "call-cause");
+        assert!(ctx.is_attributable());
+        let _ = invocation::CURRENT
+            .scope(
+                ctx,
+                call_service(
+                    &services,
+                    &instances,
+                    Some(&audit),
+                    None,
+                    "alpha".into(),
+                    &[],
+                    &[],
+                    target.clone(),
+                    "kick".into(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .expect_err("no grant");
+        let rows = audit
+            .query(
+                &AuditQuery {
+                    caused_by: Some("call-cause".into()),
+                    ..AuditQuery::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.required_scope.as_deref(), Some("consumes_services"));
+        assert_eq!(row.token_id, "alpha");
+        assert_eq!(row.actor_kind, "plugin");
+        assert_ne!(row.call_id.as_deref(), Some("call-cause"));
     }
 }

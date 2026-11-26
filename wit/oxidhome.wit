@@ -523,7 +523,12 @@ interface services {
 
   record service-info {
     /// Plugin-instance-local id, echoed back so the plugin can map the
-    /// host-assigned `service-id` to its own bookkeeping.
+    /// host-assigned `service-id` to its own bookkeeping. The
+    /// service's immutable key: grants (`consumes_services.service`)
+    /// and role selectors (`<plugin>/<local-id>`) name it. 1-64 of
+    /// `a-z`, `0-9`, `.`, `_`, `-`, starting with a letter or digit
+    /// (so never `*` or `/`); `register-service` refuses anything
+    /// else with `invalid-argument`.
     local-id: local-id,
     /// Human-readable name. Also the capability key gated by the
     /// manifest's `[capabilities] declares_services`.
@@ -610,6 +615,17 @@ interface events {
     /// that don't hit the durable log (unusual in production; can
     /// happen in host-side test fixtures).
     row-id: option<u64>,
+    /// H6: call id (`call-<32 hex>`) of the external request this
+    /// event traces back to: the publishing invocation's own call id
+    /// when a token caused it, or, when an `on-event` reaction
+    /// published it, the call id that reaction traces back to (so
+    /// every event in a chain of reactions names the same request).
+    /// `none` for work the host started on its own (`init`, `tick`). **Host-populated on publish** —
+    /// any value a plugin passes is overwritten. Attribution only: an
+    /// operator follows it into the audit ledger
+    /// (`GET /api/v1/audit?call_id=…`); it grants nothing, and a
+    /// subscriber's `on-event` runs with its own authority.
+    call-id: option<string>,
     payload: event-payload,
   }
 
@@ -1206,7 +1222,9 @@ interface host-services {
   /// with an already-registered service in the same instance
   /// (`invalid-argument`). Callers of `resolve-service` /
   /// `call-service` address the service by this key, and no
-  /// downstream call can mutate it.
+  /// downstream call can mutate it. A `local-id` outside the
+  /// service grammar (see `service-info.local-id`) is refused with
+  /// `invalid-argument`.
   register-service: func(info: service-info) -> result<service-id, error>;
   /// Replace an already-registered service's info. H10: `local-id`
   /// is immutable — a call whose `info.local-id` differs from the
@@ -1276,6 +1294,17 @@ interface host-services {
   /// consulted, so the manifest still acts as a ceiling on what
   /// the plugin can be authorized to invoke.
   ///
+  /// **Root authority (H6).** When the invocation making the call
+  /// is rooted at an external request (a token's command or service
+  /// call, and every call-service hop it leads to), the call also
+  /// needs that request's own permission for `service.call` on the
+  /// target, and none of its denies may match. A plugin's grant
+  /// never extends what the requester may do. Work the host started
+  /// (`init`, `tick`, and every `on-event`, including a reaction to
+  /// an event whose `call-id` names a request) is decided by the
+  /// plugin's grants alone: an event attributes, it doesn't
+  /// delegate.
+  ///
   /// Because the authorization key is the service's immutable
   /// `local-id`, a callee that renames its service via
   /// `update-service` cannot silently shadow a grant. The
@@ -1314,7 +1343,7 @@ interface host-services {
   ///
   /// Errors: `not-found` (no such service); `permission-denied`
   /// (no matching entry in the caller's `consumes_services`
-  /// grants); `invalid-argument` (same-instance target, A→…→A
+  /// grants, or the originating request may not make this call); `invalid-argument` (same-instance target, A→…→A
   /// cycle, a command the service's `command-spec` list doesn't
   /// declare, or `args` that violate its `params` schema);
   /// `internal` (the callee's `ok-with-state` reply violates the

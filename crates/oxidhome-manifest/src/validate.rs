@@ -41,7 +41,7 @@ pub enum ValidationError {
     #[error(
         "plugin.id `{got}` does not match the reverse-DNS shape \
          (`[a-z0-9][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)+` — every label must start with \
-         `[a-z0-9]`; e.g. `example.simulated-switch`)"
+         `[a-z0-9]`, at most 255 bytes; e.g. `example.simulated-switch`)"
     )]
     InvalidPluginId { got: String },
 
@@ -81,6 +81,12 @@ pub enum ValidationError {
         count: usize,
         max: usize,
     },
+
+    #[error(
+        "capabilities.consumes_services[{index}].service `{service}` is not a service \
+         local-id: 1-64 of `a-z`, `0-9`, `.`, `_`, `-`, starting with a letter or digit"
+    )]
+    InvalidServiceLocalId { index: usize, service: String },
 
     #[error(
         "capabilities.reads_state has {count} entries; the cap is {max}. \
@@ -515,6 +521,12 @@ pub fn check_capability_limits(
         }
     }
     for (index, grant) in caps.consumes_services.iter().enumerate() {
+        if !is_service_local_id(&grant.service) {
+            errors.push(ValidationError::InvalidServiceLocalId {
+                index,
+                service: grant.service.clone(),
+            });
+        }
         if grant.commands.len() > MAX_COMMANDS_PER_GRANT {
             errors.push(ValidationError::TooManyCommandsPerGrant {
                 index,
@@ -523,6 +535,27 @@ pub fn check_capability_limits(
             });
         }
     }
+}
+
+/// Longest `plugin.id` a manifest may declare: the id is the plugin's
+/// directory name on install, so it fits a filesystem name (`NAME_MAX`,
+/// 255 bytes), and a role selector can always name it exactly.
+pub const MAX_PLUGIN_ID_BYTES: usize = 255;
+
+/// Longest service `local-id` the host accepts.
+pub const MAX_SERVICE_LOCAL_ID_BYTES: usize = 64;
+
+/// `true` for a service `local-id`: 1 to [`MAX_SERVICE_LOCAL_ID_BYTES`]
+/// of `a-z`, `0-9`, `.`, `_`, `-`, starting with a letter or digit. No
+/// `*` (the grant and selector wildcard) and no `/` (which splits
+/// `<plugin>/<local-id>` in role selectors).
+#[must_use]
+pub fn is_service_local_id(id: &str) -> bool {
+    (1..=MAX_SERVICE_LOCAL_ID_BYTES).contains(&id.len())
+        && id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && id.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// Standalone wrapper around [`check_capability_limits`] for
@@ -646,7 +679,7 @@ pub fn validate(m: &PluginManifest) -> Result<(), Vec<ValidationError>> {
         });
     }
 
-    if !is_reverse_dns(&m.plugin.id) {
+    if m.plugin.id.len() > MAX_PLUGIN_ID_BYTES || !is_reverse_dns(&m.plugin.id) {
         errors.push(ValidationError::InvalidPluginId {
             got: m.plugin.id.clone(),
         });
@@ -1501,6 +1534,57 @@ mod tests {
 
     /// H10 round-4: manifest with a grant whose `commands` list
     /// exceeds [`MAX_COMMANDS_PER_GRANT`] is refused.
+    #[test]
+    fn overlong_plugin_ids_are_refused() {
+        let mut m = ok_manifest();
+        m.plugin.id = format!("{}.b", "a".repeat(MAX_PLUGIN_ID_BYTES - 2));
+        assert!(validate(&m).is_ok());
+        m.plugin.id.insert(0, 'a');
+        let errs = validate(&m).expect_err("refused");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::InvalidPluginId { .. })),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn service_local_ids_are_validated() {
+        for good in ["counter", "svc-1", "a", "house.mode_2", "0x"] {
+            assert!(is_service_local_id(good), "{good}");
+        }
+        let long = "a".repeat(MAX_SERVICE_LOCAL_ID_BYTES + 1);
+        for bad in [
+            "",
+            "*",
+            "send*",
+            "a/b",
+            "Send",
+            "-x",
+            ".x",
+            "a b",
+            long.as_str(),
+        ] {
+            assert!(!is_service_local_id(bad), "{bad}");
+        }
+        let mut m = ok_manifest();
+        m.capabilities.consumes_services = vec![crate::manifest::ServiceGrant {
+            plugin: "example.other".into(),
+            instance: "*".into(),
+            service: "send*".into(),
+            commands: vec!["go".into()],
+            caller_instance: "*".into(),
+        }];
+        let errs = validate(&m).expect_err("refused");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                ValidationError::InvalidServiceLocalId { index: 0, service } if service == "send*"
+            )),
+            "{errs:?}"
+        );
+    }
+
     #[test]
     fn consumes_services_grants_reject_too_many_commands() {
         use crate::manifest::ServiceGrant;

@@ -20,6 +20,10 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tower::ServiceExt as _;
 
+fn call_id(n: u64) -> String {
+    format!("call-{n:032x}")
+}
+
 fn event(n: u64) -> Event {
     Event {
         device: None,
@@ -27,6 +31,9 @@ fn event(n: u64) -> Event {
         origin_plugin_id: "com.example.resume".into(),
         origin_instance_id: "resume-a".into(),
         row_id: None,
+        // Even events are attributed, so replay and live delivery can
+        // both be checked to carry the id.
+        call_id: n.is_multiple_of(2).then(|| call_id(n)),
         payload: EventPayload::Custom(CustomEvent {
             topic: "resume.test".into(),
             payload: n.to_string(),
@@ -333,6 +340,17 @@ async fn connect_tail_resumes_from_cursor() {
     let (messages, _) = connect_messages(body, 3).await;
     let ids: Vec<&Value> = messages.iter().map(|m| &m["event"]["rowId"]).collect();
     assert_eq!(ids, ["2", "3", "4"]);
+    // H6 slice 4: the call id survives replay from history (2) and
+    // live delivery (4); an unattributed event (3) has none.
+    let calls: Vec<&Value> = messages.iter().map(|m| &m["event"]["callId"]).collect();
+    assert_eq!(
+        calls,
+        [
+            &Value::String(call_id(2)),
+            &Value::Null,
+            &Value::String(call_id(4))
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -429,6 +447,7 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
         origin_plugin_id: "com.example.resume".into(),
         origin_instance_id: "resume-a".into(),
         row_id: None,
+        call_id: None,
         payload: EventPayload::StateChanged(StateChange {
             capability: "camera".into(),
             fields: vec![KeyValue {

@@ -974,6 +974,18 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (instance_id, host, port, installation_uuid)
     ) WITHOUT ROWID;
     ",
+    // 25 — H6 slice 4: events carry attribution. `event_log.call_id` is
+    // the call id of the attributable invocation that published the
+    // event (an external request, or an `on-event` reaction to one);
+    // `audit_event.caused_by` is, on a reaction's rows, the call id of
+    // the event it reacts to. Both NULL on older rows; both indexed
+    // (partial) so "everything request X caused" is a lookup.
+    "
+    ALTER TABLE event_log ADD COLUMN call_id TEXT;
+    CREATE INDEX event_log_call_id ON event_log(call_id) WHERE call_id IS NOT NULL;
+    ALTER TABLE audit_event ADD COLUMN caused_by TEXT;
+    CREATE INDEX audit_caused_by ON audit_event(caused_by) WHERE caused_by IS NOT NULL;
+    ",
 ];
 
 /// File name of the host database inside the state dir.
@@ -1978,6 +1990,32 @@ mod tests {
         .expect("read");
     }
 
+    /// H6 slice 4 (migration 25): lookups by request call id use the
+    /// partial indexes on `event_log.call_id` and
+    /// `audit_event.caused_by`.
+    #[test]
+    fn attribution_lookups_are_indexed() {
+        let db = Db::open_in_memory().expect("open");
+        db.read(|c| -> rusqlite::Result<()> {
+            for (sql, index) in [
+                (
+                    "SELECT id FROM event_log WHERE call_id = 'call-x'",
+                    "event_log_call_id",
+                ),
+                (
+                    "SELECT id FROM audit_event WHERE caused_by = 'call-x'",
+                    "audit_caused_by",
+                ),
+            ] {
+                let plan: String =
+                    c.query_row(&format!("EXPLAIN QUERY PLAN {sql}"), (), |row| row.get(3))?;
+                assert!(plan.contains(index), "{sql}: {plan}");
+            }
+            Ok(())
+        })
+        .expect("read");
+    }
+
     #[test]
     fn ping_ok_on_healthy_connection() {
         // The readiness probe (`GET /api/v1/readyz`) leans on this
@@ -2076,6 +2114,10 @@ mod tests {
             db.write(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch(
                     "
+                    DROP INDEX audit_caused_by;
+                    ALTER TABLE audit_event DROP COLUMN caused_by;
+                    DROP INDEX event_log_call_id;
+                    ALTER TABLE event_log DROP COLUMN call_id;
                     DROP TABLE network_tls_pin;
                     DROP TABLE auth_role;
                     DROP TABLE sandbox_removal;
@@ -2170,6 +2212,9 @@ mod tests {
                     "
                     -- Undo every migration after 16 so the file is a
                     -- genuine v15 state; reopening re-applies them.
+                    -- 25: event and reaction attribution.
+                    DROP INDEX audit_caused_by;
+                    ALTER TABLE audit_event DROP COLUMN caused_by;
                     -- 24: TLS certificate pins.
                     DROP TABLE network_tls_pin;
                     -- 23: owner-defined roles.
@@ -2585,6 +2630,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),

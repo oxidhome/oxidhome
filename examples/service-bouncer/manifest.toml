@@ -23,6 +23,9 @@ wasm = "target/wasm32-wasip2/debug/service_bouncer.wasm"
 declares_services = ["bouncer"]
 # Bouncer reads `bounce_to` from KV — give it a tiny per-instance quota.
 storage_quota_kb = 4
+# `kick` may announce on `bouncer.relay`, and every bouncer listens
+# there (see `on_event`).
+subscribes_events = true
 
 # H10 grant: authorize `kick` on `bouncer` of any live instance of
 # this same plugin, so instance A can call instance B (the

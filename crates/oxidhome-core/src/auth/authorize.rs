@@ -59,6 +59,23 @@
 //!    [`Action::TokenManage`] (minting and listing tokens) are the
 //!    owner's alone; no scope or role grants them.
 //!
+//! # Delegated hops (H6 slice 4)
+//!
+//! A `call-service` hop is decided by [`authorize_hop`]:
+//! `allow = permit(root) ∧ permit(calling plugin) ∧ no deny on the
+//! chain`. The calling plugin's permit is its `consumes_services`
+//! grant (requested ∩ granted), which the dispatcher matches and
+//! passes in. When the root is external, the root must also hold
+//! [`Action::ServiceCall`] on the target [`Resource::Service`] — the
+//! `services:call` scope (or the wildcard), or a role grant whose
+//! `services` selector covers it — and none of its denies may match
+//! the hop. A narrow token therefore can't have a script use the
+//! script's broader grants on its behalf. Host-rooted work (`init`,
+//! `tick`, `on-event`, including reactions to an event an external
+//! request caused) has the plugin itself as its root: only the
+//! plugin's grant applies. Plugins carry no deny lists yet, so the
+//! root is the only principal on the chain that contributes denies.
+//!
 //! The parity tests (`parity.rs`) pin that steps 1 and 2 match the
 //! checks they replaced on non-sensitive targets, list each
 //! intentional departure on sensitive ones, and check sample
@@ -66,9 +83,8 @@
 //!
 //! Plugin principals are still authorized by their manifest grants at
 //! their own call sites (`consumes_services`, `reads_state`,
-//! `subscribes_events`); [`Action::ServiceCall`] and
-//! [`Action::StateRead`] exist so the taxonomy is complete, and are
-//! refused here.
+//! `subscribes_events`); [`Action::StateRead`] exists so the taxonomy
+//! is complete, and is refused here.
 //!
 //! Each transport keeps its existing deny wire shape (an empty REST
 //! 403, Connect `permission_denied` with `scope <label> required`, a
@@ -135,8 +151,10 @@ pub enum Action {
     TokenManage,
     /// Manage authorization policy. No scope grants it.
     PolicyManage,
-    /// Call a plugin service. Plugin principals are authorized by
-    /// `consumes_services` in the dispatcher; no scope grants it.
+    /// Call a plugin service through a delegated hop
+    /// (`services:call`). Checked for the root of every hop
+    /// ([`authorize_hop`]), on top of the calling plugin's
+    /// `consumes_services` grant.
     ServiceCall,
     /// Read another plugin's device state. Plugin principals are
     /// authorized by `reads_state`; no scope grants it.
@@ -226,10 +244,8 @@ impl Action {
             Action::HostStatus => scopes::STATUS_READ,
             Action::HostLogs => scopes::LOGS_READ,
             Action::HostAudit => scopes::AUDIT_READ,
-            Action::TokenManage
-            | Action::PolicyManage
-            | Action::ServiceCall
-            | Action::StateRead => return None,
+            Action::ServiceCall => scopes::SERVICES_CALL,
+            Action::TokenManage | Action::PolicyManage | Action::StateRead => return None,
         })
     }
 }
@@ -249,6 +265,8 @@ pub enum ResourceKind {
     Plugin,
     /// Dashboards.
     Dashboard,
+    /// Plugin services.
+    Service,
 }
 
 /// What an action targets. Built by host code from the id the call
@@ -286,6 +304,9 @@ pub enum Resource {
     Blob(BlobResource),
     /// One dashboard.
     Dashboard(DashboardResource),
+    /// One command of one plugin service: the target of a delegated
+    /// `call-service` hop.
+    Service(ServiceResource),
 }
 
 impl Resource {
@@ -336,6 +357,24 @@ impl Resource {
     #[must_use]
     pub fn dashboard(id: i64) -> Self {
         Self::Dashboard(DashboardResource { id })
+    }
+
+    /// One command of a registered service, from the service
+    /// registry's owner tuple (never from what the caller passed
+    /// beyond the host-minted service id and the command name).
+    #[must_use]
+    pub fn service(
+        plugin_id: impl Into<String>,
+        instance_id: impl Into<String>,
+        local_id: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        Self::Service(ServiceResource {
+            plugin_id: plugin_id.into(),
+            instance_id: instance_id.into(),
+            local_id: local_id.into(),
+            command: command.into(),
+        })
     }
 
     /// The pre-check for `kind`, before a per-target check.
@@ -465,6 +504,42 @@ impl BlobResource {
     #[must_use]
     pub fn is_camera(&self) -> bool {
         self.camera
+    }
+}
+
+/// Service attributes the host decides on: the owner and the
+/// immutable `local-id` (not the renamable `name`), and the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceResource {
+    plugin_id: String,
+    instance_id: String,
+    local_id: String,
+    command: String,
+}
+
+impl ServiceResource {
+    /// Plugin that owns the service.
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    /// Instance that registered the service.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// The service's immutable `local-id`.
+    #[must_use]
+    pub fn local_id(&self) -> &str {
+        &self.local_id
+    }
+
+    /// The command called.
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
     }
 }
 
@@ -730,6 +805,18 @@ pub enum Reason {
     /// Allowed: an owner-only host action (`policy.manage`,
     /// `token.manage`).
     Owner,
+    /// Allowed: a hop of host-rooted work, which the calling plugin's
+    /// own manifest grant `grant` decides alone.
+    PluginGrant {
+        /// The manifest grant (`consumes_services`).
+        grant: &'static str,
+    },
+    /// Denied: the calling plugin's manifest grant `grant` does not
+    /// cover the hop. Its label is the grant's name.
+    MissingPluginGrant {
+        /// The manifest grant (`consumes_services`).
+        grant: &'static str,
+    },
 }
 
 /// Audit label for [`Reason::NoPermit`].
@@ -751,12 +838,14 @@ impl Reason {
             Reason::Scope { .. }
             | Reason::Role { .. }
             | Reason::Sensitive { .. }
-            | Reason::Owner => None,
+            | Reason::Owner
+            | Reason::PluginGrant { .. } => None,
             Reason::Denied { .. } => Some(DENIED_LABEL),
             Reason::MissingScope { scope } => Some(*scope),
             Reason::Constraint { sentinel, .. } => Some(*sentinel),
             Reason::NoPermit => Some(NO_PERMIT_LABEL),
             Reason::MissingSensitive { category } => Some(category.deny_label()),
+            Reason::MissingPluginGrant { grant } => Some(*grant),
         }
     }
 }
@@ -861,6 +950,53 @@ impl Decision {
 #[must_use]
 pub fn authorize(ctx: &InvocationContext, action: Action, resource: &Resource) -> Decision {
     evaluate(ctx.root().authority(), action, resource)
+}
+
+/// Manifest grant name of a plugin's service-call permit.
+pub const CONSUMES_SERVICES_GRANT: &str = "consumes_services";
+
+/// Decide a delegated hop (H6 slice 4): `ctx` is the callee's
+/// context (the hop already on its chain), `plugin_permit` whether the
+/// calling plugin's own manifest grant (`plugin_grant`, e.g.
+/// [`CONSUMES_SERVICES_GRANT`]) covers the hop.
+///
+/// The rule is `permit(root) ∧ permit(calling plugin) ∧ no deny on the
+/// chain`:
+///
+/// - the calling plugin's grant is checked first, so a hop no grant
+///   covers is refused with [`Reason::MissingPluginGrant`] whoever the
+///   root is;
+/// - an external root must itself be allowed `action` on `resource` by
+///   [`authorize`] (its scopes, roles, constraints and sensitive
+///   grants), and its denies refuse the hop whatever the plugin may;
+/// - a host-rooted hop (`init`, `tick`, `on-event`) is the plugin's own
+///   work: its grant decides ([`Reason::PluginGrant`]).
+///
+/// Plugins carry no deny lists yet, so the chain's other principals
+/// add no denies; when they do, every plugin on `ctx.chain()`
+/// contributes its own.
+///
+/// An allow may carry [`Obligations`] (a sensitive target); the caller
+/// meets them when it dispatches, as for a direct request.
+#[must_use]
+pub fn authorize_hop(
+    ctx: &InvocationContext,
+    action: Action,
+    resource: &Resource,
+    plugin_grant: &'static str,
+    plugin_permit: bool,
+) -> Decision {
+    if !plugin_permit {
+        return Decision::deny(Reason::MissingPluginGrant {
+            grant: plugin_grant,
+        });
+    }
+    if ctx.root().is_external() {
+        return authorize(ctx, action, resource);
+    }
+    Decision::allow(Reason::PluginGrant {
+        grant: plugin_grant,
+    })
 }
 
 /// The evaluator behind [`authorize`], on an [`Authority`] directly.
@@ -1122,17 +1258,142 @@ mod tests {
     #[test]
     fn unmapped_actions_are_refused_even_for_wildcard() {
         let ctx = ctx_for(&Actor::api("admin", vec!["*".into()]));
-        for a in [
-            Action::TokenManage,
-            Action::PolicyManage,
-            Action::ServiceCall,
-            Action::StateRead,
-        ] {
+        for a in [Action::TokenManage, Action::PolicyManage, Action::StateRead] {
             let d = authorize(&ctx, a, &Resource::Host);
             assert!(!d.allow);
             assert_eq!(d.reason, Reason::NoPermit);
             assert_eq!(d.reason.audit_label(), Some(NO_PERMIT_LABEL));
         }
+    }
+
+    fn bouncer() -> Resource {
+        Resource::service("example.bouncer", "alpha", "bouncer", "kick")
+    }
+
+    /// H6 slice 4: a hop needs the plugin's grant and, for an external
+    /// root, the root's own `service.call`; host-rooted work is the
+    /// plugin's alone.
+    #[test]
+    fn hops_need_the_plugin_grant_and_the_roots_permit() {
+        let hop = |ctx: &InvocationContext, plugin: bool| {
+            authorize_hop(
+                ctx,
+                Action::ServiceCall,
+                &bouncer(),
+                CONSUMES_SERVICES_GRANT,
+                plugin,
+            )
+        };
+        let host = InvocationContext::host_origin("alpha");
+        let d = hop(&host, true);
+        assert!(d.allow);
+        assert_eq!(
+            d.reason,
+            Reason::PluginGrant {
+                grant: CONSUMES_SERVICES_GRANT
+            }
+        );
+        let reaction = InvocationContext::reacting_to("alpha", "call-x");
+        assert!(hop(&reaction, true).allow);
+        let d = hop(&host, false);
+        assert_eq!(d.reason.audit_label(), Some(CONSUMES_SERVICES_GRANT));
+
+        let narrow = ctx_for(&Actor::api("t", vec!["devices:command".into()]));
+        let d = hop(&narrow, true);
+        assert!(!d.allow);
+        assert_eq!(d.reason.audit_label(), Some("services:call"));
+        // The plugin's grant is asked first, whoever the root is.
+        let admin = ctx_for(&Actor::api("t", vec!["*".into()]));
+        assert_eq!(
+            hop(&admin, false).reason.audit_label(),
+            Some(CONSUMES_SERVICES_GRANT)
+        );
+        let d = hop(&admin, true);
+        assert!(d.allow);
+        assert_eq!(d.obligations, Obligations::default());
+        let scoped = ctx_for(&Actor::api("t", vec!["services:call".into()]));
+        assert!(hop(&scoped, true).allow);
+    }
+
+    /// A role's `services` selector narrows the delegation grant; a
+    /// deny refuses the hop whatever grants it.
+    #[test]
+    fn role_service_selectors_and_denies_decide_hops() {
+        use crate::auth::{ActionSet, DenyRule, RoleDef, RoleGrant};
+        let grant = |services: &[&str]| RoleGrant {
+            actions: ActionSet::of(&[Action::ServiceCall]),
+            categories: None,
+            devices: None,
+            services: Some(services.iter().map(|s| (*s).to_owned()).collect()),
+        };
+        let role = |grants, deny| {
+            Arc::new(RoleDef {
+                id: "role-0123456789abcdef".into(),
+                name: "scene".into(),
+                grants,
+                sensitive: Vec::new(),
+                deny,
+            })
+        };
+        let with = |r| ctx_for(&Actor::api("t", Vec::new()).with_roles(vec![r]));
+        for (pattern, allowed) in [
+            ("example.bouncer", true),
+            ("example.*", true),
+            ("*", true),
+            ("example.bouncer/bouncer", true),
+            ("example.bouncer/bou*", true),
+            ("example.bouncer/other", false),
+            ("acme.*", false),
+        ] {
+            let ctx = with(role(vec![grant(&[pattern])], Vec::new()));
+            let d = authorize(&ctx, Action::ServiceCall, &bouncer());
+            assert_eq!(d.allow, allowed, "{pattern}");
+            if !allowed {
+                assert_eq!(d.reason, Reason::NoPermit, "{pattern}");
+            }
+        }
+        // A `services` grant covers nothing else.
+        let ctx = with(role(vec![grant(&["*"])], Vec::new()));
+        assert!(!authorize(&ctx, Action::ServiceCall, &Resource::Host).allow);
+        assert!(!authorize(&ctx, Action::DeviceRead, &Resource::devices()).allow);
+
+        let deny = |services: Option<Vec<String>>| DenyRule {
+            actions: ActionSet::of(&[Action::ServiceCall]),
+            categories: None,
+            devices: None,
+            services,
+        };
+        let policy = crate::auth::TokenPolicy {
+            scopes: vec!["*".into()],
+            deny: vec![deny(Some(vec!["example.bouncer/bouncer".into()]))],
+            ..crate::auth::TokenPolicy::default()
+        };
+        let ctx = ctx_for(&Actor::from_token_policy("t", policy, false));
+        let d = authorize(&ctx, Action::ServiceCall, &bouncer());
+        assert_eq!(d.reason, Reason::Denied { role: None });
+        let other = Resource::service("acme.notify", "n", "notify", "send");
+        assert!(authorize(&ctx, Action::ServiceCall, &other).allow);
+        // A role deny without a selector refuses every service; with a
+        // device selector it refuses none (services carry no
+        // category).
+        let ctx = ctx_for(
+            &Actor::api("t", vec!["*".into()]).with_roles(vec![role(Vec::new(), vec![deny(None)])]),
+        );
+        assert_eq!(
+            authorize(&ctx, Action::ServiceCall, &other).reason,
+            Reason::Denied {
+                role: Some("scene".into())
+            }
+        );
+        let by_category = DenyRule {
+            categories: Some(vec![crate::auth::DeviceCategory::Lock]),
+            ..deny(None)
+        };
+        let ctx = ctx_for(
+            &Actor::api("t", vec!["*".into()])
+                .with_roles(vec![role(Vec::new(), vec![by_category])]),
+        );
+        assert!(authorize(&ctx, Action::ServiceCall, &other).allow);
     }
 
     #[test]

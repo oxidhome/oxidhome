@@ -1365,6 +1365,7 @@ async fn events_resource_reports_pruned_cursor() {
             origin_plugin_id: "com.example.res".into(),
             origin_instance_id: "res-a".into(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: "res.expire".into(),
                 payload: String::new(),

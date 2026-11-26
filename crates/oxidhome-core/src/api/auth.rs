@@ -356,6 +356,7 @@ pub(crate) async fn require_token(
                 // per-cause without pattern-matching a
                 // free-text log line.
                 let entry = AuditEntry {
+                    caused_by: None,
                     id: 0,
                     intent_ms: 0,
                     finalized_ms: None,
@@ -419,6 +420,7 @@ pub(crate) async fn require_token(
     // executes so a mid-handler cancellation still leaves evidence.
     // (F2) Fail-closed: ledger unreachable ⇒ refuse the request.
     let intent = AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,
@@ -530,6 +532,7 @@ async fn try_best_effort_probe(
         return;
     };
     let entry = AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,
@@ -782,6 +785,7 @@ pub(super) async fn record_anonymous_probe(
     credential_fp: Option<String>,
 ) {
     let entry = AuditEntry {
+        caused_by: None,
         id: 0,
         intent_ms: 0,
         finalized_ms: None,

@@ -314,6 +314,7 @@ fn deny_audit_worker(
             .unwrap_or_else(|| invocation::InvocationContext::host_origin(&job.instance_id));
         let root = ctx.root();
         let entry = AuditEntry {
+            caused_by: ctx.caused_by().map(str::to_owned),
             id: 0,
             intent_ms: 0,
             finalized_ms: None,

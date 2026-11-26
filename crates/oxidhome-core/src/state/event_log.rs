@@ -89,6 +89,11 @@ pub struct HistoricalEvent {
     pub instance_id: String,
     pub plugin_id: String,
     pub topic: String,
+    /// H6 slice 4: call id of the external request the event traces
+    /// back to (WIT `event.call-id`): the publisher's own when a token
+    /// started it, the originating request's when a reaction published
+    /// it. `None` for host-started work.
+    pub call_id: Option<String>,
     pub payload: EventPayload,
 }
 
@@ -355,7 +360,7 @@ fn build_query(
     use std::fmt::Write as _;
 
     let mut sql = String::from(
-        "SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob \
+        "SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob, call_id \
              FROM event_log WHERE 1=1",
     );
     let mut binds: Vec<rusqlite::types::Value> = Vec::new();
@@ -483,6 +488,7 @@ fn run_query(
         let plugin_id: String = row.get(5)?;
         let topic: String = row.get(6)?;
         let blob: Vec<u8> = row.get(7)?;
+        let call_id: Option<String> = row.get(8)?;
         let stored: StoredEventPayload =
             serde_json::from_slice(&blob).map_err(|source| EventLogError::Encode {
                 topic: topic.clone(),
@@ -501,6 +507,7 @@ fn run_query(
             instance_id,
             plugin_id,
             topic,
+            call_id,
             payload: stored.into_wit(),
         });
     }
@@ -738,8 +745,8 @@ fn insert_row(
     // `i64::MAX` on disk rather than wrapping negative.
     let payload_ms = i64::try_from(event.timestamp).unwrap_or(i64::MAX);
     conn.execute(
-        "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob, call_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             received_ms,
             payload_ms,
@@ -748,6 +755,7 @@ fn insert_row(
             plugin_id,
             topic,
             payload_blob,
+            event.call_id,
         ],
     )?;
     // `last_insert_rowid` returns the just-inserted PRIMARY KEY for
@@ -820,6 +828,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::StateChanged(StateChange {
                 capability: "switch".into(),
                 fields: vec![KeyValue {
@@ -837,6 +846,7 @@ mod tests {
             origin_plugin_id: String::new(),
             origin_instance_id: String::new(),
             row_id: None,
+            call_id: None,
             payload: EventPayload::Custom(CustomEvent {
                 topic: topic.into(),
                 payload: "{}".into(),
@@ -893,6 +903,7 @@ mod tests {
                     origin_plugin_id: String::new(),
                     origin_instance_id: String::new(),
                     row_id: None,
+                    call_id: None,
                     payload: EventPayload::Button(ButtonEvent::DoublePress),
                 },
             ),
@@ -904,6 +915,7 @@ mod tests {
                     origin_plugin_id: String::new(),
                     origin_instance_id: String::new(),
                     row_id: None,
+                    call_id: None,
                     payload: EventPayload::Inference(InferenceResult {
                         model: "yolov8n".into(),
                         payload: r#"{"hits":[]}"#.into(),

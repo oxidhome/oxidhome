@@ -413,6 +413,7 @@ mod tests {
             origin_plugin_id: "example.test".into(),
             origin_instance_id: "inst".into(),
             row_id: None,
+            call_id: None,
         }
     }
 
