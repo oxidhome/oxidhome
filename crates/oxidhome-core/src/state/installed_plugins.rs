@@ -642,15 +642,12 @@ pub fn network_rule_covers(wide: &NetworkRule, narrow: &NetworkRule) -> bool {
 
 /// `caps` without any sensitive grant: what a package installed without
 /// the owner's approval (a boot-scan backfill, a dev-time argv start)
-/// is granted. A
-/// `reads_state` entry that asked for one no longer equals the request,
-/// so it grants nothing (fail closed).
+/// is granted. A `reads_state` entry that asks for one is dropped (fail
+/// closed), as the exact-entry intersection with the request would.
 pub(crate) fn without_sensitive(caps: &CapabilitiesSection) -> CapabilitiesSection {
     let mut caps = caps.clone();
     caps.sensitive_event_bytes.clear();
-    for grant in &mut caps.reads_state {
-        grant.sensitive.clear();
-    }
+    caps.reads_state.retain(|grant| grant.sensitive.is_empty());
     caps
 }
 
@@ -3832,6 +3829,9 @@ sensitive = ["camera"]
         let reg = InstalledPluginRegistry::scan(plugins_root.clone(), Arc::clone(&db)).unwrap();
         let row = &reg.list()[0];
         assert!(row.sensitive_grants().is_empty(), "{row:?}");
+        // The entry asking for camera is dropped, not narrowed (a dev
+        // start uses this grant as is).
+        assert_eq!(row.granted_capabilities.reads_state, []);
         let effective = effective_capabilities(
             &toml::from_str::<PluginManifest>(manifest)
                 .unwrap()

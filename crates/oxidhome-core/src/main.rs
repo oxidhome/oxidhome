@@ -1217,9 +1217,6 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
                         let _ = writeln!(out, "\t{tag}\t{}", printable(&rule));
                     }
                 }
-                for category in &plugin.sensitive {
-                    let _ = writeln!(out, "\tsensitive\t{}", printable(category));
-                }
             }
             Err(why) => {
                 let _ = writeln!(
@@ -1230,6 +1227,9 @@ fn format_plugin_list(plugins: &[oxidhome_core::state::OfflinePlugin]) -> String
                     printable(why)
                 );
             }
+        }
+        for category in &plugin.sensitive {
+            let _ = writeln!(out, "\tsensitive\t{}", printable(category));
         }
     }
     out
@@ -1738,7 +1738,7 @@ mod tests {
                 plugin_id: "net.example.old".into(),
                 installation_uuid: "inst-2".into(),
                 status: Err("contents changed since install; reinstall".into()),
-                sensitive: Vec::new(),
+                sensitive: vec!["camera".into()],
             },
         ];
         assert_eq!(
@@ -1749,7 +1749,8 @@ mod tests {
              \teffective\ttcp://192.168.1.20:554\n\
              \tsensitive\tcamera\n\
              net.example.old\tunavailable\tinstallation=inst-2\t\
-             contents changed since install; reinstall\n"
+             contents changed since install; reinstall\n\
+             \tsensitive\tcamera\n"
         );
     }
 

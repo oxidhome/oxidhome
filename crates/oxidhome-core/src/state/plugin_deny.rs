@@ -128,11 +128,11 @@ fn deny_everything() -> PluginDenyList {
     }])
 }
 
-/// The write a [`PluginDenyStore::change`] wraps; it runs at most once.
 /// Deletes one plugin's deny row inside the caller's transaction
 /// ([`PluginDenyStore::forget_with`]).
 pub type DeleteRow<'a> = &'a dyn Fn(&rusqlite::Connection) -> rusqlite::Result<()>;
 
+/// The write a [`PluginDenyStore::change`] wraps; it runs at most once.
 pub type Commit<'a> = Box<dyn FnOnce() -> Result<(), PluginDenyError> + 'a>;
 
 impl PluginDenyStore {
@@ -307,7 +307,7 @@ impl PluginDenyStore {
     /// transaction as the tombstone of its installation. Under the
     /// writer lock, so the list deleted is the one the tombstone ends:
     /// a list set afterwards (for a reinstall) stays. The list leaves
-    /// memory only when `wrap` succeeds.
+    /// memory only when `wrap` succeeds having run the delete.
     ///
     /// # Errors
     ///
@@ -319,12 +319,14 @@ impl PluginDenyStore {
     ) -> Result<R, E> {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.get(plugin_id);
+        let deleted = std::cell::Cell::new(false);
         let delete = |conn: &rusqlite::Connection| {
-            conn.execute("DELETE FROM plugin_deny WHERE plugin_id = ?1", [plugin_id])
-                .map(drop)
+            conn.execute("DELETE FROM plugin_deny WHERE plugin_id = ?1", [plugin_id])?;
+            deleted.set(true);
+            Ok(())
         };
         let result = wrap(current.as_deref(), &delete)?;
-        if current.is_some() {
+        if current.is_some() && (deleted.get() || self.db.is_none()) {
             let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
             self.generation.fetch_add(1, Ordering::SeqCst);
             rows.remove(plugin_id);
