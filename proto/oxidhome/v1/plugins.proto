@@ -41,6 +41,18 @@ service PluginsService {
   // Sensitive (`plugins:uninstall` scope). Refuses with FAILED_PRECONDITION
   // if any instance of the plugin is running.
   rpc UninstallPlugin(UninstallPluginRequest) returns (UninstallPluginResponse);
+
+  // Set a plugin's network grant (Phase 8.5). Every rule must lie
+  // inside one the manifest requests: a grant narrows the request,
+  // never widens it (INVALID_ARGUMENT otherwise). Running instances
+  // restart under the new grant. `policy.manage`: the owner only.
+  // Same shape as `PUT /api/v1/plugins/{plugin_id}/network-grant`.
+  rpc SetPluginNetworkGrant(SetPluginNetworkGrantRequest) returns (SetPluginNetworkGrantResponse);
+
+  // Reset a plugin's network grant to what its manifest requests,
+  // restarting its running instances. `policy.manage`. Same shape as
+  // `DELETE /api/v1/plugins/{plugin_id}/network-grant`.
+  rpc ResetPluginNetworkGrant(ResetPluginNetworkGrantRequest) returns (ResetPluginNetworkGrantResponse);
 }
 
 message ListPluginsRequest {}
@@ -146,4 +158,42 @@ message UninstallPluginRequest {
 
 message UninstallPluginResponse {
   string plugin_id = 1;
+}
+
+message SetPluginNetworkGrantRequest {
+  string plugin_id = 1;
+  // The rules to grant, in manifest syntax. Empty grants no network
+  // access.
+  repeated string rules = 2;
+}
+
+message SetPluginNetworkGrantResponse {
+  NetworkGrantChange change = 1;
+}
+
+message ResetPluginNetworkGrantRequest {
+  string plugin_id = 1;
+}
+
+message ResetPluginNetworkGrantResponse {
+  NetworkGrantChange change = 1;
+}
+
+// The result of a network grant change.
+message NetworkGrantChange {
+  string plugin_id = 1;
+  // The plugin's rules after the change, as `ListPlugins` shows them.
+  NetworkGrants network = 2;
+  // Instances restarted under the new grant.
+  repeated string restarted = 3;
+  // Instances that were running but didn't restart.
+  repeated NotRestartedInstance not_restarted = 4;
+}
+
+// An instance a grant change didn't restart: still stopping past the
+// wait limit (it picks the grant up when started again), or its start
+// failed.
+message NotRestartedInstance {
+  string instance_id = 1;
+  string reason = 2;
 }

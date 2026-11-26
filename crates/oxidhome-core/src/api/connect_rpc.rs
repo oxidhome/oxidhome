@@ -1223,6 +1223,117 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             ..Default::default()
         })
     }
+
+    async fn set_plugin_network_grant<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb_grant::SetPluginNetworkGrantRequest>,
+    ) -> ServiceResult<impl Encodable<pb_grant::SetPluginNetworkGrantResponse> + Send + use<'a>>
+    {
+        // Owner only: refuse others before copying the rule list.
+        require_connect(
+            &ctx,
+            Action::PolicyManage,
+            &Resource::pre_check(ResourceKind::Plugin),
+        )?;
+        let req = request.to_owned_message();
+        let change = self
+            .change_network_grant(&ctx, req.plugin_id, Some(&req.rules))
+            .await?;
+        Response::ok(pb_grant::SetPluginNetworkGrantResponse {
+            change: oxidhome_proto::runtime::MessageField::some(change),
+            ..Default::default()
+        })
+    }
+
+    async fn reset_plugin_network_grant<'a>(
+        &'a self,
+        ctx: RequestContext,
+        request: ServiceRequest<'_, pb_grant::ResetPluginNetworkGrantRequest>,
+    ) -> ServiceResult<impl Encodable<pb_grant::ResetPluginNetworkGrantResponse> + Send + use<'a>>
+    {
+        let req = request.to_owned_message();
+        let change = self.change_network_grant(&ctx, req.plugin_id, None).await?;
+        Response::ok(pb_grant::ResetPluginNetworkGrantResponse {
+            change: oxidhome_proto::runtime::MessageField::some(change),
+            ..Default::default()
+        })
+    }
+}
+
+/// Phase 8.5: the proto messages of the network grant RPCs.
+mod pb_grant {
+    pub(super) use oxidhome_proto::proto::oxidhome::v1::{
+        NetworkGrantChange, NetworkGrants, NotRestartedInstance, ResetPluginNetworkGrantRequest,
+        ResetPluginNetworkGrantResponse, SetPluginNetworkGrantRequest,
+        SetPluginNetworkGrantResponse,
+    };
+}
+
+impl OxidHomePlugins {
+    /// `SetPluginNetworkGrant` / `ResetPluginNetworkGrant` (`rules =
+    /// None`): `policy.manage` on the plugin, then
+    /// [`super::network_admin::change_network_grant`].
+    async fn change_network_grant(
+        &self,
+        ctx: &RequestContext,
+        plugin_id: String,
+        rules: Option<&[String]>,
+    ) -> Result<pb_grant::NetworkGrantChange, ConnectError> {
+        use crate::state::NetworkGrantError as E;
+        require_connect(
+            ctx,
+            Action::PolicyManage,
+            &Resource::plugin(plugin_id.as_str()),
+        )?;
+        let invocation = ctx
+            .extensions()
+            .get::<InvocationContext>()
+            .ok_or_else(|| rpc_err(ctx, ConnectError::internal("no invocation context")))?;
+        let rules = rules
+            .map(super::network_admin::parse_grant_rules)
+            .transpose()
+            .map_err(|e| rpc_err(ctx, ConnectError::invalid_argument(e)))?;
+        let view = super::network_admin::change_network_grant(
+            self.engine.clone(),
+            super::network_admin::GrantActor::of("connect", invocation),
+            plugin_id,
+            rules,
+        )
+        .await
+        .map_err(|e| {
+            let err = match &e {
+                E::NotInstalled(_) => ConnectError::not_found(e.to_string()),
+                E::Widens(_) | E::BadHost(_) | E::TooMany { .. } => ConnectError::invalid_argument(e.to_string()),
+                E::Unavailable(..) | E::Store(_) => {
+                    tracing::error!(target: "api.plugins", error = %e, "network grant change failed");
+                    ConnectError::internal("network grant change failed")
+                }
+            };
+            rpc_err(ctx, err)
+        })?;
+        let (requested, granted, effective) = view.network.to_strings();
+        Ok(pb_grant::NetworkGrantChange {
+            plugin_id: view.plugin_id,
+            network: oxidhome_proto::runtime::MessageField::some(pb_grant::NetworkGrants {
+                requested,
+                granted,
+                effective,
+                ..Default::default()
+            }),
+            restarted: view.restarted,
+            not_restarted: view
+                .not_restarted
+                .into_iter()
+                .map(|n| pb_grant::NotRestartedInstance {
+                    instance_id: n.instance_id,
+                    reason: n.reason,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
 }
 
 /// Map an install-side registry error to a Connect-spec error

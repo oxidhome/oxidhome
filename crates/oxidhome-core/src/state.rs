@@ -63,9 +63,10 @@ pub use event_log::{
 pub use event_tail::{EventTail, TailError, TailItem};
 pub use events::{EventBus, EventSubscription, PublishDenied, SubscriberMessage};
 pub use installed_plugins::{
-    InstallError, InstalledPlugin, InstalledPluginRegistry, NetworkGrants, OfflinePlugin,
-    UninstallError, any_grant_matches, content_digest, effective_capabilities,
-    effective_network_rules, list_installations_offline, network_rule_covers, read_installed_bytes,
+    InstallError, InstalledPlugin, InstalledPluginRegistry, NetworkGrantChange, NetworkGrantError,
+    NetworkGrants, OfflineGrantPlan, OfflinePlugin, UninstallError, any_grant_matches,
+    content_digest, effective_capabilities, effective_network_rules, list_installations_offline,
+    narrowed_network_grant, network_rule_covers, plan_network_grant_offline, read_installed_bytes,
     recompute_digest_and_manifest, recompute_installed_digest,
 };
 pub use tls_pins::{

@@ -94,6 +94,7 @@ share one axum listener, so a household hub only exposes one endpoint.
 | Tool | `plugins.install` | `plugins:install` | Takes an absolute `source_dir` (no `..` components) that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
 | Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
 | Tool | `plugins.uninstall` | `plugins:uninstall` | Refuses if instances still running. |
+| Tool | `plugins.set_network_grant` / `plugins.reset_network_grant` | owner only | Narrow a plugin's network grant (every rule inside one its manifest requests) or reset it to the request; running instances restart under it. Audited with the old and new grant. |
 | Tool | `tokens.list` | owner only | Tokens with roles, scopes, sensitive grants and deny list; never a secret. No `tokens.create`: credentials never ride MCP responses. |
 | Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |
 | Prompt | `draft_automation` | `devices:list` | Composes `oxidhome://devices` + per-device detail. |
