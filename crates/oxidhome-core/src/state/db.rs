@@ -40,557 +40,22 @@ use rusqlite::{Connection, OpenFlags};
 /// in the database file picks up where the last run left off.
 ///
 /// Each entry is the *body* of one migration — the loop in
-/// [`Db::apply_migrations`] wraps it in a `BEGIN; ... ; PRAGMA
-/// user_version = N; COMMIT;`. Keep migrations idempotent on top of
-/// `IF NOT EXISTS` only when re-running a migration would be safe;
-/// otherwise rely on `user_version` to skip already-applied ones.
-const MIGRATIONS: &[&str] = &[
-    // 1 — Phase 5a: KV store + usage tracking.
-    //
-    // `kv` holds the actual values, scoped per instance. `kv_usage`
-    // tracks bytes-used and bytes-quota so a write can be refused
-    // transactionally instead of after-the-fact. Triggers keep
-    // `kv_usage.bytes_used` in sync with the rows in `kv`:
-    //
-    // - INSERT: charges `length(key) + length(value)` against the
-    //   inserting instance's `bytes_used`.
-    // - DELETE: refunds the same amount.
-    // - UPDATE on `value`: charges the delta
-    //   (`length(new.value) - length(old.value)`).
-    //
-    // Quota enforcement happens in the writing transaction in
-    // `kv::set` — see that file for the BEGIN IMMEDIATE / check / write
-    // shape. The triggers only update accounting; they don't refuse.
-    "
-    CREATE TABLE kv (
-        instance_id  TEXT NOT NULL,
-        key          TEXT NOT NULL,
-        value        BLOB NOT NULL,
-        updated_ms   INTEGER NOT NULL,
-        PRIMARY KEY (instance_id, key)
-    ) WITHOUT ROWID;
+/// [`Db::apply_migrations`] wraps it in a transaction and sets
+/// `PRAGMA user_version` to its 1-based position. Migration 1 is the
+/// whole initial schema; a schema change appends migration 2, 3, …
+/// and never edits an applied entry.
+const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA];
 
-    CREATE TABLE kv_usage (
-        instance_id  TEXT PRIMARY KEY,
-        bytes_used   INTEGER NOT NULL DEFAULT 0,
-        bytes_quota  INTEGER NOT NULL
-    ) WITHOUT ROWID;
-
-    CREATE TRIGGER kv_usage_insert AFTER INSERT ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used + length(NEW.key) + length(NEW.value)
-         WHERE instance_id = NEW.instance_id;
-    END;
-
-    CREATE TRIGGER kv_usage_delete AFTER DELETE ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used - length(OLD.key) - length(OLD.value)
-         WHERE instance_id = OLD.instance_id;
-    END;
-
-    CREATE TRIGGER kv_usage_update AFTER UPDATE OF value ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used + length(NEW.value) - length(OLD.value)
-         WHERE instance_id = NEW.instance_id;
-    END;
-    ",
-    // 2 — Phase 5a follow-up: count key length in **bytes**, not
-    // characters. SQLite's `length()` on TEXT returns the character
-    // count; on BLOB it returns the byte count. Migration 1 used the
-    // bare `length(key)` so a non-ASCII key was undercounted against
-    // the byte quota the Rust side projects in `state::kv::set`.
-    // Drop the triggers and recreate with `length(CAST(... AS BLOB))`,
-    // then re-baseline `kv_usage.bytes_used` for any rows that already
-    // drifted under migration 1's accounting.
-    //
-    // `value` is already declared `BLOB NOT NULL` so `length(value)`
-    // is byte-correct without a cast.
-    "
-    DROP TRIGGER kv_usage_insert;
-    DROP TRIGGER kv_usage_delete;
-    DROP TRIGGER kv_usage_update;
-
-    CREATE TRIGGER kv_usage_insert AFTER INSERT ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used + length(CAST(NEW.key AS BLOB)) + length(NEW.value)
-         WHERE instance_id = NEW.instance_id;
-    END;
-
-    CREATE TRIGGER kv_usage_delete AFTER DELETE ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used - length(CAST(OLD.key AS BLOB)) - length(OLD.value)
-         WHERE instance_id = OLD.instance_id;
-    END;
-
-    CREATE TRIGGER kv_usage_update AFTER UPDATE OF value ON kv
-    BEGIN
-        UPDATE kv_usage
-           SET bytes_used = bytes_used + length(NEW.value) - length(OLD.value)
-         WHERE instance_id = NEW.instance_id;
-    END;
-
-    -- Re-baseline existing rows so already-drifted instances start
-    -- from the correct byte total. Sum over each instance's `kv` rows;
-    -- COALESCE handles instances with a `kv_usage` row but no `kv`
-    -- rows yet (registered + never wrote).
-    UPDATE kv_usage SET bytes_used = COALESCE((
-        SELECT SUM(length(CAST(key AS BLOB)) + length(value))
-          FROM kv
-         WHERE kv.instance_id = kv_usage.instance_id
-    ), 0);
-    ",
-    // 3 — Phase 5d: event history store.
-    //
-    // Durable mirror of the live `EventBus` (`state/events.rs`). The
-    // host writes every plugin-published event here, the CLI/API
-    // reads back history. Trust separation on timestamps: `received_ms`
-    // is the host's wall-clock at receive time (used for ordering,
-    // retention, query bounds); `payload_ms` is the plugin's
-    // self-reported `events::event.timestamp` (informational only, so
-    // a buggy plugin can't backdate history).
-    //
-    // `actor_kind` / `actor_id` columns from the per-crate plan are
-    // **not** here — Phase 4B only constructs `Actor::plugin(instance_id)`
-    // so they'd always echo `(plugin, instance_id)` and add no info.
-    // Phase 12 (external API) adds them as a follow-up migration when
-    // non-plugin actors become real callers.
-    //
-    // `payload_blob` is the WIT event-payload variant encoded as
-    // tagged JSON via `serde_json`. Postcard (smaller wire) is an
-    // optimization for later; the store reads opaque BLOBs so a
-    // future migration can re-encode in place.
-    "
-    CREATE TABLE event_log (
-        id            INTEGER PRIMARY KEY,
-        received_ms   INTEGER NOT NULL,
-        payload_ms    INTEGER NOT NULL,
-        device_id     TEXT,
-        instance_id   TEXT NOT NULL,
-        plugin_id     TEXT NOT NULL,
-        topic         TEXT NOT NULL,
-        payload_blob  BLOB NOT NULL
-    );
-
-    CREATE INDEX evt_received      ON event_log(received_ms);
-    CREATE INDEX evt_device        ON event_log(device_id, received_ms) WHERE device_id IS NOT NULL;
-    CREATE INDEX evt_topic         ON event_log(topic, received_ms);
-    CREATE INDEX evt_instance      ON event_log(instance_id, received_ms);
-    CREATE INDEX evt_plugin        ON event_log(plugin_id, received_ms);
-    ",
-    // 4 — Phase 5c: log/trace store.
-    //
-    // Host-owned diagnostic stream. Every `tracing::{trace,debug,info,
-    // warn,error}!` macro the host emits — including Phase-4 capability
-    // denials, Phase-5d publish_event writes, plugin-side log lines
-    // forwarded through the `logging` import — captures into this
-    // table via a `tracing_subscriber::Layer` (`state::log_store`).
-    // CLI / API query is Phase 12.
-    //
-    // Schema mirrors `03_core.md` §5c with one shape decision: the
-    // structured-field map is encoded as tagged JSON (same format as
-    // `event_log.payload_blob`) rather than postcard. JSON keeps the
-    // store self-debuggable via `sqlite3 oxidhome.db` and matches the
-    // pattern the rest of Phase 5 settled on; postcard is a possible
-    // smaller-on-disk follow-up.
-    //
-    // Indexes match the CLI's expected query shapes: time-range scans
-    // (`log_ts`), level-filter (`log_level_ts`), per-instance /
-    // per-plugin / per-device drill-down, and per-target filtering.
-    // Partial indexes (`WHERE … IS NOT NULL`) skip rows that don't
-    // carry that column — host-only events without an `instance_id`
-    // shouldn't bloat the per-instance index.
-    "
-    CREATE TABLE log_event (
-        id            INTEGER PRIMARY KEY,
-        ts_unix_ms    INTEGER NOT NULL,
-        level         INTEGER NOT NULL,
-        instance_id   TEXT,
-        plugin_id     TEXT,
-        device_id     TEXT,
-        target        TEXT NOT NULL,
-        span_path     TEXT,
-        message       TEXT NOT NULL,
-        fields_blob   BLOB
-    );
-
-    CREATE INDEX log_ts          ON log_event(ts_unix_ms);
-    CREATE INDEX log_level_ts    ON log_event(level, ts_unix_ms);
-    CREATE INDEX log_instance_ts ON log_event(instance_id, ts_unix_ms) WHERE instance_id IS NOT NULL;
-    CREATE INDEX log_plugin_ts   ON log_event(plugin_id, ts_unix_ms)   WHERE plugin_id   IS NOT NULL;
-    CREATE INDEX log_device_ts   ON log_event(device_id, ts_unix_ms)   WHERE device_id   IS NOT NULL;
-    CREATE INDEX log_target_ts   ON log_event(target, ts_unix_ms);
-    ",
-    // 5 — Phase 5c follow-up: add the `log_span_ts` index that the
-    // per-crate plan listed but migration 4 forgot. Note this index
-    // helps `span_path = ?` (and `span_path` time-range scans on
-    // events that carry one); it does **not** seek the
-    // `LogQuery::span_path_prefix` predicate, which uses
-    // `substr(span_path, 1, length(?)) = ?` — SQLite can't seek a
-    // B-tree with `substr(...)`. The partial-index `WHERE span_path
-    // IS NOT NULL` still narrows the scan because the planner can
-    // restrict to non-null span_path rows. A codepoint-range
-    // rewrite (`span_path >= ? AND span_path < ?`) would let
-    // prefix queries seek the index; Phase 12 picks that up when
-    // there's a workload that wants it.
-    "
-    CREATE INDEX log_span_ts ON log_event(span_path, ts_unix_ms) WHERE span_path IS NOT NULL;
-    ",
-    // 6 — Phase 5b: blob store index + usage tracking.
-    //
-    // Blob *bytes* live on the filesystem (`<state_dir>/blobs/<instance_id>/<id>`);
-    // these tables are the index + quota accounting. `blob` maps the
-    // plugin-chosen `name` to the host-minted id + metadata; `blob_usage`
-    // tracks `bytes_used` per instance for the manifest-declared
-    // `blob_quota_mb` cap. Triggers maintain `bytes_used` from
-    // `size_bytes` deltas so the quota check on write is a single
-    // transactional `SELECT bytes_used + new_size > bytes_quota` rather
-    // than a `SUM` over the table. Quota enforcement happens in the
-    // writing transaction in `state::blobs::write` — the triggers only
-    // update accounting; they don't refuse.
-    "
-    CREATE TABLE blob (
-        instance_id  TEXT NOT NULL,
-        name         TEXT NOT NULL,
-        id           TEXT NOT NULL,
-        size_bytes   INTEGER NOT NULL,
-        created_ms   INTEGER NOT NULL,
-        mime         TEXT,
-        PRIMARY KEY (instance_id, name)
-    ) WITHOUT ROWID;
-
-    CREATE INDEX blob_by_id ON blob(id);
-
-    CREATE TABLE blob_usage (
-        instance_id  TEXT PRIMARY KEY,
-        bytes_used   INTEGER NOT NULL DEFAULT 0,
-        bytes_quota  INTEGER NOT NULL
-    ) WITHOUT ROWID;
-
-    CREATE TRIGGER blob_usage_insert AFTER INSERT ON blob
-    BEGIN
-        UPDATE blob_usage
-           SET bytes_used = bytes_used + NEW.size_bytes
-         WHERE instance_id = NEW.instance_id;
-    END;
-
-    CREATE TRIGGER blob_usage_delete AFTER DELETE ON blob
-    BEGIN
-        UPDATE blob_usage
-           SET bytes_used = bytes_used - OLD.size_bytes
-         WHERE instance_id = OLD.instance_id;
-    END;
-
-    -- `blob_usage_update` fires on `UPDATE OF size_bytes` only — today
-    -- `state::blobs::write` does DELETE+INSERT for replacements, so
-    -- this trigger never runs in the shipped write path. Kept for any
-    -- future path that mutates `size_bytes` in place (e.g. a streaming
-    -- resource-handle resize) so the accounting stays consistent
-    -- without a Phase-N code change.
-    CREATE TRIGGER blob_usage_update AFTER UPDATE OF size_bytes ON blob
-    BEGIN
-        UPDATE blob_usage
-           SET bytes_used = bytes_used + NEW.size_bytes - OLD.size_bytes
-         WHERE instance_id = NEW.instance_id;
-    END;
-    ",
-    // 7 — Phase 5b follow-up: tighten blob id uniqueness.
-    //
-    // Migration 6's `blob_by_id` index was non-unique. `mint_id` is
-    // per-`BlobStore` (per-process) — two processes opening the same
-    // DB and minting an id in the same millisecond + counter slot
-    // would silently collide, producing two `blob` rows with the
-    // same `id` and overwriting each other's FS file. Replacing the
-    // index with a UNIQUE one on `(instance_id, id)` makes a
-    // collision fail the writing transaction loudly instead.
-    //
-    // Cross-instance collisions are fine (the id namespace is
-    // per-instance — `read(id)` already filters by `instance_id`),
-    // so the constraint is `(instance_id, id)` rather than `id`.
-    //
-    // Defensive: collapse any duplicate `(instance_id, id)` rows
-    // before the UNIQUE index goes on. Two host processes that briefly
-    // shared a DB between #19 (5b ship) and #20 (this index) could
-    // have written colliding ids; without the dedupe, the index
-    // creation would fail and brick the upgrade. `blob` is `WITHOUT
-    // ROWID` (PK is `(instance_id, name)`) so we partition by
-    // `(instance_id, id)`, keep the most-recently-created row, and
-    // tiebreak by `name` for determinism. The dropped row's FS bytes
-    // become an orphan that the Phase-12 sweep will reclaim.
-    "
-    DELETE FROM blob WHERE (instance_id, name) IN (
-      SELECT instance_id, name FROM (
-        SELECT instance_id, name,
-               ROW_NUMBER() OVER (
-                 PARTITION BY instance_id, id
-                 ORDER BY created_ms DESC, name DESC
-               ) AS rn
-        FROM blob
-      ) WHERE rn > 1
-    );
-    DROP INDEX blob_by_id;
-    CREATE UNIQUE INDEX blob_by_id ON blob(instance_id, id);
-    ",
-    // Migration 8 — Phase 12 external API token store.
-    //
-    // High-entropy random tokens (256 bits from a CSPRNG) hashed at
-    // rest with plain SHA-256. Argon2/bcrypt would be overengineering
-    // — those KDFs are tuned to slow down brute-force on
-    // low-entropy passwords; against a uniformly random 256-bit
-    // secret, brute force is infeasible regardless of hash speed.
-    // SHA-256 is constant-time on the relevant inputs and keeps the
-    // verify path cheap.
-    //
-    // `scope_json` is the scope policy blob the API consults before
-    // dispatch (shape lives in `state::auth_token`; the API enforces
-    // it). `last_used_ms` is bumped on every successful verify so
-    // operators can tell a token is in use. `revoked_ms` is the
-    // tombstone — non-null means the token is dead; rows aren't
-    // deleted so audit trails stay intact.
-    "
-    CREATE TABLE auth_token (
-      id            TEXT PRIMARY KEY,
-      label         TEXT NOT NULL,
-      hash          BLOB NOT NULL,
-      scope_json    BLOB NOT NULL,
-      created_ms    INTEGER NOT NULL,
-      last_used_ms  INTEGER,
-      revoked_ms    INTEGER
-    ) STRICT;
-    CREATE UNIQUE INDEX auth_token_hash ON auth_token(hash);
-    ",
-    // Migration 9 — architecture-review C3 dedicated audit ledger.
-    //
-    // Every API request lands here, synchronously from the middleware
-    // before the handler executes. Separate from `log_event` (which
-    // is the drop-tolerant diagnostic stream) so audit rows can't be
-    // evicted by a burst of debug logs — the whole point of C3.
-    //
-    // The row is written in **two phases**:
-    //
-    // 1. `record_intent` at the top of the middleware. Inserts with
-    //    `decision = "pending"`, `status = 0`, `finalized_ms = NULL`.
-    //    Committing this row *before* the handler runs is what makes
-    //    the ledger cancellation-safe: if the client disconnects
-    //    mid-handler (a common exploit path — `spawn_blocking`
-    //    handler tasks continue after the request future is dropped),
-    //    the intent row stays behind as evidence of the attempted
-    //    action, unambiguously flagged as unfinished. Fail-closed —
-    //    if the insert errors, the middleware refuses the request
-    //    with 500 rather than executing an unauditable operation.
-    // 2. `finalize` after the handler returns. UPDATEs the pending
-    //    row with the outcome (`allow` / `deny` / `error`), the
-    //    final HTTP status, `required_scope` (populated only on
-    //    scope-deny 403s), and stamps `finalized_ms`. Best-effort:
-    //    a finalize failure logs an ERROR but doesn't undo the
-    //    handler's already-committed side effects — the operator
-    //    still sees the pending row and knows something is wrong.
-    //
-    // Single-shot writes (`record_completed`) are used for
-    // unauthenticated probes — no handler runs, so the outcome is
-    // known at insert time. That path fills `finalized_ms` immediately
-    // and records `token_id = "anonymous"` + a `credential_fp` short
-    // SHA-256 prefix (never the raw presented secret) so a
-    // forensic sweep can correlate probes without giving an
-    // attacker anything to verify a guess against.
-    //
-    // See `state::audit_log` for the write path.
-    //
-    // Indexes:
-    // - `audit_intent`   for time-range scans on `intent_ms`
-    //                    (retention sweep + generic time-window
-    //                    queries + "abandoned intents" —
-    //                    `finalized_ms IS NULL AND intent_ms < ?`).
-    // - `audit_token_ts` so forensic drill-down on a specific token
-    //                    seeks the B-tree without a full scan.
-    "
-    CREATE TABLE audit_event (
-      id             INTEGER PRIMARY KEY,
-      intent_ms      INTEGER NOT NULL,
-      finalized_ms   INTEGER,
-      token_id       TEXT NOT NULL,
-      actor_kind     TEXT NOT NULL,
-      method         TEXT NOT NULL,
-      path           TEXT NOT NULL,
-      status         INTEGER NOT NULL,
-      decision       TEXT NOT NULL,
-      required_scope TEXT,
-      credential_fp  TEXT
-    ) STRICT;
-    CREATE INDEX audit_intent   ON audit_event(intent_ms);
-    CREATE INDEX audit_token_ts ON audit_event(token_id, intent_ms);
-    ",
-    // Migration 10 — architecture-review F4: split execution outcome
-    // from authorization outcome on the audit ledger.
-    //
-    // Before this migration `decision` and `status` served two
-    // purposes at once: they carried the *authorization* result
-    // (allow / deny / error / pending) *and* the transport
-    // classification, and — after PR #79's first cut of F4 — a
-    // domain-execution failure was folded into the same fields via
-    // a synthesized status. That conflation broke forensic queries:
-    // a plugin returning `CommandResult::Err(InvalidArgument)` on
-    // an authorized request would show up in `WHERE decision =
-    // 'deny'` searches next to real authorization denials, and the
-    // real wire status (HTTP 200) was overwritten.
-    //
-    // Two new nullable columns capture the execution outcome
-    // separately:
-    //
-    // - `execution_outcome`: NULL when the request never reached
-    //   the plugin (auth deny, dispatch NotFound, transport error),
-    //   `"success"` when the plugin returned Ok / OkWithState, and
-    //   `"failed"` when the plugin returned `CommandResult::Err`.
-    // - `domain_error`: the WIT error kind
-    //   (`"not_found"` / `"invalid_argument"` / `"permission_denied"`
-    //   / `"unavailable"` / `"internal"`) on `execution_outcome =
-    //   "failed"`, NULL otherwise.
-    //
-    // `status` returns to being the wire HTTP status, and `decision`
-    // returns to being the pure authorization outcome. Every
-    // pre-existing row is backfilled with NULLs for the new
-    // columns (they'd been rolled up into `decision` / `status`
-    // under the old semantics — leaving the values there preserves
-    // the historical record without pretending to know which entries
-    // were execution-failures vs. real denials).
-    "
-    ALTER TABLE audit_event ADD COLUMN execution_outcome TEXT;
-    ALTER TABLE audit_event ADD COLUMN domain_error TEXT;
-    ",
-    // Migration 11 — architecture-review C1b: persistent
-    // installation identity.
-    //
-    // C1 gave devices deterministic ids derived from
-    // `(plugin_id, instance_id, local_id)` so restarts stopped
-    // renumbering them. The reviewer flagged that a reusable
-    // `plugin_id` string means uninstall + reinstall (or a
-    // replacement plugin sharing the id) inherits every audit /
-    // API / history reference from the previous installation.
-    // C1b closes that hole by minting a fresh **installation
-    // UUID** on every install and threading it through the
-    // device-id derivation instead of the raw `plugin_id`.
-    //
-    // Row shape:
-    // - `installation_uuid`: 32 random hex chars, prefix
-    //   `inst-`. Minted on install; opaque to plugin authors.
-    //   Feeds `stable_device_id` so a fresh install of the same
-    //   `plugin_id` produces different device ids.
-    // - `plugin_id`: the manifest id — human-facing name. Not
-    //   unique across the table (multiple installs over time
-    //   share the id but not the uuid). Uniqueness is enforced
-    //   only for **live** rows via the partial index below, so
-    //   `install` refuses "already installed" while `uninstall`
-    //   sets `uninstalled_ms` (tombstone) and a subsequent
-    //   `install` inserts a fresh row.
-    // - `version`: manifest version at install time.
-    // - `installed_ms` / `uninstalled_ms`: host wall-clock at
-    //   the transition. `uninstalled_ms IS NULL` means the row
-    //   is live; not-null is a tombstone.
-    "
-    CREATE TABLE plugin_installation (
-      installation_uuid TEXT PRIMARY KEY,
-      plugin_id         TEXT NOT NULL,
-      version           TEXT NOT NULL,
-      installed_ms      INTEGER NOT NULL,
-      uninstalled_ms    INTEGER
-    ) STRICT;
-    CREATE UNIQUE INDEX plugin_installation_live
-      ON plugin_installation(plugin_id)
-      WHERE uninstalled_ms IS NULL;
-    ",
-    // Migration 12 — architecture-review C5: split requested
-    // capabilities (what the plugin declared in its manifest)
-    // from granted capabilities (what the host approved for this
-    // install). Runtime gates consult the grant, not the manifest
-    // — so an operator can, in a future PR, narrow the grant
-    // (or fail the install altogether) without editing the
-    // plugin's manifest.
-    //
-    // v1: `granted_capabilities_json` is set at install time to
-    // a verbatim JSON serialization of the manifest's
-    // `[capabilities]` block. That preserves current behavior
-    // while establishing the split so a follow-up can add an
-    // operator override endpoint without a schema change or a
-    // second migration wave. `NULL` (backfilled pre-C5 rows or
-    // deserialization failure) means "fall back to the
-    // manifest's requested capabilities" — see
-    // `InstalledPluginRegistry::install` and `scan`.
-    "
-    ALTER TABLE plugin_installation ADD COLUMN granted_capabilities_json TEXT;
-    ",
-    // Migration 13 — architecture-review C5 review F3:
-    // content-bound grants.
-    //
-    // Persist a SHA-256 digest over the installed plugin's
-    // manifest + wasm + assets at install time. Load-time
-    // verification compares the stored digest against a fresh
-    // recompute so an in-place `plugin.wasm` swap runs under a
-    // NULL grant (dev fallback) rather than the previously-issued
-    // one. Combined with C5's grant column and the C5 review F1
-    // quarantine, that means every production load either matches
-    // an issued grant against an unchanged package or refuses to
-    // apply the grant at all. NULL for pre-C5 rows — those are
-    // quarantined by scan alongside NULL-grant rows, so an
-    // operator's reinstall re-issues both fields together.
-    "
-    ALTER TABLE plugin_installation ADD COLUMN content_digest TEXT;
-    ",
-    // Migration 14 — architecture-review H2: rekey per-instance state
-    // on the host-minted installation identity.
-    //
-    // Before this migration `kv`, `kv_usage`, `blob`, and `blob_usage`
-    // all keyed on the caller-supplied `instance_id` alone. That
-    // string is a plugin-author-chosen identifier — an uninstall
-    // followed by a fresh `install` of the same (or a colliding)
-    // `plugin_id` inherited every stored value from the previous
-    // installation, sidestepping the fresh grant that C1b / C5 mint
-    // at install time. H2 closes the hole by qualifying every row
-    // with the host-minted `installation_uuid`.
-    //
-    // Uninstall now calls `purge_installation` on each store, which
-    // deletes every row (KV + blob index + FS bytes) that carries
-    // the tombstoned installation's uuid — so a subsequent reinstall
-    // starts with an empty per-instance keyspace and no orphan blob
-    // files.
-    //
-    // Legacy rows written under migrations 1–7 don't carry an
-    // installation_uuid we could truthfully backfill. Pre-1.0 the
-    // acceptable path is to DROP those rows so the invariant
-    // ("every state row is tied to a live install") holds from this
-    // migration onward. Operators upgrading with existing plugin
-    // KV/blob data will need to reinstall to repopulate; the audit
-    // trail (`audit_event`, `event_log`, `log_event`) is untouched.
-    //
-    // Table shape:
-    // - `kv (installation_uuid, instance_id, key)` composite PK.
-    // - `kv_usage (installation_uuid, instance_id)` composite PK.
-    // - `blob (installation_uuid, instance_id, name)` composite PK,
-    //   UNIQUE index on `(installation_uuid, instance_id, id)`.
-    // - `blob_usage (installation_uuid, instance_id)` composite PK.
-    //
-    // Triggers are rewritten to match the composite key on both
-    // sides of the `UPDATE ... WHERE` so accounting stays per-tuple.
-    "
-    DROP TRIGGER kv_usage_insert;
-    DROP TRIGGER kv_usage_delete;
-    DROP TRIGGER kv_usage_update;
-    DROP TRIGGER blob_usage_insert;
-    DROP TRIGGER blob_usage_delete;
-    DROP TRIGGER blob_usage_update;
-
-    -- Pre-H2 rows can't be truthfully attributed to any installation_uuid,
-    -- so drop them and recreate the tables with the new key shape. See
-    -- the migration header for the rationale.
-    DROP TABLE kv;
-    DROP TABLE kv_usage;
-    DROP INDEX blob_by_id;
-    DROP TABLE blob;
-    DROP TABLE blob_usage;
-
+/// Migration 1: every table, index and trigger of the host database.
+///
+/// Per-instance plugin state (`kv`, `blob` and their usage rows) is
+/// keyed on `(installation_uuid, instance_id)`, so a reinstall starts
+/// from an empty keyspace and uninstall purges by installation.
+const INITIAL_SCHEMA: &str = "
+    -- KV store (`state::kv`). `kv_usage` tracks bytes used against the
+    -- quota so `kv::set` refuses a write inside its transaction; the
+    -- triggers only keep `bytes_used` in sync (key length counted in
+    -- bytes, hence the cast) and never refuse.
     CREATE TABLE kv (
         installation_uuid TEXT NOT NULL,
         instance_id       TEXT NOT NULL,
@@ -632,6 +97,67 @@ const MIGRATIONS: &[&str] = &[
            AND instance_id       = NEW.instance_id;
     END;
 
+    -- Event history (`state::event_log`), the durable mirror of the
+    -- live bus. `received_ms` is host time (retention, query bounds;
+    -- order is by id); `payload_ms` is the plugin's self-reported timestamp.
+    -- `AUTOINCREMENT` so an id is never reused after retention deletes
+    -- the current max: clients page and resume on id cursors. The
+    -- filter indexes are keyed `(col, id)` so a cursor query seeks and
+    -- streams in id order without a sort. `call_id` is the call id of
+    -- the external request the publishing invocation traces back to
+    -- (through any chain of `on-event` reactions), NULL when it traces
+    -- back to none.
+    CREATE TABLE event_log (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        received_ms   INTEGER NOT NULL,
+        payload_ms    INTEGER NOT NULL,
+        device_id     TEXT,
+        instance_id   TEXT NOT NULL,
+        plugin_id     TEXT NOT NULL,
+        topic         TEXT NOT NULL,
+        payload_blob  BLOB NOT NULL,
+        call_id       TEXT
+    );
+
+    CREATE INDEX evt_received ON event_log(received_ms);
+    CREATE INDEX evt_device   ON event_log(device_id, id) WHERE device_id IS NOT NULL;
+    CREATE INDEX evt_topic    ON event_log(topic, id);
+    CREATE INDEX evt_instance ON event_log(instance_id, id);
+    CREATE INDEX evt_plugin   ON event_log(plugin_id, id);
+    CREATE INDEX event_log_call_id ON event_log(call_id) WHERE call_id IS NOT NULL;
+
+    -- Diagnostic log/trace store (`state::log_store`), fed by a
+    -- `tracing` layer. Drop-tolerant; the audit ledger is separate.
+    -- `log_span_ts` serves `span_path = ?`; prefix queries use
+    -- `substr` and only get the partial-index narrowing.
+    CREATE TABLE log_event (
+        id            INTEGER PRIMARY KEY,
+        ts_unix_ms    INTEGER NOT NULL,
+        level         INTEGER NOT NULL,
+        instance_id   TEXT,
+        plugin_id     TEXT,
+        device_id     TEXT,
+        target        TEXT NOT NULL,
+        span_path     TEXT,
+        message       TEXT NOT NULL,
+        fields_blob   BLOB
+    );
+
+    CREATE INDEX log_ts          ON log_event(ts_unix_ms);
+    CREATE INDEX log_level_ts    ON log_event(level, ts_unix_ms);
+    CREATE INDEX log_instance_ts ON log_event(instance_id, ts_unix_ms) WHERE instance_id IS NOT NULL;
+    CREATE INDEX log_plugin_ts   ON log_event(plugin_id, ts_unix_ms)   WHERE plugin_id   IS NOT NULL;
+    CREATE INDEX log_device_ts   ON log_event(device_id, ts_unix_ms)   WHERE device_id   IS NOT NULL;
+    CREATE INDEX log_target_ts   ON log_event(target, ts_unix_ms);
+    CREATE INDEX log_span_ts     ON log_event(span_path, ts_unix_ms)   WHERE span_path   IS NOT NULL;
+
+    -- Blob index (`state::blobs`); the bytes live under
+    -- `<state_dir>/blobs/`. `blob` maps a plugin-chosen name to the
+    -- host-minted id; the UNIQUE `blob_by_id` makes an id collision
+    -- fail the write. `blob_usage` mirrors `kv_usage`: the quota check
+    -- is in `blobs::write`, the triggers only keep the count.
+    -- `blob_usage_update` covers in-place `size_bytes` changes; the
+    -- write path replaces rows with DELETE + INSERT today.
     CREATE TABLE blob (
         installation_uuid TEXT NOT NULL,
         instance_id       TEXT NOT NULL,
@@ -677,154 +203,105 @@ const MIGRATIONS: &[&str] = &[
          WHERE installation_uuid = NEW.installation_uuid
            AND instance_id       = NEW.instance_id;
     END;
-    ",
-    // Migration 15 — Phase 13 slice 3: dashboard storage.
-    //
-    // User-composed dashboards (rows of widgets, per the UI
-    // architecture design note). Persisted centrally so the
-    // shell can show the same dashboard on any browser the
-    // operator logs in from, and so a host restart doesn't
-    // lose the layout.
-    //
-    // `layout_json` is the tree the shell serializes — the
-    // host treats it as opaque bytes; the *shape* is the
-    // shell's contract with itself, versioned by
-    // `schema_version` so a widget catalog change (widget
-    // renamed / removed / config-shape migrated) can drive
-    // a declarative shell-side transform on load.
-    //
-    // `owner_user_id` is v1's row-level ownership key. Every
-    // row carries the stable literal `"admin"` (see
-    // `DASHBOARD_ADMIN_OWNER` in `oxidhome-core::api::server`
-    // and the Phase 13 round-2 F2 doc trail on
-    // `state::dashboards`). It is deliberately NOT the
-    // Phase 12 `Actor::id()` — that returns a per-token id
-    // that rotates when the operator mints a new token,
-    // which would silo dashboards per-token and strand rows
-    // on rotation. The multi-user follow-up will require a
-    // one-line migration to map the placeholder onto the
-    // real session identity:
-    // `UPDATE dashboard SET owner_user_id = <real id> WHERE owner_user_id = 'admin'`.
-    // `created_ms` / `updated_ms` are host wall-clock — the
-    // shell shows relative timestamps off them.
-    //
-    // `by_owner` index is what the list-dashboards endpoint
-    // scans; primary-key ordering happens to match creation
-    // order which is fine for the common case.
-    "
+
+    -- API tokens (`state::auth_token`): 256-bit random secrets stored
+    -- as plain SHA-256 hashes. `scope_json` is the token's policy.
+    -- `revoked_ms` is a tombstone; rows are kept for the audit trail.
+    -- `owner` marks the owner token (first-run bootstrap or
+    -- `recover-admin-token`); the partial unique index keeps one live
+    -- owner.
+    CREATE TABLE auth_token (
+      id            TEXT PRIMARY KEY,
+      label         TEXT NOT NULL,
+      hash          BLOB NOT NULL,
+      scope_json    BLOB NOT NULL,
+      created_ms    INTEGER NOT NULL,
+      last_used_ms  INTEGER,
+      revoked_ms    INTEGER,
+      owner         INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    CREATE UNIQUE INDEX auth_token_hash ON auth_token(hash);
+    CREATE UNIQUE INDEX auth_token_one_owner ON auth_token(owner)
+     WHERE owner = 1 AND revoked_ms IS NULL;
+
+    -- Audit ledger (`state::audit_log`), separate from `log_event` so
+    -- diagnostic bursts can't evict it. Request rows are written in two
+    -- phases (a `pending` intent before the handler runs, finalized
+    -- after) so a cancelled request still leaves evidence; rows whose
+    -- outcome is known up front (unauthenticated probes, command
+    -- resolutions) are inserted finalized. `decision` is the
+    -- authorization outcome and `status` the wire status;
+    -- `execution_outcome` / `domain_error` record what the plugin did.
+    -- `call_id` / `invocation_json` carry the invocation context
+    -- (shared by an entry point and its delegated hops),
+    -- `command_id` / `command_outcome` the explicit device-command
+    -- outcome, and `level` is `warn` on sensitive-action rows. On a
+    -- reaction's rows `caused_by` is the call id of the event it
+    -- reacts to.
+    CREATE TABLE audit_event (
+      id                INTEGER PRIMARY KEY,
+      intent_ms         INTEGER NOT NULL,
+      finalized_ms      INTEGER,
+      token_id          TEXT NOT NULL,
+      actor_kind        TEXT NOT NULL,
+      method            TEXT NOT NULL,
+      path              TEXT NOT NULL,
+      status            INTEGER NOT NULL,
+      decision          TEXT NOT NULL,
+      required_scope    TEXT,
+      credential_fp     TEXT,
+      execution_outcome TEXT,
+      domain_error      TEXT,
+      call_id           TEXT,
+      invocation_json   TEXT,
+      command_id        TEXT,
+      command_outcome   TEXT,
+      level             TEXT,
+      caused_by         TEXT
+    ) STRICT;
+    CREATE INDEX audit_intent   ON audit_event(intent_ms);
+    CREATE INDEX audit_token_ts ON audit_event(token_id, intent_ms);
+    CREATE INDEX audit_call     ON audit_event(call_id) WHERE call_id IS NOT NULL;
+    CREATE INDEX audit_caused_by ON audit_event(caused_by) WHERE caused_by IS NOT NULL;
+
+    -- Plugin installations (`state::installed_plugins`). Every install
+    -- mints a fresh `installation_uuid`, which feeds device ids and
+    -- keys per-instance state; uninstall sets `uninstalled_ms` (a
+    -- tombstone), and only one live row per `plugin_id` may exist.
+    -- `granted_capabilities_json` is what the host approved, separate
+    -- from what the manifest requests; `content_digest` binds that
+    -- grant to the installed package's bytes.
+    CREATE TABLE plugin_installation (
+      installation_uuid         TEXT PRIMARY KEY,
+      plugin_id                 TEXT NOT NULL,
+      version                   TEXT NOT NULL,
+      installed_ms              INTEGER NOT NULL,
+      uninstalled_ms            INTEGER,
+      granted_capabilities_json TEXT,
+      content_digest            TEXT
+    ) STRICT;
+    CREATE UNIQUE INDEX plugin_installation_live
+      ON plugin_installation(plugin_id)
+      WHERE uninstalled_ms IS NULL;
+
+    -- Dashboards (`state::dashboards`). `layout_json` is opaque to the
+    -- host; `schema_version` versions its shape for the shell.
     CREATE TABLE dashboard (
-        id            INTEGER PRIMARY KEY,
-        name          TEXT NOT NULL,
-        owner_user_id TEXT NOT NULL,
-        layout_json   BLOB NOT NULL,
+        id             INTEGER PRIMARY KEY,
+        name           TEXT NOT NULL,
+        owner_user_id  TEXT NOT NULL,
+        layout_json    BLOB NOT NULL,
         schema_version INTEGER NOT NULL DEFAULT 1,
-        created_ms    INTEGER NOT NULL,
-        updated_ms    INTEGER NOT NULL
+        created_ms     INTEGER NOT NULL,
+        updated_ms     INTEGER NOT NULL
     );
     CREATE INDEX dashboard_by_owner ON dashboard(owner_user_id);
-    ",
-    // 16 — Phase 14.3 follow-up (round-3 P1 on PR #157):
-    // switch `event_log.id` from plain `INTEGER PRIMARY KEY`
-    // to `INTEGER PRIMARY KEY AUTOINCREMENT`.
-    //
-    // Without `AUTOINCREMENT`, `INTEGER PRIMARY KEY` is a
-    // ROWID alias — SQLite reuses ids after a DELETE removes
-    // the current max. Retention (`DELETE FROM event_log
-    // WHERE received_ms < ?1`) normally deletes the oldest
-    // rows (lowest ids) so reuse can't fire, BUT under a
-    // wall-clock rollback a *fresh* insert lands with a
-    // lower `received_ms` and a higher id — retention then
-    // deletes that fresh row (matches the cutoff) and the
-    // next insert reuses its id. A durable MCP-subscribe
-    // cursor at `after_id = <reused id>` would then see the
-    // NEW row as an already-seen event and miss it.
-    //
-    // `AUTOINCREMENT` binds ids to a monotonic counter in
-    // `sqlite_sequence` so a reused id is never issued. The
-    // migration rebuilds `event_log` in place — SQLite has
-    // no `ALTER TABLE` for this — preserving every row's
-    // existing id (and recreating every index, the filter
-    // ones rekeyed to `(col, id)` — see below) so any client
-    // that already saved an `after_id` cursor keeps working.
-    // Copying the rows with their explicit ids makes SQLite
-    // seed the `sqlite_sequence` counter at the max existing
-    // id, so post-migration inserts continue from there.
-    "
-    CREATE TABLE event_log_new (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
-        received_ms   INTEGER NOT NULL,
-        payload_ms    INTEGER NOT NULL,
-        device_id     TEXT,
-        instance_id   TEXT NOT NULL,
-        plugin_id     TEXT NOT NULL,
-        topic         TEXT NOT NULL,
-        payload_blob  BLOB NOT NULL
-    );
 
-    INSERT INTO event_log_new
-        (id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
-    SELECT id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob
-      FROM event_log;
-
-    DROP TABLE event_log;
-    ALTER TABLE event_log_new RENAME TO event_log;
-
-    -- No explicit `sqlite_sequence` seed. `AUTOINCREMENT`
-    -- tables track their high-water mark automatically: an
-    -- INSERT with an explicit id ≥ the current seq raises
-    -- the seq to that id (see SQLite `AUTOINCREMENT` docs).
-    -- The bulk copy above already advanced the sequence to
-    -- `MAX(id)`; a manual `INSERT OR REPLACE INTO
-    -- sqlite_sequence(name, seq)` would create a *duplicate*
-    -- row because the table has no unique constraint on
-    -- `name`, and AUTOINCREMENT might then read either row.
-    -- Round-4 P1 on PR #157.
-
-    -- Filter indexes are keyed `(col, id)`, not `(col,
-    -- received_ms)`: `EventLog::query` now orders by `id`
-    -- and pages on `id` cursors, so `(col, id)` lets SQLite
-    -- seek `col = ? AND id > ?` and stream rows in ORDER BY
-    -- order. The old time-keyed shape forced a scan of every
-    -- matching row plus a temp B-tree sort per query (round-8
-    -- P2). `evt_received` stays for retention + `since`.
-    CREATE INDEX evt_received ON event_log(received_ms);
-    CREATE INDEX evt_device   ON event_log(device_id, id) WHERE device_id IS NOT NULL;
-    CREATE INDEX evt_topic    ON event_log(topic, id);
-    CREATE INDEX evt_instance ON event_log(instance_id, id);
-    CREATE INDEX evt_plugin   ON event_log(plugin_id, id);
-    ",
-    // 17 — architecture-review H6: invocation context on the audit
-    // ledger. Every authenticated request now runs under a
-    // host-minted `call_id`; the entry point's row and every
-    // downstream row it causes (delegated `call-service` hops,
-    // `method = 'CALL'`) carry the same id plus a JSON summary of
-    // the root principal and delegation chain. Both nullable:
-    // pre-17 rows and anonymous probes have no invocation. The
-    // partial index serves `GET /api/v1/audit?call_id=…`.
-    "
-    ALTER TABLE audit_event ADD COLUMN call_id TEXT;
-    ALTER TABLE audit_event ADD COLUMN invocation_json TEXT;
-    CREATE INDEX audit_call ON audit_event(call_id) WHERE call_id IS NOT NULL;
-    ",
-    // 18 — architecture-review H5 / ADR-0003: explicit device-command
-    // outcomes. A device-command row carries the host-minted
-    // `command_id` and its outcome (`accepted` / `completed` /
-    // `rejected` / `timed_out` / `outcome_unknown`); the
-    // `method = 'COMMAND'` resolution rows written when an accepted
-    // command completes or expires carry the same id. Both nullable:
-    // every other row leaves them NULL.
-    "
-    ALTER TABLE audit_event ADD COLUMN command_id TEXT;
-    ALTER TABLE audit_event ADD COLUMN command_outcome TEXT;
-    ",
-    // 19 — architecture-review H2: durable device-state projection.
-    // One row per `(device_id, capability)` slot of the in-memory
-    // `DeviceStateStore`, written off the publish path by its
-    // coalescing flusher. `device_state_meta` is a single row: the
-    // store epoch, the revision the rows were flushed at, the stale
-    // eviction watermark and the JSON list of revision ranges that
-    // earlier boots skipped (cursors inside one must resync).
-    "
+    -- Durable device-state projection (`state::device_state`): one row
+    -- per `(device_id, capability)` slot, written by the coalescing
+    -- flusher. `device_state_meta` is a single row: store epoch, the
+    -- revision the rows were flushed at, the eviction watermark and the
+    -- revision ranges earlier boots skipped.
     CREATE TABLE device_state (
         device_id         TEXT NOT NULL,
         capability        TEXT NOT NULL,
@@ -848,17 +325,11 @@ const MIGRATIONS: &[&str] = &[
         holes_json        TEXT NOT NULL,
         writer            TEXT NOT NULL
     );
-    ",
-    // 20 — architecture-review H5 / ADR-0003 follow-up: pending
-    // `accepted` device commands survive a daemon restart. One row per
-    // externally-rooted command a plugin answered with `accepted`,
-    // written behind the command path by the engine's command-journal
-    // writer and deleted in the same transaction as the command's
-    // `COMMAND` resolution row. Rows still present at boot are
-    // resolved to `outcome_unknown` (daemon restart, or expiry when
-    // `expires_ms` already passed). The audit linkage columns copy the
-    // request's `audit_event` attribution.
-    "
+
+    -- Externally-rooted device commands a plugin answered `accepted`
+    -- (`runtime::command_journal`). Deleted with the command's
+    -- `COMMAND` resolution row; rows left at boot resolve to
+    -- `outcome_unknown`.
     CREATE TABLE pending_command (
         command_id       TEXT PRIMARY KEY NOT NULL,
         call_id          TEXT NOT NULL,
@@ -871,49 +342,10 @@ const MIGRATIONS: &[&str] = &[
         actor_kind       TEXT NOT NULL,
         invocation_json  TEXT NOT NULL
     ) WITHOUT ROWID;
-    ",
-    // 21 — H6 slice 2: sensitive device categories.
-    //
-    // - `auth_token.owner` marks the owner token: the one the host
-    //   minted at first-run bootstrap or with `recover-admin-token`.
-    //   The owner holds every sensitive category; every other
-    //   wildcard token loses them. The flag is backfilled from the
-    //   host's own audit rows for those two actions (`method = LOCAL`,
-    //   which no API, Connect or MCP request can produce) on tokens
-    //   that still hold exactly the minted `["*"]` scope, and set at
-    //   insert by those two code paths from now on. Only the newest
-    //   live candidate becomes the owner, and a partial unique index
-    //   keeps it to one live owner. It is a column
-    //   rather than a lookup because audit retention prunes the rows.
-    // - `audit_event.level`: `warn` on the extra row every allowed
-    //   sensitive action writes; NULL (info) otherwise.
-    // - `device_meta`: per device id, the sensitive categories the host
-    //   has ever derived (a floor a plugin can't lower), the operator's
-    //   category raise, and the registering instance. See
-    //   `state::device_meta`. Backfilled with a `camera` floor for
-    //   every device whose `video-stream` state or state-change
-    //   events (a `StateChanged` payload, not a custom event that
-    //   happens to share the topic) are persisted, so the
-    //   state restored before plugins load (and the instance's blobs)
-    //   is camera data from the first read after upgrade. The other
-    //   sensitive capabilities are new in this version.
-    "
-    ALTER TABLE auth_token ADD COLUMN owner INTEGER NOT NULL DEFAULT 0;
-    UPDATE auth_token SET owner = 1
-     WHERE id = (
-       SELECT id FROM auth_token
-        WHERE CAST(scope_json AS TEXT) = '[\"*\"]'
-          AND revoked_ms IS NULL
-          AND id IN (
-            SELECT token_id FROM audit_event
-             WHERE method = 'LOCAL'
-               AND ((actor_kind = 'host' AND path = 'host.auth.bootstrap')
-                 OR (actor_kind = 'cli' AND path = 'cli.auth.recover')))
-        ORDER BY created_ms DESC, id DESC
-        LIMIT 1);
-    CREATE UNIQUE INDEX auth_token_one_owner ON auth_token(owner)
-     WHERE owner = 1 AND revoked_ms IS NULL;
-    ALTER TABLE audit_event ADD COLUMN level TEXT;
+
+    -- Per device (`state::device_meta`): the sensitive categories the
+    -- host has ever derived (a floor a plugin can't lower), the
+    -- operator's category raise, and the registering instance.
     CREATE TABLE device_meta (
         device_id          TEXT PRIMARY KEY NOT NULL,
         owner_instance     TEXT,
@@ -921,36 +353,21 @@ const MIGRATIONS: &[&str] = &[
         category_override  TEXT,
         updated_ms         INTEGER NOT NULL
     ) STRICT, WITHOUT ROWID;
-    INSERT INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
-    SELECT device_id, owner_instance, 'camera', NULL, 0
-      FROM device_state WHERE capability = 'video-stream';
-    INSERT OR IGNORE INTO device_meta(device_id, owner_instance, sensitive_floor, category_override, updated_ms)
-    SELECT device_id, MIN(instance_id), 'camera', NULL, 0
-      FROM event_log
-     WHERE topic = 'video-stream' AND device_id IS NOT NULL
-       AND json_valid(payload_blob)
-       AND json_extract(payload_blob, '$.t') = 'StateChanged'
-       AND json_extract(payload_blob, '$.v.capability') = 'video-stream'
-     GROUP BY device_id;
-    ",
-    // 22 — ADR-0001 follow-up: a removed script sandbox's storage purge
-    // is announced here before it starts and the row deleted once it
-    // succeeded. While a row exists the sandbox id can't be reused; a
-    // purge a failure, shutdown or crash left unfinished runs again at
-    // the next boot.
-    "
+
+    -- A removed script sandbox's storage purge (ADR-0001), announced
+    -- before it starts and deleted once it succeeded. While a row
+    -- exists the sandbox id can't be reused; an unfinished purge runs
+    -- again at the next boot.
     CREATE TABLE sandbox_removal (
         installation_uuid TEXT NOT NULL,
         instance_id       TEXT NOT NULL,
         created_ms        INTEGER NOT NULL,
         PRIMARY KEY (installation_uuid, instance_id)
     ) WITHOUT ROWID;
-    ",
-    // 23 — H6 slice 3: owner-defined roles. A token policy references
-    // a role by `id`, so a rename or an edit of `definition` (grants,
-    // sensitive categories, denies as JSON) applies to every token
-    // holding it from the next request on.
-    "
+
+    -- Owner-defined roles (`state::auth_role`). Token policies name a
+    -- role by `id`, so an edit of its definition applies to every
+    -- holder.
     CREATE TABLE auth_role (
         id          TEXT PRIMARY KEY,
         name        TEXT NOT NULL UNIQUE,
@@ -958,35 +375,21 @@ const MIGRATIONS: &[&str] = &[
         created_ms  INTEGER NOT NULL,
         updated_ms  INTEGER NOT NULL
     ) WITHOUT ROWID;
-    ",
-    // 24 — Phase 8.2: certificates streaming instances trusted on first
-    // use for LAN devices, keyed by the request's host and port. The
-    // operator resets them (`oxidhome tls-pin reset`, REST, Connect);
-    // uninstalling the plugin whose instance made a pin deletes it.
-    "
+
+    -- Certificates streaming instances trusted on first use for LAN
+    -- devices (`state::tls_pins`), keyed by instance, the request's
+    -- host and port, and plugin installation. Reset by the operator;
+    -- deleted with the plugin's uninstall.
     CREATE TABLE network_tls_pin (
-        instance_id TEXT NOT NULL,
-        host        TEXT NOT NULL,
-        port        INTEGER NOT NULL,
-        sha256      TEXT NOT NULL,
-        pinned_ms   INTEGER NOT NULL,
+        instance_id       TEXT NOT NULL,
+        host              TEXT NOT NULL,
+        port              INTEGER NOT NULL,
+        sha256            TEXT NOT NULL,
+        pinned_ms         INTEGER NOT NULL,
         installation_uuid TEXT NOT NULL,
         PRIMARY KEY (instance_id, host, port, installation_uuid)
     ) WITHOUT ROWID;
-    ",
-    // 25 — H6 slice 4: events carry attribution. `event_log.call_id` is
-    // the call id of the attributable invocation that published the
-    // event (an external request, or an `on-event` reaction to one);
-    // `audit_event.caused_by` is, on a reaction's rows, the call id of
-    // the event it reacts to. Both NULL on older rows; both indexed
-    // (partial) so "everything request X caused" is a lookup.
-    "
-    ALTER TABLE event_log ADD COLUMN call_id TEXT;
-    CREATE INDEX event_log_call_id ON event_log(call_id) WHERE call_id IS NOT NULL;
-    ALTER TABLE audit_event ADD COLUMN caused_by TEXT;
-    CREATE INDEX audit_caused_by ON audit_event(caused_by) WHERE caused_by IS NOT NULL;
-    ",
-];
+";
 
 /// File name of the host database inside the state dir.
 pub const DB_FILE_NAME: &str = "oxidhome.db";
@@ -1042,12 +445,25 @@ pub const LOW_PRIORITY_MAX_DEFER: Duration = Duration::from_millis(250);
 
 /// Connection-model knobs. [`Db::open_file`] uses the defaults
 /// above; tests shrink the intervals to observe the policy without
-/// waiting on wall-clock time.
-#[derive(Debug, Clone, Copy)]
+/// waiting on wall-clock time, and swap in a longer migration list to
+/// exercise the upgrade path.
+#[derive(Clone, Copy)]
 pub(crate) struct ConnectionPolicy {
     pub(crate) read_pool_size: usize,
     pub(crate) checkpoint_interval: Duration,
     pub(crate) low_priority_max_defer: Duration,
+    pub(crate) migrations: &'static [&'static str],
+}
+
+impl std::fmt::Debug for ConnectionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionPolicy")
+            .field("read_pool_size", &self.read_pool_size)
+            .field("checkpoint_interval", &self.checkpoint_interval)
+            .field("low_priority_max_defer", &self.low_priority_max_defer)
+            .field("migrations", &self.migrations.len())
+            .finish()
+    }
 }
 
 impl Default for ConnectionPolicy {
@@ -1056,6 +472,7 @@ impl Default for ConnectionPolicy {
             read_pool_size: READ_POOL_SIZE,
             checkpoint_interval: CHECKPOINT_INTERVAL,
             low_priority_max_defer: LOW_PRIORITY_MAX_DEFER,
+            migrations: MIGRATIONS,
         }
     }
 }
@@ -1098,13 +515,6 @@ pub struct Db {
     /// `Db`, so no connection outlives it.
     checkpointer: Option<Checkpointer>,
     policy: ConnectionPolicy,
-    /// `user_version` observed *before* this process open ran any
-    /// migrations. Callers use this to detect "did migration N just
-    /// run this boot" — the H2 round-2 F3 one-shot blob-root sweep
-    /// checks `pre_open_user_version < 14` to decide whether to
-    /// reclaim legacy pre-migration-14 blob trees. `0` for a fresh
-    /// (empty) database.
-    pre_open_user_version: i64,
     /// Highest `audit_event` id when the first audit handle of this
     /// process opened (see [`Self::audit_boot_floor`]).
     audit_boot_floor: std::sync::OnceLock<i64>,
@@ -1242,16 +652,10 @@ impl Db {
         conn: Connection,
         policy: ConnectionPolicy,
     ) -> anyhow::Result<Self> {
-        // Read the on-file `user_version` before touching the
-        // schema, so callers can distinguish "we just applied
-        // migration N this open" from "N had already been applied
-        // in a prior process." The H2 round-2 F3 blob-root sweep
-        // uses this to run its one-shot cleanup exactly once, on
-        // the first boot after the migration-14 upgrade.
         let pre_open_user_version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading user_version pre-migration")?;
-        let target = schema_version();
+        let target = i64::try_from(policy.migrations.len()).expect("migration count fits in i64");
         // M3: no silent downgrade. Running against a newer schema
         // would skip migrations this binary doesn't know about and
         // read / write tables in a shape it wasn't built for.
@@ -1287,22 +691,10 @@ impl Db {
             readers: None,
             checkpointer: None,
             policy,
-            pre_open_user_version,
             audit_boot_floor: std::sync::OnceLock::new(),
         };
         db.apply_migrations()?;
         Ok(db)
-    }
-
-    /// H2 round-2 F3: the `user_version` this process observed
-    /// *before* running any migrations. Zero for a fresh DB.
-    /// Called by [`crate::Engine::with_state_dir`] to decide
-    /// whether the one-shot blob-root sweep should run (only
-    /// when `pre_open_user_version < 14` — i.e., migration 14
-    /// just applied this boot).
-    #[must_use]
-    pub fn pre_open_user_version(&self) -> i64 {
-        self.pre_open_user_version
     }
 
     fn apply_migrations(&self) -> anyhow::Result<()> {
@@ -1311,8 +703,9 @@ impl Db {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("reading user_version")?;
         let mut next = usize::try_from(current).context("user_version is negative")?;
-        while next < MIGRATIONS.len() {
-            let body = MIGRATIONS[next];
+        let migrations = self.policy.migrations;
+        while next < migrations.len() {
+            let body = migrations[next];
             let new_version = next + 1;
             let tx = conn
                 .transaction()
@@ -1553,7 +946,6 @@ impl std::fmt::Debug for Db {
             .field("conn", &"<rusqlite::Connection>")
             .field("read_pool", &self.readers.as_ref().map(|p| p.max))
             .field("policy", &self.policy)
-            .field("pre_open_user_version", &self.pre_open_user_version)
             .finish_non_exhaustive()
     }
 }
@@ -1990,7 +1382,7 @@ mod tests {
         .expect("read");
     }
 
-    /// H6 slice 4 (migration 25): lookups by request call id use the
+    /// Lookups by request call id use the
     /// partial indexes on `event_log.call_id` and
     /// `audit_event.caused_by`.
     #[test]
@@ -2082,377 +1474,27 @@ mod tests {
         }
     }
 
-    /// Round-5 P2 on PR #157: exercise the ACTUAL v15→v16
-    /// migration path, not just the post-migration
-    /// behaviour. Simulates a persisted v15 database
-    /// (`event_log` without `AUTOINCREMENT`) by:
-    ///
-    /// 1. Opening a Db (runs every migration, through 16), then
-    ///    reverting to v15 shape: DROP the post-16
-    ///    `event_log`, recreate it under the pre-16
-    ///    `INTEGER PRIMARY KEY` schema, INSERT rows with
-    ///    known ids, PRAGMA `user_version` = 15.
-    /// 2. Reopening the same file — `apply_migrations`
-    ///    sees `user_version = 15 < 16` and runs migration
-    ///    16 exactly.
-    ///
-    /// Then asserts: `user_version = 16`, existing rows
-    /// preserved verbatim (id + payload), no duplicate
-    /// `sqlite_sequence` rows, AUTOINCREMENT high-water
-    /// tracked correctly (next insert gets `max_existing +
-    /// 1`, and reissuing after deleting that new max still
-    /// bumps rather than reuses).
-    // Two-phase reopen + full post-migration invariant sweep
-    // — splitting into per-assertion helpers would obscure
-    // the "same file, closed and reopened, migration ran"
-    // narrative the test depends on.
-    #[test]
-    fn migration_21_backfills_the_owner_from_bootstrap_audit_rows() {
-        let dir = tempdir_for_test();
-        {
-            let db = Db::open_file(dir.path()).expect("open");
-            db.write(|conn| -> rusqlite::Result<()> {
-                conn.execute_batch(
-                    "
-                    DROP INDEX audit_caused_by;
-                    ALTER TABLE audit_event DROP COLUMN caused_by;
-                    DROP INDEX event_log_call_id;
-                    ALTER TABLE event_log DROP COLUMN call_id;
-                    DROP TABLE network_tls_pin;
-                    DROP TABLE auth_role;
-                    DROP TABLE sandbox_removal;
-                    DROP TABLE device_meta;
-                    ALTER TABLE audit_event DROP COLUMN level;
-                    DROP INDEX auth_token_one_owner;
-                    ALTER TABLE auth_token DROP COLUMN owner;
-                    INSERT INTO auth_token(id, label, hash, scope_json, created_ms)
-                    VALUES ('boot', 'admin', X'01', CAST('[\"*\"]' AS BLOB), 1),
-                           ('recovered', 'admin', X'02', CAST('[\"*\"]' AS BLOB), 2),
-                           ('minted', 'admin', X'03', CAST('[\"*\"]' AS BLOB), 3),
-                           ('spoof', 'x', X'04', CAST('[\"*\"]' AS BLOB), 4),
-                           ('narrowed', 'x', X'05', CAST('[\"devices:list\"]' AS BLOB), 5);
-                    INSERT INTO audit_event(intent_ms, token_id, actor_kind, method, path, status, decision)
-                    VALUES (1, 'boot', 'host', 'LOCAL', 'host.auth.bootstrap', 200, 'allow'),
-                           (2, 'recovered', 'cli', 'LOCAL', 'cli.auth.recover', 200, 'allow'),
-                           -- Wrong actor or method: an API request can't
-                           -- forge the owner by its path.
-                           (3, 'spoof', 'api', 'POST', 'host.auth.bootstrap', 200, 'allow'),
-                           (4, 'spoof', 'api', 'LOCAL', 'host.auth.bootstrap', 200, 'allow'),
-                           (5, 'narrowed', 'host', 'LOCAL', 'host.auth.bootstrap', 200, 'allow');
-                    INSERT INTO device_state(device_id, capability, owner_instance, owner_plugin,
-                        owner_install, fields_blob, global_revision, received_ms, observed_ms,
-                        source_generation, quality)
-                    VALUES ('dev-00000000000000aa', 'video-stream', 'cam', 'p', 'u', X'00', 1, 1, 1, 1, 'ok'),
-                           ('dev-00000000000000bb', 'on-off', 'cam', 'p', 'u', X'00', 2, 1, 1, 1, 'ok');
-                    -- State evicted, history kept.
-                    INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
-                    VALUES (1, 1, 'dev-00000000000000cc', 'cam2', 'p', 'video-stream',
-                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
-                           (2, 2, 'dev-00000000000000aa', 'cam', 'p', 'video-stream',
-                            CAST('{\"t\":\"StateChanged\",\"v\":{\"capability\":\"video-stream\",\"fields\":[]}}' AS BLOB)),
-                           (3, 3, 'dev-00000000000000dd', 'lamp', 'p', 'on-off', X'00'),
-                           -- A custom event sharing the topic is not a camera.
-                           (4, 4, 'dev-00000000000000ee', 'lamp', 'p', 'video-stream',
-                            CAST('{\"t\":\"Custom\",\"v\":{\"topic\":\"video-stream\"}}' AS BLOB));
-                    PRAGMA user_version = 20;
-                    ",
-                )
-            })
-            .expect("rewind to v20");
+    /// The shipped migrations plus one more, so the upgrade path
+    /// (preflight snapshot, then the pending migration) has something
+    /// to apply.
+    const UPGRADE_MIGRATIONS: &[&str] =
+        &[INITIAL_SCHEMA, "CREATE TABLE upgrade_probe (x INTEGER);"];
+
+    fn upgrade_policy() -> ConnectionPolicy {
+        ConnectionPolicy {
+            migrations: UPGRADE_MIGRATIONS,
+            ..ConnectionPolicy::default()
         }
-        let db = Db::open_file(dir.path()).expect("reopen");
-        let owners: Vec<String> = db
-            .read(|c| {
-                let mut stmt =
-                    c.prepare("SELECT id FROM auth_token WHERE owner = 1 ORDER BY id")?;
-                stmt.query_map([], |r| r.get(0))?.collect()
-            })
-            .expect("owners");
-        // One live owner: the newest candidate.
-        assert_eq!(owners, vec!["recovered".to_string()]);
-        let floors: Vec<(String, String, String)> = db
-            .read(|c| {
-                let mut stmt = c.prepare(
-                    "SELECT device_id, owner_instance, sensitive_floor FROM device_meta \
-                     ORDER BY device_id",
-                )?;
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                    .collect()
-            })
-            .expect("floors");
-        assert_eq!(
-            floors,
-            vec![
-                (
-                    "dev-00000000000000aa".to_string(),
-                    "cam".to_string(),
-                    "camera".to_string()
-                ),
-                (
-                    "dev-00000000000000cc".to_string(),
-                    "cam2".to_string(),
-                    "camera".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn migration_16_from_v15_preserves_ids_and_enables_autoincrement() {
-        let dir = tempdir_for_test();
-
-        // Phase 1: open, drop the post-16 event_log, seed a
-        // pre-16 event_log with fixed ids, roll user_version
-        // back to 15.
-        {
-            let db = Db::open_file(dir.path()).expect("open");
-            db.write(|conn| -> rusqlite::Result<()> {
-                conn.execute_batch(
-                    "
-                    -- Undo every migration after 16 so the file is a
-                    -- genuine v15 state; reopening re-applies them.
-                    -- 25: event and reaction attribution.
-                    DROP INDEX audit_caused_by;
-                    ALTER TABLE audit_event DROP COLUMN caused_by;
-                    -- 24: TLS certificate pins.
-                    DROP TABLE network_tls_pin;
-                    -- 23: owner-defined roles.
-                    DROP TABLE auth_role;
-                    -- 22: sandbox removal markers.
-                    DROP TABLE sandbox_removal;
-                    -- 21 (H6 slice 2): owner flag, audit level,
-                    -- device categories.
-                    DROP TABLE device_meta;
-                    ALTER TABLE audit_event DROP COLUMN level;
-                    DROP INDEX auth_token_one_owner;
-                    ALTER TABLE auth_token DROP COLUMN owner;
-                    -- 20 (H5): pending commands.
-                    DROP TABLE pending_command;
-                    -- 19 (H2): device-state tables.
-                    DROP TABLE device_state;
-                    DROP TABLE device_state_meta;
-                    -- 18 (H5): audit_event command columns.
-                    ALTER TABLE audit_event DROP COLUMN command_outcome;
-                    ALTER TABLE audit_event DROP COLUMN command_id;
-                    -- 17 (H6): audit_event invocation columns.
-                    DROP INDEX audit_call;
-                    ALTER TABLE audit_event DROP COLUMN invocation_json;
-                    ALTER TABLE audit_event DROP COLUMN call_id;
-                    DROP TABLE IF EXISTS event_log;
-                    -- Pre-migration-16 schema: `INTEGER PRIMARY
-                    -- KEY` without `AUTOINCREMENT` (ROWID
-                    -- semantics).
-                    CREATE TABLE event_log (
-                        id            INTEGER PRIMARY KEY,
-                        received_ms   INTEGER NOT NULL,
-                        payload_ms    INTEGER NOT NULL,
-                        device_id     TEXT,
-                        instance_id   TEXT NOT NULL,
-                        plugin_id     TEXT NOT NULL,
-                        topic         TEXT NOT NULL,
-                        payload_blob  BLOB NOT NULL
-                    );
-                    -- Two rows with explicit ids so we can
-                    -- assert preservation across the rebuild.
-                    INSERT INTO event_log(id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
-                    VALUES (5, 100, 100, NULL, 'alpha', 'example.alpha', 't', X'00');
-                    INSERT INTO event_log(id, received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob)
-                    VALUES (9, 200, 200, NULL, 'alpha', 'example.alpha', 't', X'01');
-                    ",
-                )?;
-                // No `sqlite_sequence` cleanup needed: SQLite
-                // deletes an AUTOINCREMENT table's sequence row
-                // when the table is dropped, so the DROP above
-                // already leaves the clean pre-16 state.
-                Ok(())
-            })
-            .expect("seed pre-migration state");
-            db.write(|conn| -> rusqlite::Result<()> {
-                conn.execute_batch("PRAGMA user_version = 15")?;
-                Ok(())
-            })
-            .expect("roll user_version back");
-        }
-
-        // Phase 2: reopen — `apply_migrations` sees v15 and
-        // applies migration 16 onward.
-        let db = Db::open_file(dir.path()).expect("reopen");
-
-        let version: i64 = db
-            .read(|c| c.pragma_query_value(None, "user_version", |row| row.get(0)))
-            .expect("user_version");
-        assert_eq!(
-            version,
-            i64::try_from(MIGRATIONS.len()).unwrap(),
-            "migration 16 onward must have applied",
-        );
-
-        // Existing rows preserved verbatim.
-        let (id_5_ms, id_9_ms): (i64, i64) = db
-            .read(|c| -> rusqlite::Result<_> {
-                let a: i64 =
-                    c.query_row("SELECT received_ms FROM event_log WHERE id = 5", (), |r| {
-                        r.get(0)
-                    })?;
-                let b: i64 =
-                    c.query_row("SELECT received_ms FROM event_log WHERE id = 9", (), |r| {
-                        r.get(0)
-                    })?;
-                Ok((a, b))
-            })
-            .expect("read preserved rows");
-        assert_eq!((id_5_ms, id_9_ms), (100, 200));
-
-        // No duplicate `sqlite_sequence` rows for
-        // `event_log` (round-4 P1: the removed manual seed
-        // used to append a duplicate row here).
-        let seq_rows: i64 = db
-            .read(|c| {
-                c.query_row(
-                    "SELECT COUNT(*) FROM sqlite_sequence WHERE name = 'event_log'",
-                    (),
-                    |r| r.get(0),
-                )
-            })
-            .expect("count sqlite_sequence");
-        assert_eq!(seq_rows, 1, "exactly one sqlite_sequence row expected");
-
-        // High-water: seq = max existing id (9). Next
-        // insert with implicit id must be 10, not 1.
-        let next_id: i64 = db
-            .write(|conn| -> rusqlite::Result<i64> {
-                conn.execute(
-                    "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
-                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![300_i64, 300_i64, "alpha", "example.alpha", "t", &b"\x02"[..]],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })
-            .expect("insert after migration");
-        assert_eq!(
-            next_id, 10,
-            "post-migration insert must bump past MAX(id), not reuse",
-        );
-
-        // Round-4 P1: even after deleting that max, next
-        // insert must NOT reuse id=10.
-        db.write(|conn| -> rusqlite::Result<()> {
-            conn.execute("DELETE FROM event_log WHERE id = 10", ())?;
-            Ok(())
-        })
-        .expect("delete max");
-        let after_delete: i64 = db
-            .write(|conn| -> rusqlite::Result<i64> {
-                conn.execute(
-                    "INSERT INTO event_log(received_ms, payload_ms, device_id, instance_id, plugin_id, topic, payload_blob) \
-                     VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![400_i64, 400_i64, "alpha", "example.alpha", "t", &b"\x03"[..]],
-                )?;
-                Ok(conn.last_insert_rowid())
-            })
-            .expect("insert after delete-max");
-        assert_eq!(
-            after_delete, 11,
-            "AUTOINCREMENT must not reuse the deleted max id",
-        );
-    }
-
-    /// Migration 2 has to fix up `kv_usage.bytes_used` for any
-    /// instances that already accumulated character-counted totals
-    /// under migration 1. Simulate that (on top of the current
-    /// migration-14 schema — H2 rekeyed the `kv` / `kv_usage`
-    /// tables to `(installation_uuid, instance_id)`) by:
-    ///
-    /// 1. Open a fresh file DB (runs every migration on empty
-    ///    tables — nothing to re-baseline).
-    /// 2. Hand-craft a drifted row: insert a non-ASCII key and
-    ///    manually overwrite `bytes_used` with the character count
-    ///    migration 1's triggers would have produced.
-    /// 3. Run the migration-2 rebaseline body, rewritten against
-    ///    the migration-14 shape (composite PK), and confirm
-    ///    `bytes_used` jumps to the byte total.
-    ///
-    /// The invariant under test — "`bytes_used = SUM(length_of_key_in_bytes + length_of_value)`" —
-    /// is the load-bearing bit of migration 2, and it still holds
-    /// post-14. The column list changed but the math is the same.
-    #[test]
-    fn migration_2_rebaseline_corrects_drifted_bytes_used() {
-        let dir = tempdir_for_test();
-        let db = Db::open_file(dir.path()).expect("open");
-        db.write(|conn| -> rusqlite::Result<()> {
-            conn.execute(
-                "INSERT INTO kv_usage(installation_uuid, instance_id, bytes_used, bytes_quota) \
-                 VALUES (?1, ?2, 0, ?3)",
-                rusqlite::params!["inst-test-0", "alpha", 4096_i64],
-            )?;
-            // The triggers (now migration-14-shape) account this
-            // correctly on insert, so explicitly set `bytes_used` to
-            // the character total a migration-1 trigger would have
-            // produced: "αβγ" = 3 chars, value JSON = ~10 bytes.
-            conn.execute(
-                "INSERT INTO kv(installation_uuid, instance_id, key, value, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                rusqlite::params![
-                    "inst-test-0",
-                    "alpha",
-                    "αβγ",
-                    &b"{\"t\":\"Int\",\"v\":0}"[..]
-                ],
-            )?;
-            // Force the drift: pretend the row was inserted under
-            // migration 1's character-counting triggers. 3 (chars) +
-            // 17 (payload bytes) = 20, where the byte-correct total
-            // is 6 + 17 = 23.
-            conn.execute(
-                "UPDATE kv_usage SET bytes_used = 20 \
-                 WHERE installation_uuid = 'inst-test-0' AND instance_id = 'alpha'",
-                (),
-            )?;
-            Ok(())
-        })
-        .expect("seed drift");
-
-        // Migration 2's rebaseline body, rewritten against the
-        // composite `(installation_uuid, instance_id)` PK migration
-        // 14 established for the `kv` / `kv_usage` tables.
-        db.write(|conn| -> rusqlite::Result<()> {
-            conn.execute_batch(
-                "UPDATE kv_usage SET bytes_used = COALESCE((
-                    SELECT SUM(length(CAST(key AS BLOB)) + length(value))
-                      FROM kv
-                     WHERE kv.installation_uuid = kv_usage.installation_uuid
-                       AND kv.instance_id       = kv_usage.instance_id
-                ), 0);",
-            )?;
-            Ok(())
-        })
-        .expect("rebaseline");
-
-        let used: i64 = db
-            .read(|conn| {
-                conn.query_row(
-                    "SELECT bytes_used FROM kv_usage \
-                     WHERE installation_uuid = 'inst-test-0' AND instance_id = 'alpha'",
-                    (),
-                    |row| row.get(0),
-                )
-            })
-            .expect("read");
-        assert_eq!(
-            used, 23,
-            "rebaseline should produce 6 byte key + 17 byte value = 23",
-        );
     }
 
     /// Build `<dir>/oxidhome.db` at schema `version` by applying the
-    /// first `version` migrations directly (no preflight).
-    fn seed_db_at(dir: &Path, version: usize) {
+    /// first `version` of `migrations` directly (no preflight).
+    fn seed_db_at(dir: &Path, migrations: &[&str], version: usize) {
         let conn = Connection::open(dir.join(DB_FILE_NAME)).expect("open seed db");
         let _: String = conn
             .query_row("PRAGMA journal_mode = WAL", (), |r| r.get(0))
             .expect("wal");
-        for body in &MIGRATIONS[..version] {
+        for body in &migrations[..version] {
             conn.execute_batch(body).expect("seed migration");
         }
         conn.execute_batch(&format!("PRAGMA user_version = {version}"))
@@ -2474,13 +1516,23 @@ mod tests {
     #[test]
     fn migration_preflight_snapshots_the_pre_migration_database() {
         let dir = tempdir_for_test();
-        let from = MIGRATIONS.len() - 1;
-        seed_db_at(dir.path(), from);
-        let db = Db::open_file(dir.path()).expect("open + migrate");
+        let from = 1;
+        let to = UPGRADE_MIGRATIONS.len();
+        seed_db_at(dir.path(), UPGRADE_MIGRATIONS, from);
+        let db = Db::open_file_with_policy(dir.path(), upgrade_policy()).expect("open + migrate");
         let version: i64 = db
             .read(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
             .unwrap();
-        assert_eq!(version, schema_version());
+        assert_eq!(version, i64::try_from(to).unwrap());
+        let has_probe = |c: &Connection| -> bool {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'upgrade_probe')",
+                (),
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(db.read(|c| Ok::<_, rusqlite::Error>(has_probe(c))).unwrap());
 
         let snapshots = pre_migration_snapshots(dir.path());
         assert_eq!(snapshots.len(), 1, "{snapshots:?}");
@@ -2489,10 +1541,7 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        assert!(
-            name.ends_with(&format!("-v{from}-to-v{}.db", schema_version())),
-            "{name}"
-        );
+        assert!(name.ends_with(&format!("-v{from}-to-v{to}.db")), "{name}");
         let snap =
             Connection::open_with_flags(&snapshots[0], rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();
@@ -2500,6 +1549,10 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(snap_version, i64::try_from(from).unwrap());
+        assert!(
+            !has_probe(&snap),
+            "the snapshot predates the pending migration"
+        );
         let mode: String = snap
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
@@ -2519,11 +1572,11 @@ mod tests {
     #[test]
     fn failed_preflight_refuses_to_migrate() {
         let dir = tempdir_for_test();
-        let from = MIGRATIONS.len() - 1;
-        seed_db_at(dir.path(), from);
+        let from = 1;
+        seed_db_at(dir.path(), UPGRADE_MIGRATIONS, from);
         // A file where the snapshot directory should go.
         std::fs::write(dir.path().join(crate::backup::PRE_MIGRATION_DIR), b"x").unwrap();
-        let err = Db::open_file(dir.path()).unwrap_err();
+        let err = Db::open_file_with_policy(dir.path(), upgrade_policy()).unwrap_err();
         assert!(
             format!("{err:#}").contains("pre-migration snapshot"),
             "{err:#}"
@@ -2538,7 +1591,7 @@ mod tests {
     #[test]
     fn newer_schema_is_refused() {
         let dir = tempdir_for_test();
-        seed_db_at(dir.path(), MIGRATIONS.len());
+        seed_db_at(dir.path(), MIGRATIONS, MIGRATIONS.len());
         {
             let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
             conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() + 1))
@@ -2554,7 +1607,7 @@ mod tests {
     #[test]
     fn pre_migration_snapshots_are_pruned_to_the_newest() {
         let dir = tempdir_for_test();
-        seed_db_at(dir.path(), MIGRATIONS.len());
+        seed_db_at(dir.path(), MIGRATIONS, MIGRATIONS.len());
         let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
         let mut written = Vec::new();
         for _ in 0..crate::backup::PRE_MIGRATION_KEEP + 2 {
@@ -2574,7 +1627,7 @@ mod tests {
     #[test]
     fn pruning_never_drops_the_snapshot_just_written() {
         let dir = tempdir_for_test();
-        seed_db_at(dir.path(), MIGRATIONS.len());
+        seed_db_at(dir.path(), MIGRATIONS, MIGRATIONS.len());
         let snap_dir = dir.path().join(crate::backup::PRE_MIGRATION_DIR);
         std::fs::create_dir_all(&snap_dir).unwrap();
         for i in 0..crate::backup::PRE_MIGRATION_KEEP {

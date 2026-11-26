@@ -12,7 +12,7 @@
 //! (`Arc<Db>` handle, `spawn_blocking`-driven writes
 //! from the async API layer, synchronous `impl` for the
 //! store itself). Persistence lives in `dashboard` /
-//! `dashboard_by_owner` per migration 15.
+//! `dashboard_by_owner`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

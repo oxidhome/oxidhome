@@ -1,5 +1,4 @@
-//! H6 slice 3: owner-defined roles, the `auth_role` table
-//! (migration 23).
+//! H6 slice 3: owner-defined roles, the `auth_role` table.
 //!
 //! A role is a name plus a definition (grants, sensitive categories,
 //! denies; see [`crate::auth::RoleDef`]). Token policies reference a

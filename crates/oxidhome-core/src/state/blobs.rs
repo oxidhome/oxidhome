@@ -342,7 +342,7 @@ impl BlobStore {
         // so two processes opening the same DB in the same wall-clock
         // millisecond don't both start at 0 and collide on `mint_id`.
         // The `(installation_uuid, instance_id, id)` UNIQUE constraint
-        // (migration 14) catches any residual collision loudly inside
+        // (`blob_by_id`) catches any residual collision loudly inside
         // the writing transaction, but seeding makes the collision rate
         // vanish in practice.
         Self {
@@ -560,7 +560,7 @@ impl BlobStore {
                 // INSERT-OR-REPLACE via DELETE+INSERT so the triggers
                 // fire on both legs and `bytes_used` stays correct
                 // (the UPDATE trigger only handles `size_bytes`
-                // changes, not `id` / `name` changes). Migration 14's
+                // changes, not `id` / `name` changes). The
                 // UNIQUE `(installation_uuid, instance_id, id)` index
                 // makes a residual id collision fail the transaction
                 // loudly here rather than silently overwriting the FS
@@ -1125,7 +1125,7 @@ impl BlobStore {
     /// `<unix_ms_13hex>-<counter_8hex>-<nanos_8hex>` — host-minted,
     /// filesystem-safe, sortable by creation time. The counter is
     /// seeded per-`BlobStore` (see [`Self::new`]) so two processes
-    /// don't both start at 0; migration 14's
+    /// don't both start at 0; the
     /// `UNIQUE (installation_uuid, instance_id, id)` index is the
     /// load-bearing collision check.
     fn mint_id(&self) -> String {
@@ -1148,7 +1148,7 @@ impl BlobStore {
 /// stays width-stable. `subsec_nanos()` only varies within a single
 /// second — two processes starting in the same wall-clock second
 /// share that range and only `pid` differentiates them (container
-/// pid recycling shrinks that further). That's fine: migration 14's
+/// pid recycling shrinks that further). That's fine: the
 /// `UNIQUE (installation_uuid, instance_id, id)` index is the
 /// load-bearing collision check; the seed just keeps the practical
 /// collision rate at zero.

@@ -372,7 +372,7 @@ fn set_bad_id(engine: &Engine) -> anyhow::Result<()> {
 }
 
 /// Offline token / device commands don't migrate the database: that
-/// is the daemon's job (some migrations come with on-disk cleanup).
+/// is the daemon's job.
 #[test]
 fn offline_commands_refuse_an_unmigrated_database() {
     use oxidhome_core::api::sensitive_admin::with_offline_stores;

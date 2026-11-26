@@ -2,7 +2,7 @@
 //! slice 3).
 //!
 //! A **role** is a named bundle the owner stores in the host
-//! (`auth_role`, migration 23): grants (actions, optionally narrowed to
+//! (`auth_role`): grants (actions, optionally narrowed to
 //! device categories and device ids), sensitive categories and deny
 //! entries. A token policy names its roles by id (`"roles":
 //! ["role-…"]`); the bearer middleware resolves those ids to their

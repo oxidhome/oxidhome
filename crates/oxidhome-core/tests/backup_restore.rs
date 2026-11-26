@@ -216,6 +216,8 @@ fn online_backup_then_restore_round_trips_db_blobs_and_plugins() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].actor_kind, "cli");
     assert_eq!(rows[0].decision, "allow");
+    assert_eq!(rows[0].call_id, None);
+    assert_eq!(rows[0].invocation, None);
     drop(blobs);
     drop(engine);
 
@@ -519,96 +521,7 @@ fn restore_refuses_a_schema_older_than_the_floor() {
     );
 }
 
-/// An archive taken at the restore floor (v16, before H6's
-/// migration 17) restores; the post-swap boot migrates it (with a
-/// pre-migration snapshot) and records the audit row in the new
-/// shape.
-#[test]
-fn restore_migrates_an_archive_at_the_schema_floor() {
-    let fx = fixture();
-    let out_dir = support::tempdir("backup-out");
-    let archive = out_path(&out_dir);
-    backup::create_backup(fx.state.path(), &archive).unwrap();
-    rewrite_archived_db(&archive, |conn| {
-        // Undo every migration after the floor (25: event and
-        // reaction attribution, 24: TLS pins, 23:
-        // owner-defined roles, 22: sandbox removal markers, 21: H6 slice 2
-        // owner flag, audit level and device categories, 20: H5 pending
-        // commands, 19: H2 device state, 18: H5 command columns, 17: H6
-        // audit columns).
-        conn.execute_batch(
-            "DROP INDEX audit_caused_by;
-             ALTER TABLE audit_event DROP COLUMN caused_by;
-             DROP INDEX event_log_call_id;
-             ALTER TABLE event_log DROP COLUMN call_id;
-             DROP TABLE network_tls_pin;
-             DROP TABLE auth_role;
-             DROP TABLE sandbox_removal;
-             DROP TABLE device_meta;
-             ALTER TABLE audit_event DROP COLUMN level;
-             DROP INDEX auth_token_one_owner;
-             ALTER TABLE auth_token DROP COLUMN owner;
-             DROP TABLE pending_command;
-             DROP TABLE device_state;
-             DROP TABLE device_state_meta;
-             ALTER TABLE audit_event DROP COLUMN command_outcome;
-             ALTER TABLE audit_event DROP COLUMN command_id;
-             DROP INDEX audit_call;
-             ALTER TABLE audit_event DROP COLUMN invocation_json;
-             ALTER TABLE audit_event DROP COLUMN call_id;",
-        )
-        .unwrap();
-        set_user_version(conn, backup::MIN_RESTORABLE_SCHEMA_VERSION);
-    });
-    assert_eq!(
-        backup::verify_backup(&archive)
-            .unwrap()
-            .manifest
-            .schema_version,
-        backup::MIN_RESTORABLE_SCHEMA_VERSION
-    );
-
-    backup::restore_offline(fx.state.path(), &archive).expect("restore");
-    let current = oxidhome_core::state::db::schema_version();
-    let snapshots: Vec<String> = std::fs::read_dir(fx.state.path().join(backup::PRE_MIGRATION_DIR))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    let suffix = format!(
-        "-v{}-to-v{current}.db",
-        backup::MIN_RESTORABLE_SCHEMA_VERSION
-    );
-    assert!(
-        snapshots.iter().any(|n| n.ends_with(&suffix)),
-        "{snapshots:?}"
-    );
-
-    let engine = Engine::with_state_dir(fx.state.path()).unwrap();
-    let rows = engine
-        .audit_log()
-        .query(
-            &AuditQuery {
-                path: Some(AUDIT_PATH_RESTORE.into()),
-                ..AuditQuery::default()
-            },
-            10,
-        )
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].call_id, None);
-    assert_eq!(rows[0].invocation, None);
-    assert_eq!(
-        &*engine
-            .installed_plugins()
-            .get(PLUGIN_ID)
-            .unwrap()
-            .installation_uuid,
-        fx.uuid
-    );
-}
-
-/// H6's `call_id` / `invocation_json` audit columns survive a
+/// The `call_id` / `invocation_json` audit columns survive a
 /// backup + restore unchanged.
 #[test]
 fn backup_round_trips_invocation_audit_columns() {

@@ -1,7 +1,6 @@
 //! H4: resume cursors over `event_log` row ids.
 //!
-//! Row ids come from `INTEGER PRIMARY KEY AUTOINCREMENT` (migration
-//! 16): never reused, and, because every insert goes through the one
+//! Row ids come from `INTEGER PRIMARY KEY AUTOINCREMENT`: never reused, and, because every insert goes through the one
 //! serialized writer connection and a failed insert rolls its id
 //! back with its transaction, **dense** — the rows committed at any
 //! moment are exactly `1..=head` minus the ones retention deleted.

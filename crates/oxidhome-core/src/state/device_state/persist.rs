@@ -967,22 +967,13 @@ fn decode_fields(blob: &[u8]) -> Result<Vec<KeyValue>, String> {
 /// epoch tells epoch-checking clients; raising the eviction watermark
 /// past the next boot's base makes every older cursor reset.
 ///
-/// Runs on the restored database before migrations; a database older
-/// than the device-state tables has no cursors to invalidate.
+/// Runs on the restored database before migrations; every restorable
+/// schema has the device-state tables.
 ///
 /// # Errors
 ///
 /// The update failed.
 pub fn invalidate_cursors_after_restore(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let has_meta: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' \
-         AND name = 'device_state_meta')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_meta {
-        return Ok(());
-    }
     // One row even when the meta row is missing (the rows' watermark
     // must still move past the backup's history).
     let (revision, row_max, rows, writer) = conn.query_row(

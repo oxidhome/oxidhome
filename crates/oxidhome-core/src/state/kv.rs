@@ -12,8 +12,8 @@
 //! uninstall + reinstall of the same `plugin_id` gets a fresh uuid
 //! and therefore a fresh keyspace, and [`KvStore::purge_installation`]
 //! wipes every row for a tombstoned install so orphan data doesn't
-//! survive on disk. See migration 14 in `state/db.rs` for the schema
-//! shape.
+//! survive on disk. See the initial schema in `state/db.rs` for the
+//! table shape.
 //!
 //! Encoding: WIT `value` variants are wrapped in a small typed
 //! enum and serialized to bytes via `serde_json` so the store carries
@@ -230,7 +230,7 @@ impl KvStore {
             // `length(key)` on a TEXT column counts characters, not
             // bytes — cast to BLOB so we get the same byte total the
             // Rust-side `key.len()` math used to project
-            // `new_entry_bytes`. Migration 14's triggers use the same
+            // `new_entry_bytes`. The `kv_usage` triggers use the same
             // shape so the persisted `kv_usage.bytes_used` stays in
             // sync.
             let old_size: Option<i64> = tx
@@ -318,7 +318,7 @@ impl KvStore {
         // arithmetic an open-coded range would need.
         //
         // (Quota accounting is the *byte* count, computed separately
-        // via `length(CAST(key AS BLOB))` in migration 14's triggers
+        // via `length(CAST(key AS BLOB))` in the `kv_usage` triggers
         // — that's correctness for "bytes used"; the listing here
         // is character-level prefix matching, which is what callers
         // want.)
@@ -610,11 +610,11 @@ mod tests {
     /// Regression for the byte-vs-character mismatch between the
     /// Rust-side projection (`key.len()` in bytes) and the trigger's
     /// `length(key)` on TEXT (characters). A non-ASCII key like
-    /// `"αβγ"` is 6 UTF-8 bytes but 3 characters; under the
-    /// pre-migration-2 triggers a 100-byte quota would accept many
-    /// more `"αβγ"`-keyed writes than the byte budget allowed.
-    /// Migration 2's `length(CAST(key AS BLOB))` brings both sides
-    /// onto bytes; migration 14 keeps that shape.
+    /// `"αβγ"` is 6 UTF-8 bytes but 3 characters; a trigger counting
+    /// characters would let a 100-byte quota accept many more
+    /// `"αβγ"`-keyed writes than the byte budget allows. The
+    /// triggers' `length(CAST(key AS BLOB))` keeps both sides on
+    /// bytes.
     #[test]
     fn quota_uses_byte_count_for_non_ascii_keys() {
         let kv = store();
@@ -626,9 +626,14 @@ mod tests {
             .expect("first non-ascii write");
         let (used_1, _) = kv.usage(INST_A, "alpha").expect("usage").expect("present");
         // `bytes_used` must reflect the 6-byte key, not 3.
-        assert!(
-            used_1 > 6,
-            "bytes_used should count UTF-8 bytes (key alone is 6); got {used_1} for a 6-byte key + payload",
+        let value_len: i64 = kv
+            .db
+            .read(|c| c.query_row("SELECT length(value) FROM kv", (), |r| r.get(0)))
+            .expect("value length");
+        assert_eq!(
+            i64::try_from(used_1).unwrap(),
+            6 + value_len,
+            "bytes_used should count the key's 6 UTF-8 bytes plus the value",
         );
 
         // Add three more non-ASCII keys. Each adds ~16 bytes. The

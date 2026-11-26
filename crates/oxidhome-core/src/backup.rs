@@ -97,10 +97,7 @@
 //! newer than the binary is refused outright (no silent downgrade).
 //! Rolling back to the old binary means swapping the pre-migration
 //! snapshot in by hand while the daemon is stopped, which discards
-//! every write since the upgrade — see `ARCHITECTURE.md`. Rolling
-//! back across migration 14 additionally loses the legacy blob
-//! files, which [`crate::Engine::with_state_dir`] sweeps on the
-//! boot that applies it.
+//! every write since the upgrade — see `ARCHITECTURE.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -141,13 +138,12 @@ pub const PRE_RESTORE_PREFIX: &str = "pre-restore-";
 pub const PRE_MIGRATION_DIR: &str = "pre-migration";
 /// How many pre-migration snapshots to keep.
 pub const PRE_MIGRATION_KEEP: usize = 3;
-/// Oldest schema version a backup may carry. Archives can only be
-/// produced by binaries at or past this version, and the
-/// verification queries depend on its `blob` / `plugin_installation`
-/// shape. Older-but-supported archives (e.g. v16, before H6's
-/// migration 17) are migrated by the post-swap boot, behind the usual
-/// pre-migration snapshot.
-pub const MIN_RESTORABLE_SCHEMA_VERSION: i64 = 16;
+/// Oldest schema version a backup may carry: the initial schema.
+/// The verification queries depend on its `blob` /
+/// `plugin_installation` shape. An archive older than the binary is
+/// migrated by the post-swap boot, behind the usual pre-migration
+/// snapshot.
+pub const MIN_RESTORABLE_SCHEMA_VERSION: i64 = 1;
 /// Audit `path` for a completed restore.
 pub const AUDIT_PATH_RESTORE: &str = "cli.state.restore";
 /// Audit `method` of local (non-network) actions; matches the M4

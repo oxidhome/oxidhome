@@ -179,8 +179,6 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
     };
     let gaps = sensitive_gaps(&records, &role_sensitive);
     if !records.is_empty() && !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) {
-        // The upgrade marks the owner from the bootstrap / recovery
-        // audit rows; retention may have pruned them.
         tracing::warn!(
             target: "auth.sensitive",
             "no live owner token: nothing holds sensitive categories by default; mint one \
@@ -424,9 +422,8 @@ fn open_offline(state_dir: &Path) -> anyhow::Result<(std::fs::File, crate::state
     }
     let lock = crate::exclusive_lock::acquire_state_dir_lock(state_dir)
         .context("this command needs exclusive access — stop the daemon first")?;
-    // Migrations are the daemon's to run: some come with engine-side
-    // cleanup (files on disk) that opening the database alone skips,
-    // and a later daemon start would see the schema current.
+    // Migrations are the daemon's to run: refuse a database at any
+    // other schema version before opening it.
     let path = state_dir.join(crate::state::db::DB_FILE_NAME);
     let version: i64 =
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

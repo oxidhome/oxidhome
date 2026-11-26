@@ -70,8 +70,8 @@ are recorded as `COMMAND` audit rows sharing the request's `call_id`; there is s
 
 ### Restart reconciliation and service calls
 
-Shipped in the H5 follow-up PR. Externally-rooted `accepted` commands are persisted to a `pending_command` table
-(migration 20): command and call ids, owner instance, device, capability, created and expiry wall-clock times, and the
+Shipped in the H5 follow-up PR. Externally-rooted `accepted` commands are persisted to a `pending_command` table:
+command and call ids, owner instance, device, capability, created and expiry wall-clock times, and the
 request's audit linkage (`token_id`, `actor_kind`, invocation JSON). Host-origin commands are not persisted, as they
 have no audit row to complete.
 
