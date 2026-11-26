@@ -128,7 +128,7 @@ aho-corasick = { version = "1.1.4", default-features = false, features = ["std"]
 # install and boot-scan. `default-features = false` drops the
 # `resolve-http` + `reqwest` + TLS chain — meta-validation runs
 # against the bundled draft-2020-12 meta-schema, no network.
-jsonschema = { version = "0.62.0", default-features = false }
+jsonschema = { version = "0.63.0", default-features = false }
 # Phase 14 (MCP): official Rust SDK (`rmcp`, from
 # `github.com/modelcontextprotocol/rust-sdk`). We deliberately
 # split the server-side transport feature
