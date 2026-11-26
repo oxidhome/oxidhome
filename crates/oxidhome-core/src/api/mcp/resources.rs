@@ -1561,11 +1561,10 @@ static BLOB_READ_SEMAPHORE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Sema
 /// Re-export of the blob store's per-mime cap so the local
 /// projection math ([`BLOB_ENVELOPE_OVERHEAD_BYTES`] +
 /// `MAX_BLOB_MIME_BYTES` + base64 body ≤ [`MAX_BLOB_BODY_BYTES`])
-/// can name a single source of truth. The write-time
-/// enforcement + SQL-side legacy filter live on the blob
-/// store side (round-10 F1 on PR #122); this constant is
-/// what MCP's projection uses so the two definitions can
-/// never drift.
+/// can name a single source of truth. The write-time check
+/// and the `blob.mime` schema CHECK live on the blob store
+/// side; this constant is what MCP's projection uses so the
+/// two definitions can never drift.
 use crate::state::blobs::MAX_BLOB_MIME_BYTES;
 
 /// Conservative headroom for the `BlobResourceContents` JSON

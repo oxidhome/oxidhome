@@ -17,7 +17,9 @@
 //!
 //! [`sensitive_access_report`] is the startup check: it names every
 //! live non-owner token whose `*`, `devices:command` or `blobs:read`
-//! scope spans sensitive devices that no grant of its own covers.
+//! scope reaches sensitive categories (lock, opener and alarm
+//! commands, camera bytes) that its grants, or its roles' grants,
+//! don't cover everywhere the scope reaches.
 
 use std::path::Path;
 
@@ -42,8 +44,8 @@ const MAX_DEVICE_PATTERN_LEN: usize = 64;
 /// Most device patterns one grant may carry.
 const MAX_DEVICE_PATTERNS: usize = 64;
 
-/// One live token whose broad scopes span sensitive categories it
-/// holds no grant for.
+/// One live token whose broad scopes reach sensitive categories its
+/// grants don't fully cover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SensitiveGap {
     /// Token id.
@@ -108,10 +110,10 @@ pub fn sensitive_gaps<S: std::hash::BuildHasher>(
                     return true;
                 }
                 // Command grants that together cover every allowlist
-                // pattern restore all the token reached.
+                // pattern cover everything the token reaches.
                 let granted: Vec<String> =
                     grants.filter_map(|g| g.devices.clone()).flatten().collect();
-                // No allowlist: the token reached every device id.
+                // No allowlist: the token reaches every device id.
                 let every = ["dev-*".to_owned()];
                 let allowed: &[String] = command_devices.unwrap_or(&every);
                 c.guards_commands() && allowed.iter().all(|a| pattern_covers(&granted, a))
@@ -155,9 +157,9 @@ fn in_id_space(pattern: &str) -> &str {
 }
 
 /// Startup check: log at `warn` every live non-owner token whose
-/// `*` / `devices:command` / `blobs:read` scope spans locks, openers,
-/// alarms or camera bytes without a sensitive grant for them, and how
-/// to grant one. Returns what it logged.
+/// `*` / `devices:command` / `blobs:read` scope reaches locks,
+/// openers, alarms or camera bytes that its grants don't fully cover,
+/// and how to grant them. Returns what it logged.
 pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
     let records = match tokens.list() {
         Ok(r) => r,
@@ -194,9 +196,9 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             token_id = %gap.token_id,
             label = %gap.label,
             missing = %gap.missing.to_csv(),
-            "token has broad scopes but no grant for these sensitive categories, so it can't \
-             command locks, openers or alarms or read camera bytes; grant one with \
-             `oxidhome token grant-sensitive <token-id> <category>`",
+            "token's scopes reach sensitive categories its grants don't cover on every device \
+             (lock, opener and alarm commands and camera bytes need an explicit grant); grant \
+             with `oxidhome token grant-sensitive <token-id> <category>`",
         );
     }
     gaps

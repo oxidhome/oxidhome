@@ -103,7 +103,7 @@ struct ActorInner {
     scopes: Vec<String>,
     // Phase 14.4a: per-tool constraint map from the token
     // policy. `HashMap::new()` for plugin actors and for API
-    // tokens that don't carry constraints (legacy scope-array
+    // tokens that don't carry constraints (bare scope-array
     // shape). Empty allocation is one small
     // heap word, not per-actor overhead.
     constraints: HashMap<String, policy::ToolConstraint>,
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn actor_constraint_returns_none_when_no_policy() {
-        // Legacy `Actor::api` — no constraints, so every
+        // Plain `Actor::api` — no constraints, so every
         // tool lookup returns None (unrestricted).
         let a = Actor::api("tok-abc", vec!["devices:command".into()]);
         assert!(a.constraint("device.send_command").is_none());

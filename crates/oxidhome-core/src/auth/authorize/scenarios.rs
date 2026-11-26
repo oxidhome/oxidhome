@@ -19,6 +19,112 @@ fn devices(list: &[&str]) -> ToolConstraint {
     }
 }
 
+fn plugins(list: &[&str]) -> ToolConstraint {
+    ToolConstraint {
+        devices: None,
+        plugins: Some(list.iter().map(|s| (*s).to_string()).collect()),
+    }
+}
+
+fn constrained(scopes: &[&str], entries: &[(&str, ToolConstraint)]) -> Actor {
+    Actor::api_with_policy(
+        "tok",
+        scopes.iter().map(|s| (*s).to_string()).collect(),
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect(),
+    )
+}
+
+/// Each `plugins.*` allowlist narrows only its own action, so one
+/// token can start one plugin and uninstall another.
+#[test]
+fn plugin_allowlists_narrow_only_their_own_action() {
+    let actor = constrained(
+        &["*"],
+        &[
+            ("plugins.show", plugins(&["acme.*"])),
+            ("plugins.start", plugins(&["acme.lamp"])),
+            ("plugins.stop", plugins(&["acme.*", "other.p"])),
+            ("plugins.uninstall", plugins(&["other.*"])),
+            ("plugins.install", plugins(&[])),
+        ],
+    );
+    let instance = |id: &str| Resource::instance(id, None);
+    let plugin = Resource::plugin;
+    let cases = [
+        (Action::PluginRead, plugin("acme.lamp"), Ok(())),
+        (
+            Action::PluginRead,
+            plugin("other.p"),
+            Err("constraint:plugins.show:plugins"),
+        ),
+        (Action::InstanceStart, instance("acme.lamp"), Ok(())),
+        (
+            Action::InstanceStart,
+            instance("other.p"),
+            Err("constraint:plugins.start:plugins"),
+        ),
+        (Action::InstanceStop, instance("other.p"), Ok(())),
+        (
+            Action::InstanceStop,
+            instance("other.q"),
+            Err("constraint:plugins.stop:plugins"),
+        ),
+        (Action::PluginUninstall, plugin("other.q"), Ok(())),
+        (
+            Action::PluginUninstall,
+            plugin("acme.lamp"),
+            Err("constraint:plugins.uninstall:plugins"),
+        ),
+        (
+            Action::PluginInstall,
+            plugin("acme.lamp"),
+            Err("constraint:plugins.install:plugins"),
+        ),
+    ];
+    for (action, resource, want) in cases {
+        assert_eq!(
+            decide(&actor, action, &resource),
+            want,
+            "{} {resource:?}",
+            action.as_str()
+        );
+    }
+}
+
+/// A missing scope is reported before a constraint: a token with a
+/// device allowlist but no `devices:command` is refused with the
+/// scope, whether or not the allowlist covers the device.
+#[test]
+fn missing_scope_wins_over_a_constraint() {
+    let actor = constrained(
+        &["devices:list"],
+        &[("device.send_command", devices(&["dev-a1b2*"]))],
+    );
+    for id in ["dev-a1b2c3d4e5f60718", "dev-ffff000000000000"] {
+        let target = Resource::device(id, DeviceClass::of(DeviceCategory::Light));
+        assert_eq!(
+            decide(&actor, Action::DeviceCommand, &target),
+            Err("devices:command"),
+            "{id}"
+        );
+    }
+    let actor = constrained(
+        &["plugins:list"],
+        &[("plugins.start", plugins(&["acme.*"]))],
+    );
+    assert_eq!(
+        decide(
+            &actor,
+            Action::InstanceStart,
+            &Resource::instance("acme.lamp", None)
+        ),
+        Err("plugins:start")
+    );
+}
+
 /// Every scope constant is the `legacy_scope` of exactly one action.
 #[test]
 fn every_scope_constant_maps_to_one_action() {
@@ -41,7 +147,16 @@ fn every_scope_constant_maps_to_one_action() {
         scopes::STATUS_READ,
         scopes::BLOBS_READ,
         scopes::PLUGINS_UI,
+        scopes::SERVICES_CALL,
     ];
+    assert_eq!(
+        all.len(),
+        Action::ALL
+            .iter()
+            .filter(|a| a.legacy_scope().is_some())
+            .count(),
+        "a scope constant is missing from the list",
+    );
     for s in all {
         let actions: Vec<_> = Action::ALL
             .iter()

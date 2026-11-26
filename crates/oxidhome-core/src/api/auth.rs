@@ -979,7 +979,7 @@ pub(super) async fn finalize_audit(
 /// same record → actor projection.
 pub(super) fn actor_from_record(rec: &TokenRecord, tokens: &TokenStore) -> Actor {
     // Phase 14.4a: `scope_json` now decodes into a
-    // [`TokenPolicy`] — either the legacy `["scope"]` array or
+    // [`TokenPolicy`] — either the bare `["scope"]` array or
     // the extended `{scopes, constraints}` object. Parse
     // failure ⇒ deny-all actor (empty scopes + empty
     // constraints), same rationale as pre-14.4: an operator
@@ -1032,7 +1032,7 @@ pub(super) fn actor_from_record(rec: &TokenRecord, tokens: &TokenStore) -> Actor
     actor.with_roles(roles)
 }
 
-/// Legacy scope-array parser retained as a thin shim over
+/// Bare scope-array parser retained as a thin shim over
 /// [`crate::auth::parse_policy`] for the tests that pin it
 /// directly. Prefer `parse_policy` — the shim discards
 /// [`TokenPolicy::constraints`].
@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn actor_from_record_legacy_shape_has_no_constraints() {
+    fn actor_from_record_scope_list_shape_has_no_constraints() {
         let rec = TokenRecord {
             id: "tok-legacy".into(),
             label: "legacy".into(),

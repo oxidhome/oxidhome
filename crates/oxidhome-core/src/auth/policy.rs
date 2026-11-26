@@ -1,13 +1,8 @@
-//! Phase 14.4 — richer token policy blob.
+//! Token policy blob.
 //!
-//! Phase 14.2a landed bearer + per-scope-string enforcement:
-//! the token record stored a JSON array of scope names
-//! (`["logs:read", "devices:command"]`), and each dispatch site
-//! called `crate::api::scopes::require_scope` against the
-//! bearer's scope list.
-//!
-//! Phase 14.4 extends that shape with **per-tool constraints**
-//! — an operator issuing an MCP token should be able to say
+//! A token's policy is its scope list, optionally extended with
+//! **per-tool constraints** (Phase 14.4) — an operator issuing an
+//! MCP token should be able to say
 //! *"this token can send commands to any device matching
 //! `dev-a1b2c3d4*`, but nothing else"*, not just *"this token
 //! holds `devices:command`"*.
@@ -168,8 +163,8 @@ pub struct TokenPolicy {
 
 impl TokenPolicy {
     /// Serialize to the `scope_json` form: the bare scope-list array when
-    /// there are no constraints and no sensitive grants, the extended
-    /// object otherwise. Round-trips through [`parse_policy`].
+    /// there are no constraints, sensitive grants, roles or denies, the
+    /// extended object otherwise. Round-trips through [`parse_policy`].
     #[must_use]
     pub fn to_json(&self) -> Vec<u8> {
         if self.constraints.is_empty()

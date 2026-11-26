@@ -2750,7 +2750,7 @@ async fn plugins_install_audit_taxonomy_stays_clean() {
 
 /// Mint a bearer carrying an extended `TokenPolicy` envelope
 /// with the constraint blob under test. `scope_json` in the
-/// store accepts either shape (legacy scope array or the
+/// store accepts either shape (bare scope array or the
 /// `{scopes, constraints}` object) — this helper always
 /// writes the extended shape so 14.4a's parse path runs.
 fn mint_bearer_with_constraint(engine: &Engine, id: &str, constraints_json: &str) -> String {
