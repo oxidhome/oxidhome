@@ -383,6 +383,8 @@ pub struct Request {
     total_timeout: Option<Duration>,
     max_body: usize,
     max_redirects: u8,
+    /// Header names a `connection` header nominated as hop-by-hop.
+    connection_options: Vec<String>,
 }
 
 impl Request {
@@ -398,6 +400,7 @@ impl Request {
             total_timeout: None,
             max_body: DEFAULT_MAX_BODY,
             max_redirects: MAX_REDIRECTS,
+            connection_options: Vec::new(),
         }
     }
 
@@ -426,15 +429,27 @@ impl Request {
     }
 
     /// Add a header (names are case-insensitive; repeats are kept).
-    /// [`FORBIDDEN_HEADERS`], `content-length` and `te` are dropped.
+    /// [`FORBIDDEN_HEADERS`], `content-length` and `te` are dropped, and
+    /// so are the headers a `connection` header names (before or after
+    /// it), which belong to the connection they were captured on.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         let name = name.into().to_ascii_lowercase();
+        let value = value.into();
+        if name == "connection" {
+            let options = String::from_utf8_lossy(&value).to_ascii_lowercase();
+            for option in options.split(',').map(str::trim).filter(|o| !o.is_empty()) {
+                self.headers.retain(|(n, _)| n != option);
+                self.connection_options.push(option.to_owned());
+            }
+            return self;
+        }
         // `te` too: it needs a `connection: te`, which is dropped.
         if !matches!(name.as_str(), "content-length" | "te")
             && !FORBIDDEN_HEADERS.contains(&name.as_str())
+            && !self.connection_options.contains(&name)
         {
-            self.headers.push((name, value.into()));
+            self.headers.push((name, value));
         }
         self
     }
@@ -513,6 +528,10 @@ impl Request {
     /// response head has arrived; read the body with the returned
     /// [`BodyReader`]. [`Request::max_body`] doesn't apply.
     ///
+    /// A request body is still sent whole first: when the server answers
+    /// with a `1xx` / `2xx` before it has read it all, this returns once
+    /// the upload is done (or fails with it).
+    ///
     /// The response holds one of the instance's concurrent HTTP requests
     /// until it is dropped.
     ///
@@ -564,7 +583,7 @@ impl Request {
                 }
             })?;
             let location = match redirect_location(head.status, &head.headers) {
-                Some(location) if self.max_redirects > 0 => location?,
+                Some(location) if self.max_redirects > 0 => location,
                 // The final response.
                 _ => return Ok((head, url)),
             };
@@ -574,7 +593,7 @@ impl Request {
                 });
             }
             hops += 1;
-            let next = url.join(&location).map_err(|err| match err {
+            let next = url.join(&location?).map_err(|err| match err {
                 Error::InvalidUrl(location) => Error::InvalidRedirect(location),
                 other => other,
             })?;
@@ -1118,6 +1137,7 @@ impl std::fmt::Debug for Request {
             .field("total_timeout", &self.total_timeout)
             .field("max_body", &self.max_body)
             .field("max_redirects", &self.max_redirects)
+            .field("connection_options", &self.connection_options)
             .finish()
     }
 }
@@ -1345,8 +1365,9 @@ fn plain_authority(authority: &str) -> bool {
     };
     let host_ok = !host.is_empty()
         && (authority.starts_with('[')
+            // RFC 3986 `reg-name`: unreserved, sub-delims and `%`.
             || host.bytes().all(|b| {
-                b.is_ascii_graphic() && !matches!(b, b'@' | b'[' | b']' | b'/' | b'?' | b'#')
+                b.is_ascii_alphanumeric() || b"-._~%!$&'()*+,;=".contains(&b)
             }));
     let port_ok = port.is_none_or(|p| {
         (1..=5).contains(&p.len())
@@ -1415,6 +1436,7 @@ mod tests {
             "http://[::1]abc/",
             "http://[nope]/",
             "http://h:1:2/",
+            "http://cam|era/",
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }
@@ -1551,6 +1573,9 @@ mod tests {
         let request = request
             .header("Content-Length", "3")
             .header("TE", "trailers")
+            .header("X-Before", "1")
+            .header("Connection", "X-Before, x-after")
+            .header("X-After", "2")
             .header("Authorization", "Basic x");
         let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["authorization"]);
