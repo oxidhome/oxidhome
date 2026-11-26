@@ -61,7 +61,10 @@ pub struct TestHost {
 /// [`TestHost::start_with`]. `Default` loads the plugin the way
 /// `oxidhome-core` dev-loads it: a generated instance id, manifest
 /// defaults for every config field, and the capabilities the manifest
-/// requests.
+/// requests, except sensitive ones (`sensitive_event_bytes`, and each
+/// `reads_state` entry naming a sensitive category), which only an
+/// approved install holds: grant them with [`LoadOptions::grant`] to
+/// test an approved camera read.
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     instance_id: Option<String>,

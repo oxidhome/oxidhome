@@ -45,7 +45,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
-use axum::response::Response as AxumResponse;
+use axum::response::{IntoResponse as _, Response as AxumResponse};
 use connectrpc::{
     ConnectError, Encodable, RequestContext, Response, Router as ConnectRouter, ServiceRequest,
     ServiceResult,
@@ -2222,7 +2222,55 @@ pub fn axum_service(engine: Engine) -> axum::Router {
     let inner = router(engine).into_axum_service();
     axum::Router::new()
         .fallback_service(inner)
+        .layer(axum::middleware::from_fn(json_object_only))
         .layer(from_fn_with_state(auth_state, connect_auth_middleware))
+}
+
+/// A Connect JSON message is an object; the generated decoders would
+/// also take a positional array (`["/dir", ["camera"]]` as an
+/// `InstallPlugin` approving camera), so a JSON body that doesn't start
+/// with `{` is refused `invalid_argument`. Only the leading chunks are
+/// read; the body goes on unchanged.
+async fn json_object_only(req: Request, next: Next) -> AxumResponse {
+    use futures_util::StreamExt as _;
+    let is_json = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim_start().starts_with("application/json"));
+    if req.method() != axum::http::Method::POST || !is_json {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut head: Vec<bytes::Bytes> = Vec::new();
+    let first = loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let first = chunk.iter().copied().find(|b| !b.is_ascii_whitespace());
+                head.push(chunk);
+                if first.is_some() {
+                    break first;
+                }
+            }
+            Some(Err(_)) | None => break None,
+        }
+    };
+    if first.is_some_and(|b| b != b'{') {
+        let body = serde_json::json!({
+            "code": "invalid_argument",
+            "message": "a Connect JSON request must be an object",
+        });
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response();
+    }
+    let replay = futures_util::stream::iter(head.into_iter().map(Ok::<_, axum::Error>));
+    let req = Request::from_parts(parts, Body::from_stream(replay.chain(stream)));
+    next.run(req).await
 }
 
 /// axum `from_fn_with_state` middleware. Wraps every Connect call:

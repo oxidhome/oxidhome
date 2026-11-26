@@ -235,6 +235,17 @@ async fn sensitive_grants_are_approved_at_install_over_connect() {
             .contains("camera"),
         "{body}"
     );
+    // A positional body is refused, not read as an approval.
+    let (status, body) = api_status(
+        &f.router,
+        &f.owner,
+        "POST",
+        uri,
+        json!([source, ["camera"]]),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status} {body}");
+    assert!(!installed(&f.engine));
     let approve = json!({"sourceDir": source, "approveSensitive": ["camera"]});
     let (status, body) = api_status(&f.router, &f.installer, "POST", uri, approve.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");

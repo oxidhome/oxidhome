@@ -2149,10 +2149,14 @@ impl InstalledPluginRegistry {
     /// here, so this module stays focused on the ledger + FS side of
     /// uninstall and doesn't need to import the state stores.
     ///
+    /// Tests only: it leaves the plugin's deny list, which
+    /// [`crate::Engine::uninstall_plugin`] deletes with the tombstone.
+    ///
     /// # Errors
     ///
     /// See [`UninstallError`].
-    pub fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
+    #[cfg(test)]
+    pub(crate) fn uninstall(&self, plugin_id: &str) -> Result<Arc<str>, UninstallError> {
         self.uninstall_with(plugin_id, None, &|_| Ok(()))
     }
 
@@ -2166,7 +2170,7 @@ impl InstalledPluginRegistry {
     /// As [`Self::uninstall`], and [`UninstallError::NotInstalled`] when
     /// the plugin is now another installation; `also` failing rolls the
     /// tombstone back.
-    pub fn uninstall_with(
+    pub(crate) fn uninstall_with(
         &self,
         plugin_id: &str,
         expected: Option<&str>,

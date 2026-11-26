@@ -364,7 +364,7 @@ impl KvStore {
 
     /// Wipe every KV row (and its usage-accounting row) for the
     /// installation tombstoned at `installation_uuid`. Called from
-    /// [`crate::state::InstalledPluginRegistry::uninstall`] so a
+    /// [`crate::Engine::uninstall_plugin`] so a
     /// subsequent reinstall of the same `plugin_id` sees an empty
     /// keyspace — H2's central invariant.
     ///

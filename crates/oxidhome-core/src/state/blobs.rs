@@ -928,7 +928,7 @@ impl BlobStore {
     /// Wipe every SQL row (`blob` + `blob_usage`) AND the on-disk
     /// directory tree for the installation tombstoned at
     /// `installation_uuid`. Called from
-    /// [`crate::state::InstalledPluginRegistry::uninstall`] so a
+    /// [`crate::Engine::uninstall_plugin`] so a
     /// subsequent reinstall of the same `plugin_id` sees an empty
     /// blob namespace — H2's central invariant.
     ///
