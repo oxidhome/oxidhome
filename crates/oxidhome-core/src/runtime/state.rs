@@ -494,6 +494,45 @@ pub struct PluginState {
     pub(crate) clock: crate::clock::Clock,
 }
 
+/// H6 slice 5: whether the owner's deny lists hide an event from a
+/// plugin: its own list and those of the plugins upstream of the
+/// subscription or read, on `event.subscribe` of the event's device
+/// (an event without one is a pre-check, refused only by an
+/// unnarrowed entry). Used at delivery (`on-event`) and by
+/// `read-events`.
+#[derive(Debug, Clone)]
+pub(crate) struct EventRefusal {
+    denies: Arc<crate::state::PluginDenyStore>,
+    devices: Arc<DeviceRegistry>,
+    plugin_id: String,
+}
+
+impl EventRefusal {
+    /// `true` when a list refuses `ev`; `upstream` names the plugins
+    /// whose calls led to the subscription or read.
+    pub(crate) fn refuses<'a>(
+        &'a self,
+        ev: &crate::host_impl::plugin::oxidhome::plugin::events::Event,
+        upstream: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
+        if self.denies.is_empty() {
+            return false;
+        }
+        let resource = ev.device.as_deref().map_or(
+            crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+            |d| self.devices.resource(d),
+        );
+        crate::auth::denied_by(
+            &self.denies,
+            std::iter::once(self.plugin_id.as_str())
+                .chain(upstream.into_iter().map(String::as_str)),
+            crate::auth::Action::EventSubscribe,
+            &resource,
+        )
+        .is_some()
+    }
+}
+
 impl PluginState {
     /// Build a fresh state for one plugin instance. `devices` /
     /// `events` / `kv` / `event_log` / `blobs` come from the parent
@@ -675,6 +714,17 @@ impl PluginState {
             reads_state: &self.granted_capabilities.reads_state,
             subscribes_events: self.granted_capabilities.subscribes_events,
             denies: &self.plugin_denies,
+        }
+    }
+
+    /// What decides whether this plugin's deny lists hide an event
+    /// from it ([`EventRefusal`]); owned, for blocking scans.
+    #[must_use]
+    pub(crate) fn event_refusal(&self) -> EventRefusal {
+        EventRefusal {
+            denies: Arc::clone(&self.plugin_denies),
+            devices: Arc::clone(&self.devices),
+            plugin_id: self.manifest.plugin.id.clone(),
         }
     }
 
@@ -1826,8 +1876,9 @@ impl host_events::Host for PluginState {
         // `event.read` (a subscription outlives the request that made
         // it). What each event delivers is filtered by the deny list
         // again at delivery.
+        let ctx = crate::auth::invocation::current_or_host(&self.instance_id);
         let decision = crate::auth::authorize_plugin(
-            &crate::auth::invocation::current_or_host(&self.instance_id),
+            &ctx,
             &self.principal(),
             crate::auth::Action::EventSubscribe,
             &crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
@@ -1881,9 +1932,17 @@ impl host_events::Host for PluginState {
         // `WakeToken`, which deregisters the wake — so unsubscribe
         // is automatic on drop and `unsubscribe()` (below) just
         // removes the local entry.
-        let subscription = self
+        let mut subscription = self
             .events
             .subscribe_with_wake(filter, Arc::clone(&self.wake));
+        // The plugins upstream of a subscription made inside a
+        // delegated call keep their deny lists over what it delivers.
+        subscription.upstream = ctx
+            .chain()
+            .iter()
+            .map(|h| h.caller_plugin.clone())
+            .collect::<Vec<_>>()
+            .into();
         let id = subscription.id;
         self.subscriptions.push(subscription);
         Ok(id)

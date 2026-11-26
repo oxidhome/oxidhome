@@ -107,18 +107,24 @@ fn approx_size(event: &Event) -> usize {
         + payload
 }
 
-/// Read one page for a reader with `filters` as its subscriptions.
+/// Read one page for a reader with `filters` as its subscriptions,
+/// skipping (before counting) the rows `refused` hides.
 fn read_page(
     log: &EventLog,
     after_id: u64,
     limit: usize,
-    filters: &[EventFilter],
+    filters: &[(EventFilter, Arc<[String]>)],
     bytes: bool,
+    refused: impl Fn(&Event, &[String]) -> bool,
 ) -> Result<Result<ScanPage, CursorExpired>, EventLogError> {
     let mut taken = 0usize;
     let mut size = 0usize;
     log.scan_after_cursor(after_id, SCAN_BUDGET, |event| {
-        if !is_gap_marker(event) && !filters.iter().any(|f| filter_matches(f, event)) {
+        if !is_gap_marker(event)
+            && !filters
+                .iter()
+                .any(|(f, upstream)| filter_matches(f, event) && !refused(event, upstream))
+        {
             return ScanStep::Skip;
         }
         if taken >= limit {
@@ -175,30 +181,6 @@ impl PluginState {
         Ok(())
     }
 
-    /// Drop the rows a plugin deny list on `ctx`'s chain refuses
-    /// `event.subscribe` of (per row's device; a row without one is a
-    /// pre-check), as live delivery does.
-    fn hide_denied_events(&self, ctx: &crate::auth::InvocationContext, events: &mut Vec<Event>) {
-        if self.plugin_denies.is_empty() {
-            return;
-        }
-        let plugin_id = &self.manifest.plugin.id;
-        events.retain(|ev| {
-            let resource = ev.device.as_deref().map_or(
-                crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
-                |d| self.devices.resource(d),
-            );
-            crate::auth::denied_on_chain(
-                &self.plugin_denies,
-                plugin_id,
-                ctx.chain(),
-                crate::auth::Action::EventSubscribe,
-                &resource,
-            )
-            .is_none()
-        });
-    }
-
     /// `host-events::read-events`; see the module docs.
     pub(super) async fn read_events_impl(
         &mut self,
@@ -214,17 +196,29 @@ impl PluginState {
         let bytes = self.granted_capabilities.reads_event_bytes;
         let log = Arc::clone(&self.event_log);
         let subscriptions = &self.subscriptions;
+        let refusal = self.event_refusal();
+        let chain: Vec<String> = ctx
+            .chain()
+            .iter()
+            .map(|h| h.caller_plugin.clone())
+            .collect();
         let read = async {
             // The permit moves into the closure, so a call cancelled
             // or timed out while its read runs still holds the slot
             // until the read finishes: a hung disk can't pile up
             // blocking threads.
             let permit = Arc::clone(&READS).acquire_owned().await.ok()?;
-            let filters: Vec<EventFilter> =
-                subscriptions.iter().map(|s| s.filter.clone()).collect();
+            let filters: Vec<(EventFilter, Arc<[String]>)> = subscriptions
+                .iter()
+                .map(|s| (s.filter.clone(), Arc::clone(&s.upstream)))
+                .collect();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                read_page(&log, after_id, limit, &filters, bytes)
+                // A row is hidden as live delivery would hide it, plus
+                // by the deny lists on this call's own chain.
+                read_page(&log, after_id, limit, &filters, bytes, |ev, upstream| {
+                    refusal.refuses(ev, upstream.iter().chain(chain.iter()))
+                })
             })
             .await
             .map(Some)
@@ -283,10 +277,7 @@ impl PluginState {
                 return Err(WitError::Internal("event history read failed".into()));
             }
         };
-        // The deny lists on the chain hide their devices' rows, as at
-        // delivery; the cursor still moves past them.
-        let mut events = page.events;
-        self.hide_denied_events(&ctx, &mut events);
+        let events = page.events;
         tracing::debug!(
             target: "host.events",
             instance_id = %self.instance_id,
@@ -398,7 +389,8 @@ mod tests {
         filters: &[EventFilter],
         bytes: bool,
     ) -> ScanPage {
-        read_page(log, after, limit, filters, bytes)
+        let filters: Vec<_> = filters.iter().map(|f| (f.clone(), Arc::from([]))).collect();
+        read_page(log, after, limit, &filters, bytes, |_, _| false)
             .expect("read")
             .expect("cursor")
     }
@@ -526,7 +518,7 @@ mod tests {
             &[custom("t", "1"), custom("t", "2"), custom("t", "3")],
         );
         log.trim_older_than(i64::MAX).expect("trim");
-        let expired = read_page(&log, 1, 10, &[all()], true)
+        let expired = read_page(&log, 1, 10, &[(all(), Arc::from([]))], true, |_, _| false)
             .expect("read")
             .expect_err("expired");
         assert_eq!(

@@ -95,12 +95,16 @@ fn maybe_visible(
 }
 
 /// What `plugin`, reading within `ctx`, may see of `entry` (of a
-/// device of `class`), or the label of the refusal.
+/// device of `class`), or the label of the refusal. `camera_source`:
+/// the entry's owner instance has registered a camera, so its bytes
+/// count as camera bytes whatever the device (as for a token's direct
+/// read, `api::bytes`).
 fn visibility(
     ctx: &InvocationContext,
     plugin: &PluginPrincipal<'_>,
     installation_uuid: &str,
     class: DeviceClass,
+    camera_source: bool,
     entry: &DeviceState,
 ) -> Result<Visibility, &'static str> {
     if is_own(plugin.instance_id, installation_uuid, entry) {
@@ -124,7 +128,17 @@ fn visibility(
     {
         return Ok(Visibility::Withheld);
     }
-    let bytes = authorize_plugin(ctx, plugin, Action::BlobRead, &resource);
+    let bytes_resource = if camera_source {
+        Resource::state(
+            entry.device_id.as_str(),
+            class.with_camera_bytes(),
+            entry.owner_plugin.as_str(),
+            entry.capability.as_str(),
+        )
+    } else {
+        resource
+    };
+    let bytes = authorize_plugin(ctx, plugin, Action::BlobRead, &bytes_resource);
     // A sensitive obligation (camera bytes for the root) is one a
     // plugin read can't meet: withhold.
     Ok(if bytes.allow && bytes.obligations.sensitive.is_empty() {
@@ -426,15 +440,22 @@ impl host_state::Host for PluginState {
         let mut refused = None;
         let mut out: Vec<WitDeviceState> = entries
             .iter()
-            .filter_map(
-                |e| match visibility(&ctx, &plugin, &self.installation_uuid, class, e) {
+            .filter_map(|e| {
+                match visibility(
+                    &ctx,
+                    &plugin,
+                    &self.installation_uuid,
+                    class,
+                    self.devices.instance_is_camera(&e.owner_instance),
+                    e,
+                ) {
                     Ok(vis) => Some(to_wit(e, vis)),
                     Err(label) => {
                         refused.get_or_insert(label);
                         None
                     }
-                },
-            )
+                }
+            })
             .collect();
         if out.is_empty() {
             audit_state_denied(
@@ -512,14 +533,16 @@ impl host_state::Host for PluginState {
         let ctx = &invocation::current_or_host(&self.instance_id);
         let plugin = &self.principal();
         let install = install.as_str();
+        let devices = &self.devices;
         let entries = page
             .devices
             .iter()
             .flat_map(|entries| {
-                let class = entries.first().map(|e| self.devices.class_of(&e.device_id));
+                let class = entries.first().map(|e| devices.class_of(&e.device_id));
                 entries.iter().filter_map(move |e| {
                     let class = class.unwrap_or_else(DeviceClass::unregistered);
-                    visibility(ctx, plugin, install, class, e)
+                    let camera = devices.instance_is_camera(&e.owner_instance);
+                    visibility(ctx, plugin, install, class, camera, e)
                         .ok()
                         .map(|vis| to_wit(e, vis))
                 })
@@ -580,7 +603,7 @@ mod tests {
             denies: &denies,
         };
         let ctx = InvocationContext::host_origin(me);
-        let v = visibility(&ctx, &plugin, install, DeviceClass::other(), e).ok();
+        let v = visibility(&ctx, &plugin, install, DeviceClass::other(), false, e).ok();
         // The scan's first pass never hides what the decision shows.
         assert!(v.is_none() || maybe_visible(me, install, grants, e));
         v
@@ -631,6 +654,39 @@ mod tests {
         assert_eq!(
             vis("me", "inst-p.me", &[no_bytes, bytes], &e),
             Some(Visibility::Full)
+        );
+    }
+
+    /// H6 slice 5: inside a token's invocation, bytes from an instance
+    /// that registered a camera are camera bytes, whatever the device:
+    /// a token without the camera grant can't have a plugin read them
+    /// on its behalf, as it can't read them directly.
+    #[test]
+    fn camera_source_bytes_need_the_roots_camera_grant() {
+        use crate::auth::{Actor, ActorKind, Principal, Transport};
+        let denies = crate::state::PluginDenyStore::detached();
+        let grants = [grant("*", &["*"], &["*"], true)];
+        let plugin = PluginPrincipal {
+            plugin_id: "p.me",
+            instance_id: "me",
+            requested_services: &[],
+            granted_services: &[],
+            reads_state: &grants,
+            subscribes_events: false,
+            denies: &denies,
+        };
+        let e = entry("other", "p.other", "dev-1", "switch");
+        let actor = Actor::api("tok", vec!["devices:read".into(), "blobs:read".into()]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
+        let class = DeviceClass::other();
+        assert_eq!(
+            visibility(&ctx, &plugin, "inst-p.me", class, false, &e),
+            Ok(Visibility::Full)
+        );
+        assert_eq!(
+            visibility(&ctx, &plugin, "inst-p.me", class, true, &e),
+            Ok(Visibility::Withheld)
         );
     }
 

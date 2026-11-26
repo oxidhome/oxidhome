@@ -1399,12 +1399,18 @@ impl PluginInstance {
         // `plugin.on_event` with both `instance_id` and `plugin_id`).
         // Reading from `self.store.data()` per iteration is fine —
         // these strings don't change for the lifetime of the instance.
+        let refusal = self.store.data().event_refusal();
         let mut delivered = 0;
-        for ev in pending {
+        for (ev, upstream) in pending {
             if stop() {
                 break;
             }
             let data = self.store.data();
+            // A deny list set since the event was collected (while an
+            // earlier `on-event` ran) applies to it.
+            if refusal.refuses(&ev, upstream.iter()) {
+                continue;
+            }
             let span = info_span!(
                 "plugin.on_event",
                 instance_id = %data.instance_id,
@@ -1441,39 +1447,23 @@ impl PluginInstance {
     /// receivers are skipped silently — the lag counter from
     /// `tokio::sync::broadcast::error::RecvError::Lagged` is the
     /// signal a real driver should surface; here we just continue.
-    fn collect_pending_events(&mut self) -> Vec<Event> {
+    fn collect_pending_events(&mut self) -> Vec<(Event, Arc<[String]>)> {
         use crate::state::SubscriberMessage;
         let state = self.store.data_mut();
         // Every event with a row id up to `cutoff` has finished its
         // fan-out (it is in every matching queue); later ones may not
         // have yet.
         let cutoff = state.events.row_watermark().get();
-        // H6 slice 5: the owner's deny list for this plugin filters
-        // what its subscriptions deliver, per event (a category deny
-        // on `event.subscribe` hides that category's events).
-        let denies = Arc::clone(&state.plugin_denies);
-        let devices = Arc::clone(&state.devices);
-        let plugin_id = state.manifest.plugin.id.clone();
-        let owner_refuses = |ev: &Event| {
-            !denies.is_empty() && {
-                let resource = ev.device.as_deref().map_or(
-                    crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
-                    |d| devices.resource(d),
-                );
-                crate::auth::denied_on_chain(
-                    &denies,
-                    &plugin_id,
-                    &[],
-                    crate::auth::Action::EventSubscribe,
-                    &resource,
-                )
-                .is_some()
-            }
-        };
+        // H6 slice 5: the owner's deny lists (this plugin's, and those
+        // of the plugins upstream of the subscription) filter what it
+        // delivers, per event; checked again right before delivery.
+        let refusal = state.event_refusal();
         // One FIFO run per subscription, merged below.
-        let mut runs: Vec<VecDeque<(u64, Event)>> = Vec::new();
+        let mut runs: Vec<VecDeque<Pending>> = Vec::new();
         for sub in &mut state.subscriptions {
             let mut events = VecDeque::new();
+            let upstream = Arc::clone(&sub.upstream);
+            let owner_refuses = |ev: &Event| refusal.refuses(ev, upstream.iter());
             // A held event goes first; while it is still above the
             // cutoff, the rest of its queue waits behind it (FIFO).
             if let Some((rows_through, ev)) = sub.held.take() {
@@ -1481,7 +1471,7 @@ impl PluginInstance {
                     sub.held = Some((rows_through, ev));
                     continue;
                 }
-                events.push_back((rows_through, ev));
+                events.push_back((rows_through, ev, Arc::clone(&upstream)));
             }
             // Take at most what is queued now, so publishers refilling
             // the queue can't keep this drain going.
@@ -1536,7 +1526,7 @@ impl PluginInstance {
                     sub.held = Some((rows_through, ev));
                     break;
                 }
-                events.push_back((rows_through, ev));
+                events.push_back((rows_through, ev, Arc::clone(&upstream)));
             }
             if !events.is_empty() {
                 runs.push(events);
@@ -1783,12 +1773,17 @@ pub(crate) fn project_command_state(
     CommandResult::OkWithState(canonical)
 }
 
+/// An event collected for delivery: the bus watermark at its fan-out,
+/// the event, and the plugins upstream of its subscription.
+type Pending = (u64, Event, Arc<[String]>);
+
 /// Merge per-subscription FIFO runs of `(rows_through, event)` by
 /// their front entries' `(rows_through, row-id)` (no row id sorts
 /// last), so no event overtakes an earlier one from its own run. Ties
 /// keep run order.
-fn merge_queues(mut queues: Vec<VecDeque<(u64, Event)>>) -> Vec<Event> {
-    let key = |(rows_through, ev): &(u64, Event)| (*rows_through, ev.row_id.unwrap_or(u64::MAX));
+fn merge_queues<T>(mut queues: Vec<VecDeque<(u64, Event, T)>>) -> Vec<(Event, T)> {
+    let key =
+        |(rows_through, ev, _): &(u64, Event, T)| (*rows_through, ev.row_id.unwrap_or(u64::MAX));
     let mut merged = Vec::with_capacity(queues.iter().map(VecDeque::len).sum());
     while let Some(next) = queues
         .iter()
@@ -1797,8 +1792,8 @@ fn merge_queues(mut queues: Vec<VecDeque<(u64, Event)>>) -> Vec<Event> {
         .min()
         .map(|(_, i)| i)
     {
-        if let Some((_, ev)) = queues[next].pop_front() {
-            merged.push(ev);
+        if let Some((_, ev, extra)) = queues[next].pop_front() {
+            merged.push((ev, extra));
         }
     }
     merged
@@ -1824,10 +1819,10 @@ mod merge_queues_tests {
         }
     }
 
-    fn topics(events: &[Event]) -> Vec<String> {
+    fn topics(events: &[(Event, ())]) -> Vec<String> {
         events
             .iter()
-            .map(|e| match &e.payload {
+            .map(|(e, ())| match &e.payload {
                 EventPayload::Custom(c) => c.topic.clone(),
                 _ => unreachable!(),
             })
@@ -1836,8 +1831,8 @@ mod merge_queues_tests {
 
     #[test]
     fn merges_by_row_id_across_queues() {
-        let a = VecDeque::from([(10, ev("a10", Some(10))), (12, ev("a12", Some(12)))]);
-        let b = VecDeque::from([(11, ev("b11", Some(11))), (12, ev("b-live", None))]);
+        let a = VecDeque::from([(10, ev("a10", Some(10)), ()), (12, ev("a12", Some(12)), ())]);
+        let b = VecDeque::from([(11, ev("b11", Some(11)), ()), (12, ev("b-live", None), ())]);
         assert_eq!(
             topics(&merge_queues(vec![a, b])),
             ["a10", "b11", "a12", "b-live"]
@@ -1848,8 +1843,8 @@ mod merge_queues_tests {
     fn never_reorders_within_a_queue() {
         // A rowless event stamped with a watermark its recorded
         // successor hadn't enqueued yet still goes first.
-        let a = VecDeque::from([(11, ev("live", None)), (11, ev("row11", Some(11)))]);
-        let b = VecDeque::from([(11, ev("b11", Some(11)))]);
+        let a = VecDeque::from([(11, ev("live", None), ()), (11, ev("row11", Some(11)), ())]);
+        let b = VecDeque::from([(11, ev("b11", Some(11)), ())]);
         assert_eq!(topics(&merge_queues(vec![a, b])), ["b11", "live", "row11"]);
     }
 }

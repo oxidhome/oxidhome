@@ -43,7 +43,7 @@ use std::borrow::Cow;
 use oxidhome_manifest::{ServiceGrant, StateGrant};
 
 use super::authorize::{Action, Decision, Reason, Resource, ResourceKind, authorize};
-use super::invocation::{DelegationHop, InvocationContext};
+use super::invocation::InvocationContext;
 use super::role::{ActionSet, DenyRule};
 use crate::state::PluginDenyStore;
 
@@ -114,44 +114,35 @@ pub fn authorize_plugin(
     Decision::allow(Reason::PluginGrant { grant })
 }
 
-/// [`Reason::PluginDenied`] for the first plugin whose deny list
-/// refuses `action` on `resource`: `plugin_id` (the acting plugin)
-/// first, then each caller on `chain`. For checks made outside a
-/// decision, such as filtering what an event subscription delivers
-/// (`chain` empty: `on-event` is host-rooted).
+/// [`Reason::PluginDenied`] for the first of `plugins` whose deny
+/// list refuses `action` on `resource`, read from one snapshot of the
+/// lists. For checks made outside a decision, such as filtering what
+/// an event subscription delivers.
 #[must_use]
-pub fn denied_on_chain(
+pub fn denied_by<'a>(
     denies: &PluginDenyStore,
-    plugin_id: &str,
-    chain: &[DelegationHop],
+    plugins: impl IntoIterator<Item = &'a str>,
     action: Action,
     resource: &Resource,
 ) -> Option<Reason> {
-    if denies.is_empty() {
-        return None;
-    }
-    std::iter::once(plugin_id)
-        .chain(chain.iter().map(|h| h.caller_plugin.as_str()))
-        .find(|id| {
-            denies
-                .get(id)
-                .is_some_and(|rules| rules.iter().any(|d| d.matches(action, resource)))
-        })
+    denies
+        .first_refusing(plugins, |d| d.matches(action, resource))
         .map(|id| Reason::PluginDenied {
             plugin: id.to_owned(),
         })
 }
 
+/// The acting plugin's list, then each caller's on the chain.
 fn chain_denied(
     ctx: &InvocationContext,
     plugin: &PluginPrincipal<'_>,
     action: Action,
     resource: &Resource,
 ) -> Option<Reason> {
-    denied_on_chain(
+    denied_by(
         plugin.denies,
-        plugin.plugin_id,
-        ctx.chain(),
+        std::iter::once(plugin.plugin_id)
+            .chain(ctx.chain().iter().map(|h| h.caller_plugin.as_str())),
         action,
         resource,
     )
@@ -248,7 +239,9 @@ pub fn restrict_to_plugin_actions(names: &[String], rule: DenyRule) -> Option<De
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Transport};
+    use crate::auth::{
+        Actor, ActorKind, DelegationHop, DeviceCategory, DeviceClass, Principal, Transport,
+    };
 
     fn bouncer() -> Resource {
         Resource::service("example.bouncer", "alpha", "bouncer", "kick")
@@ -505,16 +498,7 @@ mod tests {
             "dev-a1b2c3d4e5f60718",
             DeviceClass::of(DeviceCategory::Alarm),
         );
-        assert!(
-            denied_on_chain(
-                &denies,
-                "example.caller",
-                &[],
-                Action::EventSubscribe,
-                &alarm
-            )
-            .is_some()
-        );
+        assert!(denied_by(&denies, ["example.caller"], Action::EventSubscribe, &alarm).is_some());
         denies
             .set(
                 "example.caller",

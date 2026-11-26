@@ -156,26 +156,30 @@ fn change_in(
     plugin_id: &str,
     rules: Vec<DenyRule>,
 ) -> Result<PluginDenyView, PluginDenyAdminError> {
-    let old = store.get(plugin_id);
-    let path = audit_path(by, plugin_id, old.as_deref().unwrap_or_default(), &rules);
     let view = PluginDenyView::new(plugin_id.to_owned(), &rules);
     let mut refused = None;
-    let out = audited_call(
-        audit,
-        by.actor_kind,
-        &by.token_id,
-        &path,
-        by.call_id.as_deref(),
-        || {
-            store.set(plugin_id, rules).map_err(|e| {
-                let msg = e.to_string();
-                refused = Some(e);
-                anyhow::anyhow!(msg)
-            })
-        },
-    );
+    // The old list, the audit row and the write under one writer lock:
+    // the row names the list the change replaced.
+    let new = rules.clone();
+    let out = store.change(plugin_id, rules, |old, commit| {
+        let path = audit_path(by, plugin_id, old.unwrap_or_default(), &new);
+        audited_call(
+            audit,
+            by.actor_kind,
+            &by.token_id,
+            &path,
+            by.call_id.as_deref(),
+            || {
+                commit().map_err(|e| {
+                    let msg = e.to_string();
+                    refused = Some(e);
+                    anyhow::anyhow!(msg)
+                })
+            },
+        )
+    });
     match (out, refused) {
-        (Ok(_), _) => {
+        (Ok(()), _) => {
             tracing::warn!(
                 target: "auth.plugin",
                 plugin_id = %plugin_id,
@@ -213,16 +217,12 @@ pub fn set_plugin_deny_offline(
         token_id: "-".to_owned(),
         call_id: None,
     };
-    let old = store.get(plugin_id);
-    let path = audit_path(&by, plugin_id, old.as_deref().unwrap_or_default(), &rules);
     let view = PluginDenyView::new(plugin_id.to_owned(), &rules);
-    audited(
-        audit,
-        "cli",
-        "-",
-        &path,
-        || Ok(store.set(plugin_id, rules)?),
-    )?;
+    let new = rules.clone();
+    store.change(plugin_id, rules, |old, commit| {
+        let path = audit_path(&by, plugin_id, old.unwrap_or_default(), &new);
+        audited(audit, "cli", "-", &path, || Ok(commit()?))
+    })?;
     Ok(view)
 }
 

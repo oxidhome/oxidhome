@@ -805,6 +805,7 @@ impl EventBus {
             receiver,
             wake_token: None,
             held: None,
+            upstream: std::sync::Arc::from([]),
             _slot_token: SubscriberToken {
                 id,
                 // C2e review F3: `Weak`, not `Arc`. If the token
@@ -943,6 +944,10 @@ pub struct EventSubscription {
     /// this queue meanwhile so delivery stays FIFO. Dropped with the
     /// subscription.
     pub(crate) held: Option<(u64, Event)>,
+    /// H6 slice 5: the plugins whose `call-service` hops led to this
+    /// subscription (empty for host-rooted work); their deny lists
+    /// apply to what it delivers.
+    pub(crate) upstream: std::sync::Arc<[String]>,
 }
 
 impl SubscriberMessage {

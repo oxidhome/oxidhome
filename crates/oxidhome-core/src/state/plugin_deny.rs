@@ -154,6 +154,23 @@ impl PluginDenyStore {
             .cloned()
     }
 
+    /// The first of `plugins` whose list has an entry `refuses`
+    /// accepts, all read under one lock, so a decision never mixes two
+    /// states of the lists.
+    pub fn first_refusing<'a>(
+        &self,
+        plugins: impl IntoIterator<Item = &'a str>,
+        refuses: impl Fn(&DenyRule) -> bool,
+    ) -> Option<&'a str> {
+        let rows = self.rows.read().unwrap_or_else(PoisonError::into_inner);
+        if rows.is_empty() {
+            return None;
+        }
+        plugins
+            .into_iter()
+            .find(|id| rows.get(*id).is_some_and(|list| list.iter().any(&refuses)))
+    }
+
     /// `true` when no plugin has a deny list: the decision's fast path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -190,6 +207,43 @@ impl PluginDenyStore {
         plugin_id: &str,
         rules: Vec<DenyRule>,
     ) -> Result<Option<PluginDenyList>, PluginDenyError> {
+        self.change(plugin_id, rules, |old, commit| {
+            let old = old.map(Arc::from);
+            commit().map(|()| old)
+        })
+    }
+
+    /// [`Self::set`], with `wrap` around the write: it sees the list
+    /// being replaced and calls `commit` to make the change, all under
+    /// the writer lock, so what it records about the old list is what
+    /// the change replaced (the audit row of an admin change).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `wrap` returns; `commit` fails as [`Self::set`] does.
+    pub fn change<R>(
+        &self,
+        plugin_id: &str,
+        rules: Vec<DenyRule>,
+        wrap: impl FnOnce(Option<&[DenyRule]>, &mut dyn FnMut() -> Result<(), PluginDenyError>) -> R,
+    ) -> R {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self.get(plugin_id);
+        let mut rules = Some(rules);
+        let mut commit = || {
+            let rules = rules.take().unwrap_or_default();
+            self.commit_locked(plugin_id, rules, current.is_some())
+        };
+        wrap(current.as_deref(), &mut commit)
+    }
+
+    /// Validate and store `rules`; the writer lock is held.
+    fn commit_locked(
+        &self,
+        plugin_id: &str,
+        rules: Vec<DenyRule>,
+        exists: bool,
+    ) -> Result<(), PluginDenyError> {
         if !oxidhome_manifest::is_plugin_id(plugin_id) {
             return Err(PluginDenyError::BadPluginId(plugin_id.to_owned()));
         }
@@ -197,9 +251,7 @@ impl PluginDenyStore {
             return Err(PluginDenyError::TooManyEntries);
         }
         debug_assert!(rules.iter().all(|r| PLUGIN_ACTIONS.contains_all(r.actions)));
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        let current = self.get(plugin_id);
-        if !rules.is_empty() && current.is_none() && self.len() >= MAX_PLUGIN_DENY_LISTS {
+        if !rules.is_empty() && !exists && self.len() >= MAX_PLUGIN_DENY_LISTS {
             return Err(PluginDenyError::TooManyLists);
         }
         if let Some(db) = &self.db {
@@ -226,7 +278,7 @@ impl PluginDenyStore {
         } else {
             rows.insert(plugin_id.to_owned(), Arc::from(rules));
         }
-        Ok(current)
+        Ok(())
     }
 
     fn len(&self) -> usize {

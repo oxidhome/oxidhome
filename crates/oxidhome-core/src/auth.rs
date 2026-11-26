@@ -52,7 +52,7 @@ pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet}
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
 pub use plugin::{
     CONSUMES_SERVICES_GRANT, PLUGIN_ACTIONS, PluginPrincipal, READS_STATE_BYTES_GRANT,
-    READS_STATE_GRANT, SUBSCRIBES_EVENTS_GRANT, authorize_plugin, denied_on_chain,
+    READS_STATE_GRANT, SUBSCRIBES_EVENTS_GRANT, authorize_plugin, denied_by,
     restrict_to_plugin_actions,
 };
 pub use policy::{
