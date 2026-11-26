@@ -33,9 +33,9 @@ const POLL_WAIT: Duration = Duration::from_secs(5);
 /// Most reads from one held socket per tick, so a busy peer can't keep a
 /// tick running.
 const MAX_READS_PER_TICK: usize = 256;
-/// Most bytes `stream` reads (its result is stored, within the
-/// manifest's 16 KiB storage quota).
-const STREAM_MAX: usize = 4 * 1024;
+/// Most bytes `stream` reads (its result is stored as JSON, up to six
+/// bytes per byte, within the manifest's 16 KiB storage quota).
+const STREAM_MAX: usize = 1024;
 /// Most redirects `http` follows.
 const MAX_REDIRECTS: usize = 3;
 

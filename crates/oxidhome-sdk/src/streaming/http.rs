@@ -365,7 +365,10 @@ fn wait(ready: &Pollable, expiry: Option<&Expiry>) -> Result<(), Error> {
         ready.block();
         return Ok(());
     };
-    poll(&[ready, &expiry.timer]);
+    // The timer's own wake-up counts: asking it again may not see it.
+    if poll(&[ready, &expiry.timer]).contains(&1) {
+        return Err(expiry.deadline.expired());
+    }
     expiry.check()
 }
 
@@ -807,6 +810,9 @@ fn write_body(
             let ready = poll(&waits);
             // The deadline first: nothing that came with it counts.
             if let Some(expiry) = expiry {
+                if ready.contains(&2) {
+                    return Err(expiry.deadline.expired());
+                }
                 expiry.check()?;
             }
             match early {
