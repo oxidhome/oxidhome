@@ -1271,6 +1271,11 @@ impl Url {
             let dir = &base_path[..=base_path.rfind('/').unwrap_or(0)];
             format!("{dir}{location}")
         };
+        // Before the dot segments go: a bad segment they remove is still
+        // a bad `Location`.
+        if !plain_path_and_query(&target) {
+            return Err(Error::InvalidUrl(redact_userinfo(location)));
+        }
         let (path, query) = match target.split_once('?') {
             Some((p, q)) => (p.to_owned(), Some(q)),
             None => (target.clone(), None),
@@ -1529,7 +1534,13 @@ mod tests {
         ] {
             assert_eq!(base.join(location).expect(location).to_string(), expected);
         }
-        for location in ["mailto:help@example.org", "ftp://cam.lan/x", "https:x"] {
+        for location in [
+            "mailto:help@example.org",
+            "ftp://cam.lan/x",
+            "https:x",
+            "/bad<path/../next",
+            "https://cam.lan/bad<path/../next",
+        ] {
             assert!(base.join(location).is_err(), "{location}");
         }
     }
