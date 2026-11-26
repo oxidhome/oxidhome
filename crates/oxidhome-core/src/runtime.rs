@@ -846,7 +846,7 @@ impl Engine {
         // before any purge. A quarantined directory with no installation
         // row tombstones nothing, so its removal keeps the list.
         let ctx = crate::auth::invocation::current();
-        let has_row = &*installation_uuid != crate::state::installed_plugins::NO_SQL_ROW_UUID;
+        let has_row = crate::state::installed_plugins::has_installation_row(&installation_uuid);
         self.plugin_denies.forget_with(plugin_id, |old, delete| {
             let remove = || self.purge_and_tombstone(plugin_id, &installation_uuid, delete);
             match old {

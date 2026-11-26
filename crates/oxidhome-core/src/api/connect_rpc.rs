@@ -45,7 +45,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{Next, from_fn_with_state};
-use axum::response::{IntoResponse as _, Response as AxumResponse};
+use axum::response::Response as AxumResponse;
 use connectrpc::{
     ConnectError, Encodable, RequestContext, Response, Router as ConnectRouter, ServiceRequest,
     ServiceResult,
@@ -2219,58 +2219,82 @@ pub fn axum_service(engine: Engine) -> axum::Router {
         enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
         transport: crate::auth::Transport::Connect,
     };
-    let inner = router(engine).into_axum_service();
+    let inner = router(engine)
+        .into_axum_service()
+        .with_interceptor(JsonObjectsOnly);
     axum::Router::new()
         .fallback_service(inner)
-        .layer(axum::middleware::from_fn(json_object_only))
         .layer(from_fn_with_state(auth_state, connect_auth_middleware))
 }
 
-/// A Connect JSON message is an object; the generated decoders would
-/// also take a positional array (`["/dir", ["camera"]]` as an
-/// `InstallPlugin` approving camera), so a JSON body that doesn't start
-/// with `{` is refused `invalid_argument`. Only the leading chunks are
-/// read; the body goes on unchanged.
-async fn json_object_only(req: Request, next: Next) -> AxumResponse {
-    use futures_util::StreamExt as _;
-    let is_json = req
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.trim_start().starts_with("application/json"));
-    if req.method() != axum::http::Method::POST || !is_json {
-        return next.run(req).await;
-    }
-    let (parts, body) = req.into_parts();
-    let mut stream = body.into_data_stream();
-    let mut head: Vec<bytes::Bytes> = Vec::new();
-    let first = loop {
-        match stream.next().await {
-            Some(Ok(chunk)) => {
-                let first = chunk.iter().copied().find(|b| !b.is_ascii_whitespace());
-                head.push(chunk);
-                if first.is_some() {
-                    break first;
-                }
-            }
-            Some(Err(_)) | None => break None,
+/// A JSON message is an object, and proto3 JSON never nests an array
+/// directly in an array; the generated decoders would also take a
+/// positional array (`["/dir", ["camera"]]` as an `InstallPlugin`
+/// approving camera, `[["state.read"]]` as a deny entry), so a JSON
+/// request that isn't an object, or holds an array inside an array, is
+/// refused `invalid_argument`. An interceptor, so it sees the body
+/// read under the service's limits and unframed, on every transport.
+struct JsonObjectsOnly;
+
+impl JsonObjectsOnly {
+    fn check(ctx: &RequestContext, payload: &connectrpc::Payload) -> Result<(), ConnectError> {
+        if payload.format() != connectrpc::CodecFormat::Json {
+            return Ok(());
         }
-    };
-    if first.is_some_and(|b| b != b'{') {
-        let body = serde_json::json!({
-            "code": "invalid_argument",
-            "message": "a Connect JSON request must be an object",
-        });
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            body.to_string(),
-        )
-            .into_response();
+        let refuse = || {
+            rpc_err(
+                ctx,
+                ConnectError::invalid_argument(
+                    "a JSON request must be an object, with no positional (array) messages",
+                ),
+            )
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload.bytes()) else {
+            // Not JSON: the decoder answers it.
+            return Ok(());
+        };
+        if !value.is_object() || has_nested_array(&value) {
+            return Err(refuse());
+        }
+        Ok(())
     }
-    let replay = futures_util::stream::iter(head.into_iter().map(Ok::<_, axum::Error>));
-    let req = Request::from_parts(parts, Body::from_stream(replay.chain(stream)));
-    next.run(req).await
+}
+
+/// `true` when an array holds an array, anywhere in `value`.
+fn has_nested_array(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.iter().any(|v| v.is_array() || has_nested_array(v))
+        }
+        serde_json::Value::Object(map) => map.values().any(has_nested_array),
+        _ => false,
+    }
+}
+
+#[connectrpc::async_trait]
+impl connectrpc::Interceptor for JsonObjectsOnly {
+    async fn intercept_unary(
+        &self,
+        req: connectrpc::interceptor::UnaryRequest,
+        next: connectrpc::Next<'_>,
+    ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
+        Self::check(&req.ctx, &req.payload)?;
+        next.run(req).await
+    }
+
+    async fn intercept_streaming(
+        &self,
+        req: connectrpc::interceptor::StreamRequest,
+        inbound: connectrpc::PayloadStream,
+        next: connectrpc::NextStream<'_>,
+    ) -> Result<connectrpc::interceptor::StreamResponse, ConnectError> {
+        use futures_util::StreamExt as _;
+        let ctx = req.ctx.clone();
+        let inbound: connectrpc::PayloadStream = Box::pin(inbound.map(move |item| {
+            item.and_then(|payload| JsonObjectsOnly::check(&ctx, &payload).map(|()| payload))
+        }));
+        next.run(req, inbound).await
+    }
 }
 
 /// axum `from_fn_with_state` middleware. Wraps every Connect call:

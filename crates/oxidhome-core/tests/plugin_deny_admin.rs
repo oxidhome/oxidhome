@@ -317,6 +317,18 @@ async fn the_owner_sets_and_resets_a_deny_list_over_connect() {
     assert_eq!(body["pluginId"], PLUGIN_ID);
     assert_eq!(body["deny"], selector, "{body}");
     assert_eq!(applied(&f.engine), lock_reads());
+    // A positional entry is refused, list kept.
+    let (status, body) = api_status(
+        &f.router,
+        &f.owner,
+        "POST",
+        &connect("SetPluginDeny"),
+        json!({"pluginId": PLUGIN_ID, "deny": [[["state.read"]]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_argument", "{body}");
+    assert_eq!(applied(&f.engine), lock_reads());
     // A misspelled field reads as an empty list: refused, list kept.
     let (status, body) = api_status(
         &f.router,

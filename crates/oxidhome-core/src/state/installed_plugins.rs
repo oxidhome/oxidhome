@@ -701,6 +701,15 @@ pub fn any_grant_matches(
 /// couldn't resolve" apart from "no SQL row at all".
 pub(crate) const NO_SQL_ROW_UUID: &str = "no-sql-row";
 
+/// The placeholder a duplicate-id quarantine with no live row carries.
+const DUP_UNKNOWN_UUID: &str = "dup-unknown";
+
+/// `false` for a path-only quarantine's placeholder uuid, which names
+/// no installation row.
+pub(crate) fn has_installation_row(installation_uuid: &str) -> bool {
+    installation_uuid != NO_SQL_ROW_UUID && installation_uuid != DUP_UNKNOWN_UUID
+}
+
 /// Mint a fresh installation UUID. Format: `inst-<32 lowercase hex>`
 /// — 16 random bytes = 128 bits of entropy, matching a `UUIDv4`'s
 /// shape without pulling in the `uuid` crate. The `inst-` prefix
@@ -1293,7 +1302,7 @@ impl InstalledPluginRegistry {
                                 .get(&id_arc)
                                 .map(|e| Arc::clone(&e.installation_uuid))
                         })
-                        .unwrap_or_else(|| Arc::from("dup-unknown"));
+                        .unwrap_or_else(|| Arc::from(DUP_UNKNOWN_UUID));
                     if let Some(prior_path) = observed_manifest_ids.get(&manifest_id) {
                         tracing::error!(
                             plugin_id = %manifest_id,
@@ -1356,7 +1365,7 @@ impl InstalledPluginRegistry {
                                 .get(&manifest_id)
                                 .map(|l| Arc::clone(&l.installation_uuid))
                         })
-                        .unwrap_or_else(|| Arc::from("dup-unknown"));
+                        .unwrap_or_else(|| Arc::from(DUP_UNKNOWN_UUID));
                     quarantined_registry.insert(
                         id_arc,
                         QuarantineEntry {

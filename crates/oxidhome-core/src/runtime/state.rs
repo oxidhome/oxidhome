@@ -624,11 +624,14 @@ impl PluginState {
         // C5: `PluginState::new` doesn't know about
         // `InstalledPluginRegistry` (it's the low-level
         // constructor used by tests + the loader). Default the
-        // grant to the manifest's request — the loader
+        // grant to the manifest's request, less any sensitive grant
+        // (H6 slice 5b: only an approved install holds one) — the loader
         // (`PluginInstance::instantiate`) overrides via
         // `Self::with_granted_capabilities` when a live install
         // row is present.
-        let granted_capabilities = Arc::new(manifest.capabilities.clone());
+        let granted_capabilities = Arc::new(crate::state::installed_plugins::without_sensitive(
+            &manifest.capabilities,
+        ));
         // H10 round-4: seed the "requested" list from the manifest
         // directly, matching the granted default above. The loader
         // (`PluginInstance::instantiate`) overrides only the

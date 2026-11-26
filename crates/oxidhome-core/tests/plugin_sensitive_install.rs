@@ -246,6 +246,36 @@ async fn sensitive_grants_are_approved_at_install_over_connect() {
     .await;
     assert!(status.is_client_error(), "{status} {body}");
     assert!(!installed(&f.engine));
+    // So is one framed for gRPC-Web JSON.
+    let payload = json!([source, ["camera"]]).to_string().into_bytes();
+    let mut framed = vec![0u8];
+    framed.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+    framed.extend_from_slice(&payload);
+    let response = f
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {}", f.owner))
+                .header(header::CONTENT_TYPE, "application/grpc-web+json")
+                .body(Body::from(framed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let grpc_status = response
+        .headers()
+        .get("grpc-status")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        grpc_status.as_deref() == Some("3") || text.contains("grpc-status: 3"),
+        "{grpc_status:?} {text}"
+    );
+    assert!(!installed(&f.engine));
     let approve = json!({"sourceDir": source, "approveSensitive": ["camera"]});
     let (status, body) = api_status(&f.router, &f.installer, "POST", uri, approve.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
