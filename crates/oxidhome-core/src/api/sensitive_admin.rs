@@ -197,8 +197,8 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             label = %gap.label,
             missing = %gap.missing.to_csv(),
             "token's broad scopes span sensitive categories its grants don't fully cover \
-             (lock, opener and alarm commands and camera bytes need an explicit grant); grant \
-             with `oxidhome token grant-sensitive <token-id> <category>`",
+             (lock, opener and alarm commands and camera bytes need an explicit grant); with \
+             the daemon stopped, grant with `oxidhome token grant-sensitive <token-id> <category>`",
         );
     }
     gaps
