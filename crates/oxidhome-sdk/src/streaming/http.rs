@@ -44,8 +44,9 @@
 //!   headers at [`MAX_HEADER_BYTES`]; more fails it with
 //!   [`Error::Request`].
 //! - **Headers.** [`FORBIDDEN_HEADERS`] (hop-by-hop headers and `host`,
-//!   which the host sets) and `content-length` (set from the body) are
-//!   dropped by [`Request::header`], so a header list copied from a
+//!   which the host sets), `content-length` (set from the body) and `te`
+//!   (valid only with `connection: te`) are dropped by
+//!   [`Request::header`], so a header list copied from a
 //!   packet capture can be sent as is.
 //! - **Redirects.** `301`, `302`, `303`, `307` and `308` with a
 //!   `Location` are followed, at most [`MAX_REDIRECTS`] times (fewer with
@@ -91,7 +92,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Headers `wasi:http` refuses from a plugin: hop-by-hop headers, and
 /// `host`, which the host sets from the URL. [`Request::header`] drops
-/// them (and `content-length`, which is set from the body).
+/// them (and `content-length`, which is set from the body, and `te`,
+/// which is only valid with a `connection: te`).
 pub const FORBIDDEN_HEADERS: [&str; 9] = [
     "connection",
     "keep-alive",
@@ -424,11 +426,14 @@ impl Request {
     }
 
     /// Add a header (names are case-insensitive; repeats are kept).
-    /// [`FORBIDDEN_HEADERS`] and `content-length` are dropped.
+    /// [`FORBIDDEN_HEADERS`], `content-length` and `te` are dropped.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         let name = name.into().to_ascii_lowercase();
-        if name != "content-length" && !FORBIDDEN_HEADERS.contains(&name.as_str()) {
+        // `te` too: it needs a `connection: te`, which is dropped.
+        if !matches!(name.as_str(), "content-length" | "te")
+            && !FORBIDDEN_HEADERS.contains(&name.as_str())
+        {
             self.headers.push((name, value.into()));
         }
         self
@@ -780,21 +785,25 @@ fn write_body(
             let mut waits = vec![&writable, stall.as_ref().unwrap_or(&answered)];
             waits.extend(expiry.map(|e| &e.timer));
             let ready = poll(&waits);
-            if ready.contains(&0) {
-                continue;
+            // The deadline first: nothing that came with it counts.
+            if let Some(expiry) = expiry {
+                expiry.check()?;
             }
-            if ready.contains(&1) {
-                if early.is_some() {
+            match early {
+                // A response first, even with room to write again: a
+                // refusal ends the upload.
+                None if ready.contains(&1) => {
+                    let response = take_response(pending, None)?;
+                    if response.status() >= 300 {
+                        return Ok(Written::Refused(response));
+                    }
+                    early = Some(response);
+                }
+                Some(_) if !ready.contains(&0) && ready.contains(&1) => {
                     return Err(Error::Http(ErrorCode::ConnectionWriteTimeout));
                 }
-                let response = take_response(pending, None)?;
-                if response.status() >= 300 {
-                    return Ok(Written::Refused(response));
-                }
-                early = Some(response);
-                continue;
+                _ => {}
             }
-            // The deadline: the check above reports it.
             continue;
         }
         if rest.is_empty() {
@@ -1188,12 +1197,7 @@ impl Url {
         let rest = rest.split('#').next().unwrap_or_default();
         let end = rest.find(['/', '?']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(end);
-        if authority.is_empty()
-            || authority.contains('@')
-            || authority
-                .bytes()
-                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
+        if !plain_authority(authority) {
             return Err(invalid());
         }
         let path_and_query = if tail.starts_with('/') {
@@ -1207,17 +1211,11 @@ impl Url {
         {
             return Err(invalid());
         }
-        let url = Self {
+        Ok(Self {
             https,
             authority: authority.to_owned(),
             path_and_query,
-        };
-        // A port that isn't one (`:abc`, `:99999`, `:`) would otherwise
-        // only fail at the host, after earlier hops went out.
-        if url.origin().1.is_none() {
-            return Err(invalid());
-        }
-        Ok(url)
+        })
     }
 
     /// Resolve a `Location` against this URL (RFC 3986 §5.2, for the
@@ -1319,6 +1317,45 @@ impl std::fmt::Display for Url {
     }
 }
 
+/// Whether `authority` is `host[:port]` as the host takes it: a host
+/// without userinfo, whitespace or brackets, or a bracketed IPv6
+/// address; a port of 1–5 digits that fits a `u16`. Checked here so a
+/// bad `Location` is [`Error::InvalidRedirect`] rather than a failure at
+/// the host after earlier hops went out.
+fn plain_authority(authority: &str) -> bool {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        match after {
+            "" => (inner, None),
+            _ => match after.strip_prefix(':') {
+                Some(port) => (inner, Some(port)),
+                None => return false,
+            },
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let host_ok = !host.is_empty()
+        && (authority.starts_with('[')
+            || host.bytes().all(|b| {
+                b.is_ascii_graphic() && !matches!(b, b'@' | b'[' | b']' | b'/' | b'?' | b'#')
+            }));
+    let port_ok = port.is_none_or(|p| {
+        (1..=5).contains(&p.len())
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok()
+    });
+    host_ok && port_ok
+}
+
 /// RFC 3986 §5.2.4, on an absolute path.
 fn remove_dot_segments(path: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
@@ -1373,6 +1410,11 @@ mod tests {
             "http://h:abc/",
             "http://h:99999/",
             "http://h:/",
+            "http://h:+80/",
+            "http://camera]/",
+            "http://[::1]abc/",
+            "http://[nope]/",
+            "http://h:1:2/",
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }
@@ -1508,6 +1550,7 @@ mod tests {
         }
         let request = request
             .header("Content-Length", "3")
+            .header("TE", "trailers")
             .header("Authorization", "Basic x");
         let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["authorization"]);

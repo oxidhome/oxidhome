@@ -410,3 +410,48 @@ async fn a_response_body_wakes_the_plugin_before_its_tick() {
     instance.stop().await.unwrap();
     drop(next);
 }
+
+/// One total timeout covers every phase of an SDK request, even under a
+/// virtual clock (the guest's clock stands still, its timers don't):
+/// a head and a body that each come within the limit, but not both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_total_timeout_spans_the_head_and_the_body() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow peer");
+    let peer = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n");
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_millis(700));
+        let _ = stream.write_all(b"ok");
+    });
+    let dir = probe(&format!("tcp://{peer}"), None);
+    let mut overrides = toml::Table::new();
+    overrides.insert(
+        "ops".into(),
+        toml::Value::String(format!("get-total 1000 http://{peer}/")),
+    );
+    let instance = host
+        .start_with(
+            dir.path(),
+            LoadOptions::new().config(toml::Value::Table(overrides)),
+        )
+        .await
+        .expect("start net-probe");
+    instance.wait_for_running().await.expect("running");
+    let result = string(&instance.storage(), "op/0");
+    assert!(
+        result.starts_with("err:TotalTimeout") && result.ends_with("|sent:true"),
+        "{result}"
+    );
+    instance.stop().await.unwrap();
+}
