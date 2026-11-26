@@ -262,7 +262,18 @@ fn principal_deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminEr
              token or role"
         )));
     }
-    deny_rules(specs)
+    // A device-narrowed `*` means the device actions a token or role
+    // takes: without `state.read`, so the stored and listed entry is
+    // one this function accepts back.
+    let mut rules = deny_rules(specs)?;
+    for rule in &mut rules {
+        if rule.categories.is_some() || rule.devices.is_some() {
+            rule.actions = rule.actions.without(crate::auth::ActionSet::of(&[
+                crate::auth::Action::StateRead,
+            ]));
+        }
+    }
+    Ok(rules)
 }
 
 pub(crate) fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
@@ -595,7 +606,7 @@ struct NewRoleObject {
 
 /// Deserialize `T` from a JSON object only: a derived struct would
 /// also accept an array, and `[]` must not quietly clear a role.
-fn from_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn from_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -957,6 +968,28 @@ mod tests {
         assert_eq!(rows[0].token_id, m.token_id);
         assert_eq!(rows[0].path, "cli.auth.mint:dashboard");
         assert_eq!(rows[0].decision, "allow");
+    }
+
+    /// A device-narrowed `*` on a token names no `state.read` (a
+    /// plugin-only action), so what a listing shows can be minted back.
+    #[test]
+    fn a_narrowed_wildcard_deny_round_trips() {
+        let (tokens, audit) = stores();
+        let mut r = req("tablet", &["dashboard"]);
+        r.deny = vec![SelectorSpec {
+            actions: vec!["*".into()],
+            category: Some(vec!["lock".into()]),
+            devices: None,
+            services: None,
+        }];
+        let m = mint(&tokens, &audit, "cli", "cli", None, &r).expect("mint");
+        let shown = &m.summary.deny[0];
+        assert!(!shown.contains("state.read"), "{shown}");
+        let (actions, _) = shown.split_once('@').expect("narrowed");
+        r.label = "again".into();
+        r.deny[0].actions = actions.split(',').map(str::to_owned).collect();
+        let again = mint(&tokens, &audit, "cli", "cli", None, &r).expect("mint back");
+        assert_eq!(again.summary.deny, m.summary.deny);
     }
 
     #[test]

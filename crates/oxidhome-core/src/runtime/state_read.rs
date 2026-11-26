@@ -544,10 +544,10 @@ impl host_state::Host for PluginState {
                 break;
             }
         }
+        // Undecided reads as nothing visible: a distinct error would
+        // tell a hidden device from an unknown one.
         let Some((mut out, refused)) = decided else {
-            return Err(WitError::Unavailable(
-                "devices changed throughout get-state; try again".into(),
-            ));
+            return Err(no_visible_state(&device));
         };
         if out.is_empty() {
             audit_state_denied(
@@ -610,6 +610,7 @@ impl host_state::Host for PluginState {
         // the page is read again.
         let mut tries = 0;
         let (page, entries) = loop {
+            let policy = plugin.denies.generation();
             let classes = self.devices.class_snapshot();
             let visible =
                 |e: &DeviceState| decide(ctx, plugin, &install, &grants, &classes, e, false);
@@ -638,13 +639,16 @@ impl host_state::Host for PluginState {
                         .map(|vis| to_wit(e, vis))
                 })
                 .collect();
-            if self.devices.is_current(&classes) {
+            // The scan's and the second pass's decisions under one
+            // policy, or an entry the scan let through and the second
+            // pass dropped could end the listing early.
+            if self.devices.is_current(&classes) && plugin.denies.generation() == policy {
                 break (page, entries);
             }
             tries += 1;
             if tries == SNAPSHOT_TRIES {
                 return Err(WitError::Unavailable(
-                    "devices changed throughout list-state; try again".into(),
+                    "devices or deny lists changed throughout list-state; try again".into(),
                 ));
             }
         };

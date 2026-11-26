@@ -981,13 +981,26 @@ async fn reset_network_grant(
 
 // ── Plugin deny lists (H6 slice 5) ───────────────────────────────
 
-/// Body of `PUT /api/v1/plugins/{plugin_id}/deny`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Body of `PUT /api/v1/plugins/{plugin_id}/deny`: an object only (a
+/// derived struct would take `[[]]` too, and clear the list).
 struct PluginDenyBody {
     /// Deny entries, as token deny lists take them; `*` names every
     /// plugin action. Empty removes the list.
     deny: Vec<super::token_admin::SelectorSpec>,
+}
+
+/// [`PluginDenyBody`]'s object form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginDenyObject {
+    deny: Vec<super::token_admin::SelectorSpec>,
+}
+
+impl<'de> Deserialize<'de> for PluginDenyBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: PluginDenyObject = super::token_admin::from_object(deserializer)?;
+        Ok(Self { deny: o.deny })
+    }
 }
 
 /// Why a deny list request failed, as REST answers it.
