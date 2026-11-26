@@ -240,7 +240,10 @@ pub enum LoadMode {
     ///   doesn't match (H11 same-id / different-path).
     /// - Fall back to synthetic UUID + manifest-requested
     ///   capabilities when no row exists at all (nothing to
-    ///   shadow). Callers pick this mode by conscious choice —
+    ///   shadow), less any sensitive grant (H6 slice 5b:
+    ///   `sensitive_event_bytes` cleared, each `reads_state` entry
+    ///   naming a sensitive category dropped; only an approved
+    ///   install holds them). Callers pick this mode by conscious choice —
     ///   argv-loaded plugins in `main.rs`, integration tests,
     ///   the `Engine::new()` in-memory harness.
     Dev,
@@ -314,6 +317,7 @@ impl PluginInstance {
     /// Same as [`Self::load`], but the caller supplies the user
     /// config-override blob. Uses `LoadMode::Dev` — the loader may
     /// fall back to synthetic identity + manifest-requested caps
+    /// (less any sensitive grant, as [`LoadMode::Dev`] says)
     /// when no installed ledger row claims `manifest.plugin.id`.
     /// Production (API-driven) loads must go through
     /// [`Self::load_with_mode`] with `LoadMode::Installed` so
