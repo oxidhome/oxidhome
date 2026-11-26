@@ -319,18 +319,18 @@ impl PluginState {
                 &self.instance_id,
                 DeniedRead::Events { scope },
             );
-            return Err(WitError::PermissionDenied(
-                if matches!(
-                    decision.reason,
-                    crate::auth::Reason::MissingPluginGrant { .. }
-                ) {
+            return Err(WitError::PermissionDenied(match &decision.reason {
+                crate::auth::Reason::MissingPluginGrant { .. } => {
                     "read-events requires `capabilities.subscribes_events = true` in the \
                      plugin manifest"
                         .into()
-                } else {
-                    format!("read-events refused (`{scope}`)")
-                },
-            ));
+                }
+                crate::auth::Reason::PluginDenied { plugin } => {
+                    format!("read-events refused: the owner's deny list for plugin `{plugin}`")
+                }
+                // The root's policy stays in the audit ledger.
+                _ => "read-events refused by the invocation's root principal".into(),
+            }));
         }
         Ok(())
     }

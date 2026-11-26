@@ -42,7 +42,7 @@ pub const AUDIT_PATH_DEVICE_CATEGORY: &str = "cli.device.category";
 /// Longest device pattern a grant may carry, in bytes.
 const MAX_DEVICE_PATTERN_LEN: usize = 64;
 /// Most device patterns one grant may carry.
-const MAX_DEVICE_PATTERNS: usize = 64;
+pub(crate) const MAX_DEVICE_PATTERNS: usize = 64;
 
 /// One live token whose broad scopes span sensitive categories its
 /// grants don't fully cover.

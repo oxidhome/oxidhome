@@ -476,10 +476,12 @@ impl SelectorWire {
         })
     }
 
-    /// `true` when no list in the entry has more than `max` items.
-    pub(crate) fn within(&self, max: usize) -> bool {
+    /// `true` when no list in the entry has more than `max` items
+    /// (`max_devices` for its device patterns).
+    pub(crate) fn within(&self, max: usize, max_devices: usize) -> bool {
         self.actions.len() <= max
-            && [&self.category, &self.devices, &self.services]
+            && self.devices.as_ref().is_none_or(|l| l.len() <= max_devices)
+            && [&self.category, &self.services]
                 .into_iter()
                 .all(|l| l.as_ref().is_none_or(|l| l.len() <= max))
     }

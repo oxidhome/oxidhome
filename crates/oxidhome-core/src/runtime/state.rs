@@ -525,9 +525,13 @@ impl EventRefusal {
         self.denies(crate::auth::Action::EventSubscribe, &resource, upstream)
     }
 
-    /// The deny lists' [`generation`](crate::state::PluginDenyStore::generation).
+    /// The deny lists' [`generation`](crate::state::PluginDenyStore::generation)
+    /// plus the device classes': decisions bracketed by equal readings
+    /// saw one policy and one classification.
     pub(crate) fn generation(&self) -> u64 {
-        self.denies.generation()
+        self.denies
+            .generation()
+            .wrapping_add(self.devices.generation())
     }
 
     /// `true` when a list refuses reading `ev`'s bytes (`blob.read`
@@ -1931,18 +1935,18 @@ impl host_events::Host for PluginState {
                 &self.instance_id,
                 super::state_read::DeniedRead::Subscribe { scope: label },
             );
-            return Err(WitError::PermissionDenied(
-                if matches!(
-                    decision.reason,
-                    crate::auth::Reason::MissingPluginGrant { .. }
-                ) {
+            return Err(WitError::PermissionDenied(match &decision.reason {
+                crate::auth::Reason::MissingPluginGrant { .. } => {
                     "subscribe requires `capabilities.subscribes_events = true` in the plugin \
                      manifest"
                         .into()
-                } else {
-                    format!("subscribe refused (`{label}`)")
-                },
-            ));
+                }
+                crate::auth::Reason::PluginDenied { plugin } => {
+                    format!("subscribe refused: the owner's deny list for plugin `{plugin}`")
+                }
+                // The root's policy stays in the audit ledger.
+                _ => "subscribe refused by the invocation's root principal".into(),
+            }));
         }
         // C4: per-instance subscription cap. Complements the bus-side
         // `SOFT_SUBSCRIBER_CAP` (soft, cross-subscriber): this is the

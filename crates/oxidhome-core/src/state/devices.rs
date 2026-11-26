@@ -261,7 +261,7 @@ impl DeviceRegistry {
 
     /// Registry and metadata changes so far: equal readings bracket a
     /// moment with no change in between.
-    fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         use std::sync::atomic::Ordering;
         self.generation
             .load(Ordering::SeqCst)
@@ -362,6 +362,20 @@ impl DeviceRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// [`Self::bump`] after `id` was (re)inserted over `old`, unless its
+    /// derived class is unchanged (a rename or an identical update).
+    fn bump_if_reclassed(
+        &self,
+        guard: &RwLockWriteGuard<'_, HashMap<DeviceId, Arc<DeviceMeta>>>,
+        old: Option<&DeviceMeta>,
+        id: &DeviceId,
+    ) {
+        let derive = |m: &DeviceMeta| DeviceClass::derive(&m.info.capabilities);
+        if old.map(derive) != guard.get(id).map(|m| derive(m)) {
+            self.bump(guard);
+        }
+    }
+
     /// Drop `id`'s entry, if any.
     fn remove_entry(&self, id: &DeviceId) {
         let mut guard = self.write();
@@ -417,8 +431,8 @@ impl DeviceRegistry {
             info,
         });
         let mut guard = self.write();
-        guard.insert(id.clone(), meta);
-        self.bump(&guard);
+        let old = guard.insert(id.clone(), meta);
+        self.bump_if_reclassed(&guard, old.as_deref(), &id);
         id
     }
 
@@ -492,8 +506,8 @@ impl DeviceRegistry {
             owner_instance,
             info,
         });
-        guard.insert(id.clone(), meta);
-        self.bump(&guard);
+        let old = guard.insert(id.clone(), meta);
+        self.bump_if_reclassed(&guard, old.as_deref(), &id);
         Ok(id)
     }
 
@@ -553,8 +567,8 @@ impl DeviceRegistry {
                     self.bump(&guard);
                     return Err(err);
                 }
-                guard.insert(id.clone(), new);
-                self.bump(&guard);
+                let old = guard.insert(id.clone(), new);
+                self.bump_if_reclassed(&guard, old.as_deref(), id);
                 Ok(())
             }
             _ => Err(WitError::NotFound(format!("device {id} not registered"))),
@@ -916,6 +930,15 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &reg.class_snapshot()), "shared");
 
         assert!(reg.remove("inst", &"dev-0000000000000000".into()).is_err());
+        let lamp = reg.register("u", "inst".into(), empty_info());
+        let first = reg.class_snapshot();
+        let mut renamed = empty_info();
+        renamed.name = "renamed".into();
+        reg.update("inst", &lamp, renamed).expect("update");
+        assert_eq!(reg.register("u", "inst".into(), empty_info()), lamp);
+        assert!(reg.is_current(&first), "same class, same snapshot");
+        reg.remove("inst", &lamp).expect("remove");
+        let first = reg.class_snapshot();
         assert_eq!(reg.remove_by_owner("inst"), 0);
         assert!(reg.is_current(&first), "a failed change changes nothing");
 

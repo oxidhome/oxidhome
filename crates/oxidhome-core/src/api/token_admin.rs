@@ -232,7 +232,7 @@ pub fn build_policy(
         }
     }
     sensitive.sort_by_key(|g| g.category);
-    let deny = deny_rules(&req.deny)?;
+    let deny = principal_deny_rules(&req.deny)?;
     let policy = TokenPolicy {
         scopes,
         sensitive,
@@ -246,6 +246,23 @@ pub fn build_policy(
         return Err(invalid("the policy does not round-trip"));
     }
     Ok(policy)
+}
+
+/// [`deny_rules`] for a token or role. `state.read` is a plugin's
+/// action only (a plugin's state read reaches its root as
+/// `device.read`), so naming it there would deny nothing.
+fn principal_deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
+    let plugin_only = crate::auth::Action::StateRead.as_str();
+    if specs
+        .iter()
+        .any(|s| s.actions.iter().any(|a| a == plugin_only))
+    {
+        return Err(invalid(format!(
+            "`{plugin_only}` is denied on plugins (`plugin deny`); deny `device.read` on a \
+             token or role"
+        )));
+    }
+    deny_rules(specs)
 }
 
 pub(crate) fn deny_rules(specs: &[SelectorSpec]) -> Result<Vec<DenyRule>, AdminError> {
@@ -698,7 +715,7 @@ pub fn build_role(spec: &RoleSpec) -> Result<Vec<u8>, AdminError> {
         name: String::new(),
         grants,
         sensitive,
-        deny: deny_rules(&spec.deny)?,
+        deny: principal_deny_rules(&spec.deny)?,
     };
     let json = def.definition_json();
     if RoleDef::parse("", "", &json).as_ref() != Some(&def) {
@@ -972,6 +989,18 @@ mod tests {
                     ..req("x", &["resident"])
                 },
                 "at least one action",
+            ),
+            (
+                MintRequest {
+                    deny: vec![SelectorSpec {
+                        actions: vec!["state.read".into()],
+                        category: None,
+                        devices: None,
+                        services: None,
+                    }],
+                    ..req("x", &["resident"])
+                },
+                "deny `device.read`",
             ),
             (
                 MintRequest {

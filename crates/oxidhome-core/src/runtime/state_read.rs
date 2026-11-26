@@ -508,28 +508,47 @@ impl host_state::Host for PluginState {
         }
         let ctx = invocation::current_or_host(&self.instance_id);
         let plugin = self.principal();
-        let class = self.devices.class_of(&device);
-        let mut refused = None;
-        let mut out: Vec<WitDeviceState> = entries
-            .iter()
-            .filter_map(|e| {
-                match visibility(
-                    &ctx,
-                    &plugin,
-                    &self.installation_uuid,
-                    class,
-                    self.devices.instance_is_camera(&e.owner_instance),
-                    e,
-                    true,
-                ) {
-                    Ok(vis) => Some(to_wit(e, vis)),
-                    Err(label) => {
-                        refused.get_or_insert(label);
-                        None
+        // Every decision under one classification: a device
+        // reclassified meanwhile means deciding again.
+        let decide_all = || {
+            let mut refused = None;
+            let class = self.devices.class_of(&device);
+            let out: Vec<WitDeviceState> = entries
+                .iter()
+                .filter_map(|e| {
+                    match visibility(
+                        &ctx,
+                        &plugin,
+                        &self.installation_uuid,
+                        class,
+                        self.devices.instance_is_camera(&e.owner_instance),
+                        e,
+                        true,
+                    ) {
+                        Ok(vis) => Some(to_wit(e, vis)),
+                        Err(label) => {
+                            refused.get_or_insert(label);
+                            None
+                        }
                     }
-                }
-            })
-            .collect();
+                })
+                .collect();
+            (out, refused)
+        };
+        let mut decided = None;
+        for _ in 0..SNAPSHOT_TRIES {
+            let classes = self.devices.generation();
+            let result = decide_all();
+            if self.devices.generation() == classes {
+                decided = Some(result);
+                break;
+            }
+        }
+        let Some((mut out, refused)) = decided else {
+            return Err(WitError::Unavailable(
+                "devices changed throughout get-state; try again".into(),
+            ));
+        };
         if out.is_empty() {
             audit_state_denied(
                 self.audit_log.clone(),
@@ -590,9 +609,9 @@ impl host_state::Host for PluginState {
         // registered meanwhile may have state in the page. Otherwise
         // the page is read again.
         let mut tries = 0;
-        let (page, classes) = loop {
+        let (page, entries) = loop {
             let classes = self.devices.class_snapshot();
-            let decide =
+            let visible =
                 |e: &DeviceState| decide(ctx, plugin, &install, &grants, &classes, e, false);
             let page = self.device_state.snapshot_page_capped(
                 after.as_deref(),
@@ -606,11 +625,21 @@ impl host_state::Host for PluginState {
                             .capability
                             .as_ref()
                             .is_none_or(|c| *c == e.capability)
-                        && decide(e).is_some()
+                        && visible(e).is_some()
                 },
             );
+            // The byte decisions too, under the same classification.
+            let entries: Vec<WitDeviceState> = page
+                .devices
+                .iter()
+                .flatten()
+                .filter_map(|e| {
+                    decide(ctx, plugin, &install, &grants, &classes, e, true)
+                        .map(|vis| to_wit(e, vis))
+                })
+                .collect();
             if self.devices.is_current(&classes) {
-                break (page, classes);
+                break (page, entries);
             }
             tries += 1;
             if tries == SNAPSHOT_TRIES {
@@ -622,14 +651,6 @@ impl host_state::Host for PluginState {
         let next_cursor = page
             .resume_after
             .map(|after| self.device_state.seal_scan_position(&after));
-        let entries = page
-            .devices
-            .iter()
-            .flatten()
-            .filter_map(|e| {
-                decide(ctx, plugin, &install, &grants, &classes, e, true).map(|vis| to_wit(e, vis))
-            })
-            .collect();
         Ok(StatePage {
             revision: page.revision,
             entries,

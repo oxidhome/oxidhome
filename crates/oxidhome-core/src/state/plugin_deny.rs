@@ -74,6 +74,12 @@ impl Default for PluginDenyStore {
 /// Most items in each list of a stored deny entry, as an admin change
 /// accepts.
 const MAX_SELECTOR_LIST: usize = crate::api::token_admin::MAX_LIST;
+/// Most device patterns in a stored deny entry, likewise.
+const MAX_SELECTOR_DEVICES: usize = crate::api::sensitive_admin::MAX_DEVICE_PATTERNS;
+/// Largest stored definition read: far above the largest list the
+/// limits allow, so only a corrupt row is past it (and fails closed
+/// without being copied or parsed).
+const MAX_DEFINITION_BYTES: usize = 4 * 1024 * 1024;
 
 /// The stored form of a list: a JSON array of deny entries.
 fn encode(rules: &[DenyRule]) -> Vec<u8> {
@@ -88,7 +94,11 @@ pub fn decode_plugin_deny(definition: &[u8]) -> Option<Vec<DenyRule>> {
     let wire: Vec<crate::auth::role::SelectorWire> = serde_json::from_slice(definition).ok()?;
     // The admin surfaces' limits, so a stored list is never wider
     // than one they accept.
-    if wire.len() > MAX_PLUGIN_DENY_ENTRIES || !wire.iter().all(|w| w.within(MAX_SELECTOR_LIST)) {
+    if wire.len() > MAX_PLUGIN_DENY_ENTRIES
+        || !wire
+            .iter()
+            .all(|w| w.within(MAX_SELECTOR_LIST, MAX_SELECTOR_DEVICES))
+    {
         return None;
     }
     wire.into_iter()
@@ -135,7 +145,9 @@ impl PluginDenyStore {
                 // this module writes fails closed below, rather than
                 // stopping the store from opening (or being reset).
                 let definition = match r.get_ref(1)? {
-                    rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b) => {
+                    rusqlite::types::ValueRef::Blob(b) | rusqlite::types::ValueRef::Text(b)
+                        if b.len() <= MAX_DEFINITION_BYTES =>
+                    {
                         b.to_vec()
                     }
                     _ => Vec::new(),
@@ -421,6 +433,20 @@ mod tests {
         let store = PluginDenyStore::open(db).expect("open");
         let list = store.get("com.example.x").expect("fail closed");
         assert_eq!(list[0].actions, PLUGIN_ACTIONS);
+        // The widest device list an admin change takes survives a
+        // reopen.
+        let devices: Vec<String> = (0..crate::api::sensitive_admin::MAX_DEVICE_PATTERNS)
+            .map(|i| format!("dev-{i:016x}"))
+            .collect();
+        let widest = serde_json::json!([{"actions": ["state.read"], "devices": devices}]);
+        let widest = decode_plugin_deny(widest.to_string().as_bytes()).expect("within limits");
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        PluginDenyStore::open(Arc::clone(&db))
+            .expect("open")
+            .set("com.example.d", widest.clone())
+            .expect("set");
+        let store = PluginDenyStore::open(db).expect("reopen");
+        assert_eq!(store.get("com.example.d").as_deref(), Some(&widest[..]));
         // Text, a list wider than an admin change takes, and a
         // non-text value all fail closed too.
         let many: Vec<String> = (0..=MAX_SELECTOR_LIST)

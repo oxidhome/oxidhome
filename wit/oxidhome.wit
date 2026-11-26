@@ -1301,9 +1301,13 @@ interface host-services {
   /// target, and none of its denies may match. A plugin's grant
   /// never extends what the requester may do. Work the host started
   /// (`init`, `tick`, and every `on-event`, including a reaction to
-  /// an event whose `call-id` names a request) is decided by the
-  /// plugin's grants alone: an event attributes, it doesn't
-  /// delegate.
+  /// an event whose `call-id` names a request) needs no root
+  /// permission: an event attributes, it doesn't delegate.
+  ///
+  /// **Owner deny lists (H6).** Whoever roots the call, the owner's
+  /// deny list for this plugin, and for every plugin whose call led
+  /// to it, can refuse `service.call` on the target; a refused call
+  /// is `permission-denied`.
   ///
   /// Because the authorization key is the service's immutable
   /// `local-id`, a callee that renames its service via
@@ -1422,6 +1426,15 @@ interface host-sandboxes {
 /// Event bus pub/sub. Subscribed events are delivered via the plugin's
 /// exported `on-event(...)`; `read-events` replays the same events
 /// from the host's durable history.
+///
+/// `subscribe` and `read-events` need `capabilities.subscribes_events`
+/// and, inside a request's invocation, that request's `event.read`.
+/// The owner's deny lists (this plugin's, and those of the plugins
+/// whose calls led to the subscription or read) filter what is
+/// delivered or returned: an event of a device they refuse
+/// `event.subscribe` on is dropped, and its `bytes-val` fields are
+/// withheld (the marker below) where they refuse `blob.read`. Lists
+/// are checked again at each delivery.
 interface host-events {
   use types.{subscription-id, error};
   use events.{event, event-filter};
@@ -1505,8 +1518,12 @@ interface host-config {
 /// replaced by a `json-val` marker
 /// `{"withheld":"bytes","size_bytes":N,"required_scope":"reads_state.bytes"}`
 /// unless the matching grant sets `bytes = true`; a plugin's own
-/// entries are returned as written. Refused reads are recorded in the
-/// host's audit ledger.
+/// entries are returned as written. The owner's deny lists (this
+/// plugin's, and those of the plugins whose calls led to the read)
+/// hide what they refuse `state.read` on and withhold bytes where they
+/// refuse `blob.read`; inside a request's invocation the request needs
+/// `device.read` (and `blob.read` for bytes) too. Refused reads are
+/// recorded in the host's audit ledger.
 interface host-state {
   use types.{device-id, unix-ms, key-value, error};
 
