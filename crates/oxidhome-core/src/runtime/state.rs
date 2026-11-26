@@ -752,6 +752,7 @@ impl PluginState {
             granted_services: &self.granted_capabilities.consumes_services,
             reads_state: &self.granted_capabilities.reads_state,
             subscribes_events: self.granted_capabilities.subscribes_events,
+            reads_event_bytes: self.granted_capabilities.reads_event_bytes,
             denies: &self.plugin_denies,
         }
     }

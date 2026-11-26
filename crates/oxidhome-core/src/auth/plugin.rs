@@ -23,6 +23,7 @@
 //!   | `service.call` | [`Resource::Service`] | `consumes_services`: one requested and one granted selector match all five axes (H10) |
 //!   | `state.read` | [`Resource::State`] | `reads_state`: a selector matches the owner plugin, capability and device |
 //!   | `blob.read` | [`Resource::State`] | `reads_state` with `bytes = true` (the entry's `bytes-val` fields) |
+//!   | `blob.read` | [`Resource::Device`] or [`Resource::Blob`] (an event's `bytes-val` fields, [`event_bytes_permit`]) | `reads_event_bytes` |
 //!   | `event.subscribe` | any | `subscribes_events` |
 //!
 //! - **The root's permit**, when the invocation is rooted at an
@@ -33,8 +34,8 @@
 //!   (`init`, `tick`, `on-event`) is the plugin's own.
 //!
 //! Not in the engine, as manifest-only checks: `network`,
-//! `declares_devices` / `declares_services`, quotas,
-//! `script_sandboxes` and `reads_event_bytes`. A plugin's own state
+//! `declares_devices` / `declares_services`, quotas and
+//! `script_sandboxes`. A plugin's own state
 //! entries are its own data and are not asked about here
 //! (`runtime::state_read`). Host-mediated device commands between
 //! plugins don't exist yet, so `device.command` is not a plugin action.
@@ -63,6 +64,9 @@ pub const CONSUMES_SERVICES_GRANT: &str = "consumes_services";
 pub const READS_STATE_GRANT: &str = "reads_state";
 /// What permits a plugin the `bytes-val` fields of a state entry.
 pub const READS_STATE_BYTES_GRANT: &str = "reads_state.bytes";
+/// What permits a plugin the `bytes-val` fields of recorded events
+/// (`read-events`).
+pub const READS_EVENT_BYTES_GRANT: &str = "reads_event_bytes";
 /// Manifest grant name of a plugin's event-bus permit.
 pub const SUBSCRIBES_EVENTS_GRANT: &str = "subscribes_events";
 
@@ -84,6 +88,8 @@ pub struct PluginPrincipal<'a> {
     pub reads_state: &'a [StateGrant],
     /// Effective `subscribes_events`.
     pub subscribes_events: bool,
+    /// Effective `reads_event_bytes`.
+    pub reads_event_bytes: bool,
     /// The owner's deny lists, for this plugin and the chain's.
     pub denies: &'a PluginDenyStore,
 }
@@ -191,6 +197,9 @@ fn plugin_permit(
                 .then_some(grant)
                 .ok_or(missing(grant))
         }
+        (Action::BlobRead, Resource::Device(_) | Resource::Blob(_)) => {
+            event_bytes_permit(plugin.reads_event_bytes, resource)
+        }
         (Action::EventSubscribe, _) => plugin
             .subscribes_events
             .then_some(SUBSCRIBES_EVENTS_GRANT)
@@ -200,6 +209,26 @@ fn plugin_permit(
         (Action::BlobRead, _) => Err(missing(READS_STATE_BYTES_GRANT)),
         _ => Err(Reason::NoPermit),
     }
+}
+
+/// A plugin's permit to read the `bytes-val` fields of a recorded
+/// event, whose bytes are `resource`
+/// ([`crate::runtime`]'s `bytes_resource`: the event's device, or its
+/// source's blobs): `reads_event_bytes`. Owned inputs, so a history
+/// scan can decide it off the plugin's state.
+///
+/// # Errors
+///
+/// [`Reason::MissingPluginGrant`] labelled `reads_event_bytes`.
+pub fn event_bytes_permit(
+    reads_event_bytes: bool,
+    _resource: &Resource,
+) -> Result<&'static str, Reason> {
+    reads_event_bytes
+        .then_some(READS_EVENT_BYTES_GRANT)
+        .ok_or(Reason::MissingPluginGrant {
+            grant: READS_EVENT_BYTES_GRANT,
+        })
 }
 
 /// What the root of an external invocation must hold for a plugin to
@@ -271,6 +300,7 @@ mod tests {
             granted_services: services,
             reads_state: reads,
             subscribes_events: true,
+            reads_event_bytes: false,
             denies,
         }
     }
@@ -471,6 +501,7 @@ mod tests {
         assert!(authorize_plugin(&host, &p, Action::EventSubscribe, &pre).allow);
         let off = PluginPrincipal {
             subscribes_events: false,
+            reads_event_bytes: false,
             ..p
         };
         assert_eq!(
@@ -508,6 +539,39 @@ mod tests {
             )
             .expect("set");
         assert!(!authorize_plugin(&host, &p, Action::EventSubscribe, &pre).allow);
+    }
+
+    /// An event's bytes need `reads_event_bytes`, like a state entry's
+    /// need `reads_state.bytes`; an external root also needs
+    /// `blob.read` on them.
+    #[test]
+    fn event_bytes_need_reads_event_bytes() {
+        let denies = PluginDenyStore::detached();
+        let p = plugin(&denies, &[], &[]);
+        let host = InvocationContext::host_origin("caller");
+        let lamp = Resource::device(
+            "dev-a1b2c3d4e5f60718",
+            DeviceClass::of(DeviceCategory::Light),
+        );
+        let blob = Resource::blob("src", "", false);
+        for bytes in [&lamp, &blob] {
+            let d = authorize_plugin(&host, &p, Action::BlobRead, bytes);
+            assert_eq!(d.reason.audit_label(), Some(READS_EVENT_BYTES_GRANT));
+        }
+        let with = PluginPrincipal {
+            reads_event_bytes: true,
+            ..p
+        };
+        let d = authorize_plugin(&host, &with, Action::BlobRead, &lamp);
+        assert_eq!(
+            d.reason,
+            Reason::PluginGrant {
+                grant: READS_EVENT_BYTES_GRANT
+            }
+        );
+        let narrow = ctx_for(&Actor::api("t", vec!["events:read".into()]));
+        let d = authorize_plugin(&narrow, &with, Action::BlobRead, &lamp);
+        assert_eq!(d.reason.audit_label(), Some("blobs:read"));
     }
 
     #[test]

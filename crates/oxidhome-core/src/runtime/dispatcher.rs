@@ -201,6 +201,7 @@ pub async fn call_service_from_host(
         granted_services: caller_granted_grants,
         reads_state: &[],
         subscribes_events: false,
+        reads_event_bytes: false,
         denies: &denies,
     };
     call_service(
@@ -950,6 +951,7 @@ mod tests {
             granted_services: granted,
             reads_state: &[],
             subscribes_events: false,
+            reads_event_bytes: false,
             denies: &denies,
         };
         super::call_service(

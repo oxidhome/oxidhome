@@ -17,7 +17,9 @@
 //! traced, not audited.
 //!
 //! `bytes-val` fields are replaced by a `json-val` marker unless the
-//! effective capabilities set `reads_event_bytes`. There is no
+//! plugin's permit covers them (`blob.read` on the event's device or
+//! source blobs, granted by `reads_event_bytes`:
+//! [`crate::auth::event_bytes_permit`]). There is no
 //! own-event exemption as in H2: `event_log` doesn't record the
 //! publisher's installation, so an instance id reused by another
 //! install couldn't be told apart from the original.
@@ -247,8 +249,10 @@ fn read_stable(
 /// [`RowAccess`] for a plugin's `read-events` (H6 slice 5). A row is
 /// hidden when a deny list (the plugin's, its subscription's upstream
 /// plugins', or this call's chain) refuses `event.subscribe` of its
-/// device, as at delivery. Bytes go out with `reads_event_bytes` when
-/// no list refuses `blob.read` of them and, inside a token's
+/// device, as at delivery. Bytes go out when no list refuses
+/// `blob.read` of them, the plugin's permit covers them
+/// (`reads_event_bytes`, [`crate::auth::event_bytes_permit`]) and,
+/// inside a token's
 /// invocation, the token may read them (`blob.read`, with no sensitive
 /// obligation: camera bytes, from a camera device or a camera-source
 /// instance, are withheld), as for its direct read.
@@ -280,14 +284,14 @@ impl RowAccess for HistoryAccess {
     }
 
     fn releases_bytes(&self, event: &Event, upstream: &[String]) -> bool {
-        if !self.bytes {
-            return false;
-        }
         let resource = bytes_resource(
             event,
             |d| self.classes.class_of(d),
             self.classes.instance_is_camera(&event.origin_instance_id),
         );
+        if crate::auth::event_bytes_permit(self.bytes, &resource).is_err() {
+            return false;
+        }
         if self.refusal.denies(
             crate::auth::Action::BlobRead,
             &resource,

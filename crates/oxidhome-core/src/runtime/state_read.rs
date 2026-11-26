@@ -707,6 +707,7 @@ mod tests {
             granted_services: &[],
             reads_state: grants,
             subscribes_events: false,
+            reads_event_bytes: false,
             denies: &denies,
         };
         let ctx = InvocationContext::host_origin(me);
@@ -780,6 +781,7 @@ mod tests {
             granted_services: &[],
             reads_state: &grants,
             subscribes_events: false,
+            reads_event_bytes: false,
             denies: &denies,
         };
         let e = entry("other", "p.other", "dev-1", "switch");
