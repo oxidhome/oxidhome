@@ -104,8 +104,9 @@ const INITIAL_SCHEMA: &str = "
     -- the current max: clients page and resume on id cursors. The
     -- filter indexes are keyed `(col, id)` so a cursor query seeks and
     -- streams in id order without a sort. `call_id` is the call id of
-    -- the attributable invocation that published the event (an
-    -- external request, or an `on-event` reaction to one).
+    -- the external request the publishing invocation traces back to
+    -- (through any chain of `on-event` reactions), NULL when it traces
+    -- back to none.
     CREATE TABLE event_log (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         received_ms   INTEGER NOT NULL,
