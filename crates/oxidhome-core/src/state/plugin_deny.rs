@@ -210,38 +210,42 @@ impl PluginDenyStore {
         self.change(plugin_id, rules, |old, commit| {
             let old = old.map(Arc::from);
             commit().map(|()| old)
-        })
+        })?
     }
 
     /// [`Self::set`], with `wrap` around the write: it sees the list
     /// being replaced and calls `commit` to make the change, all under
     /// the writer lock, so what it records about the old list is what
-    /// the change replaced (the audit row of an admin change).
+    /// the change replaced (the audit row of an admin change). A change
+    /// the limits refuse is refused before `wrap` runs.
     ///
     /// # Errors
     ///
-    /// Whatever `wrap` returns; `commit` fails as [`Self::set`] does.
+    /// The change is refused ([`PluginDenyError`]: not a plugin id, too
+    /// many entries or lists). Otherwise `wrap`'s result is returned,
+    /// `commit` failing on a storage error.
     pub fn change<R>(
         &self,
         plugin_id: &str,
         rules: Vec<DenyRule>,
         wrap: impl FnOnce(Option<&[DenyRule]>, &mut dyn FnMut() -> Result<(), PluginDenyError>) -> R,
-    ) -> R {
+    ) -> Result<R, PluginDenyError> {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let current = self.get(plugin_id);
+        self.check(plugin_id, &rules, current.is_some())?;
         let mut rules = Some(rules);
         let mut commit = || {
             let rules = rules.take().unwrap_or_default();
-            self.commit_locked(plugin_id, rules, current.is_some())
+            self.commit_locked(plugin_id, rules)
         };
-        wrap(current.as_deref(), &mut commit)
+        Ok(wrap(current.as_deref(), &mut commit))
     }
 
-    /// Validate and store `rules`; the writer lock is held.
-    fn commit_locked(
+    /// The limits on a change; the writer lock is held.
+    fn check(
         &self,
         plugin_id: &str,
-        rules: Vec<DenyRule>,
+        rules: &[DenyRule],
         exists: bool,
     ) -> Result<(), PluginDenyError> {
         if !oxidhome_manifest::is_plugin_id(plugin_id) {
@@ -250,27 +254,41 @@ impl PluginDenyStore {
         if rules.len() > MAX_PLUGIN_DENY_ENTRIES {
             return Err(PluginDenyError::TooManyEntries);
         }
-        debug_assert!(rules.iter().all(|r| PLUGIN_ACTIONS.contains_all(r.actions)));
         if !rules.is_empty() && !exists && self.len() >= MAX_PLUGIN_DENY_LISTS {
             return Err(PluginDenyError::TooManyLists);
         }
+        Ok(())
+    }
+
+    /// Store `rules`, [`Self::check`]ed; the writer lock is held.
+    fn commit_locked(&self, plugin_id: &str, rules: Vec<DenyRule>) -> Result<(), PluginDenyError> {
+        debug_assert!(rules.iter().all(|r| PLUGIN_ACTIONS.contains_all(r.actions)));
         if let Some(db) = &self.db {
-            if rules.is_empty() {
-                db.write(|conn| {
+            // `synchronous = FULL`: an acknowledged deny must survive
+            // power loss, or the next start would load the wider
+            // policy (like the network grant and TLS pin writes).
+            db.write(|conn| -> Result<(), rusqlite::Error> {
+                conn.pragma_update(None, "synchronous", "FULL")?;
+                let result = if rules.is_empty() {
                     conn.execute("DELETE FROM plugin_deny WHERE plugin_id = ?1", [plugin_id])
-                })?;
-            } else {
-                let definition = encode(&rules);
-                db.write(|conn| {
+                } else {
                     conn.execute(
                         "INSERT INTO plugin_deny (plugin_id, definition, updated_ms) \
                          VALUES (?1, ?2, ?3) \
                          ON CONFLICT(plugin_id) DO UPDATE SET \
                          definition = excluded.definition, updated_ms = excluded.updated_ms",
-                        params![plugin_id, definition, now_unix_ms()],
+                        params![plugin_id, encode(&rules), now_unix_ms()],
                     )
-                })?;
-            }
+                };
+                if let Err(err) = conn.pragma_update(None, "synchronous", "NORMAL") {
+                    tracing::warn!(
+                        target: "auth.plugin",
+                        error = %err,
+                        "failed to restore synchronous = NORMAL; connection stays at FULL",
+                    );
+                }
+                result.map(drop)
+            })?;
         }
         let mut rows = self.rows.write().unwrap_or_else(PoisonError::into_inner);
         if rules.is_empty() {

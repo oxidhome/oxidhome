@@ -134,7 +134,9 @@ pub mod __buffa {
         reg.register_json_any(super::__GET_PLUGIN_DENY_REQUEST_JSON_ANY);
         reg.register_json_any(super::__SET_PLUGIN_DENY_REQUEST_JSON_ANY);
         reg.register_json_any(super::__RESET_PLUGIN_DENY_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__PLUGIN_DENY_JSON_ANY);
+        reg.register_json_any(super::__GET_PLUGIN_DENY_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__SET_PLUGIN_DENY_RESPONSE_JSON_ANY);
+        reg.register_json_any(super::__RESET_PLUGIN_DENY_RESPONSE_JSON_ANY);
     }
 }
 #[doc(inline)]
@@ -446,8 +448,16 @@ pub use self::__buffa::view::ResetPluginDenyRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::ResetPluginDenyRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::PluginDenyView;
+pub use self::__buffa::view::GetPluginDenyResponseView;
 #[doc(inline)]
-pub use self::__buffa::view::PluginDenyOwnedView;
+pub use self::__buffa::view::GetPluginDenyResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginDenyResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::SetPluginDenyResponseOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginDenyResponseView;
+#[doc(inline)]
+pub use self::__buffa::view::ResetPluginDenyResponseOwnedView;
 #[doc(inline)]
 pub use self::__buffa::register_types;

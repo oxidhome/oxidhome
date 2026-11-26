@@ -522,12 +522,23 @@ impl EventRefusal {
             crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
             |d| self.devices.resource(d),
         );
+        self.denies(crate::auth::Action::EventSubscribe, &resource, upstream)
+    }
+
+    /// `true` when this plugin's list, or one of `upstream`'s, refuses
+    /// `action` on `resource`.
+    pub(crate) fn denies<'a>(
+        &'a self,
+        action: crate::auth::Action,
+        resource: &crate::auth::Resource,
+        upstream: impl IntoIterator<Item = &'a String>,
+    ) -> bool {
         crate::auth::denied_by(
             &self.denies,
             std::iter::once(self.plugin_id.as_str())
                 .chain(upstream.into_iter().map(String::as_str)),
-            crate::auth::Action::EventSubscribe,
-            &resource,
+            action,
+            resource,
         )
         .is_some()
     }
@@ -1890,6 +1901,11 @@ impl host_events::Host for PluginState {
                 instance_id = %self.instance_id,
                 required = label,
                 "subscribe denied",
+            );
+            super::state_read::queue_deny_audit(
+                self.audit_log.clone(),
+                &self.instance_id,
+                super::state_read::DeniedRead::Subscribe { scope: label },
             );
             return Err(WitError::PermissionDenied(
                 if matches!(

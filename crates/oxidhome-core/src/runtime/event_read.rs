@@ -107,30 +107,59 @@ fn approx_size(event: &Event) -> usize {
         + payload
 }
 
+/// What a reader may see of a history row, given the plugins upstream
+/// of the subscription that matched it.
+trait RowAccess {
+    /// The row is hidden (a deny list refuses it).
+    fn refused(&self, event: &Event, upstream: &[String]) -> bool;
+    /// Its `bytes-val` fields may go out.
+    fn releases_bytes(&self, event: &Event, upstream: &[String]) -> bool;
+}
+
+/// Everything visible, bytes as `bytes` says (tests).
+#[cfg(test)]
+struct Open {
+    bytes: bool,
+}
+
+#[cfg(test)]
+impl RowAccess for Open {
+    fn refused(&self, _: &Event, _: &[String]) -> bool {
+        false
+    }
+    fn releases_bytes(&self, _: &Event, _: &[String]) -> bool {
+        self.bytes
+    }
+}
+
 /// Read one page for a reader with `filters` as its subscriptions,
-/// skipping (before counting) the rows `refused` hides.
+/// skipping (before counting) the rows `access` hides and withholding
+/// the bytes it doesn't release.
 fn read_page(
     log: &EventLog,
     after_id: u64,
     limit: usize,
     filters: &[(EventFilter, Arc<[String]>)],
-    bytes: bool,
-    refused: impl Fn(&Event, &[String]) -> bool,
+    access: &impl RowAccess,
 ) -> Result<Result<ScanPage, CursorExpired>, EventLogError> {
     let mut taken = 0usize;
     let mut size = 0usize;
     log.scan_after_cursor(after_id, SCAN_BUDGET, |event| {
-        if !is_gap_marker(event)
-            && !filters
+        let upstream = if is_gap_marker(event) {
+            None
+        } else {
+            match filters
                 .iter()
-                .any(|(f, upstream)| filter_matches(f, event) && !refused(event, upstream))
-        {
-            return ScanStep::Skip;
-        }
+                .find(|(f, upstream)| filter_matches(f, event) && !access.refused(event, upstream))
+            {
+                Some((_, upstream)) => Some(upstream),
+                None => return ScanStep::Skip,
+            }
+        };
         if taken >= limit {
             return ScanStep::Full;
         }
-        if !bytes {
+        if !upstream.is_some_and(|up| access.releases_bytes(event, up)) {
             withhold_bytes(&mut event.payload);
         }
         let len = approx_size(event);
@@ -146,6 +175,74 @@ fn read_page(
             ScanStep::Take
         }
     })
+}
+
+/// [`RowAccess`] for a plugin's `read-events` (H6 slice 5). A row is
+/// hidden when a deny list (the plugin's, its subscription's upstream
+/// plugins', or this call's chain) refuses `event.subscribe` of its
+/// device, as at delivery. Bytes go out with `reads_event_bytes` when
+/// no list refuses `blob.read` of them and, inside a token's
+/// invocation, the token may read them (`blob.read`, with no sensitive
+/// obligation: camera bytes, from a camera device or a camera-source
+/// instance, are withheld), as for its direct read.
+struct HistoryAccess {
+    refusal: super::state::EventRefusal,
+    classes: crate::state::devices::ClassSnapshot,
+    chain: Vec<String>,
+    bytes: bool,
+    ctx: crate::auth::InvocationContext,
+}
+
+impl HistoryAccess {
+    fn plugins<'a>(&'a self, upstream: &'a [String]) -> impl Iterator<Item = &'a String> {
+        upstream.iter().chain(self.chain.iter())
+    }
+}
+
+impl RowAccess for HistoryAccess {
+    fn refused(&self, event: &Event, upstream: &[String]) -> bool {
+        let resource = event.device.as_deref().map_or(
+            crate::auth::Resource::pre_check(crate::auth::ResourceKind::Event),
+            |d| self.classes.resource(d),
+        );
+        self.refusal.denies(
+            crate::auth::Action::EventSubscribe,
+            &resource,
+            self.plugins(upstream),
+        )
+    }
+
+    fn releases_bytes(&self, event: &Event, upstream: &[String]) -> bool {
+        if !self.bytes {
+            return false;
+        }
+        let camera = self.classes.instance_is_camera(&event.origin_instance_id);
+        let resource = match event.device.as_deref() {
+            Some(d) => {
+                let class = self.classes.class_of(d);
+                crate::auth::Resource::device(
+                    d,
+                    if camera {
+                        class.with_camera_bytes()
+                    } else {
+                        class
+                    },
+                )
+            }
+            None => crate::auth::Resource::blob(event.origin_instance_id.as_str(), "", camera),
+        };
+        if self.refusal.denies(
+            crate::auth::Action::BlobRead,
+            &resource,
+            self.plugins(upstream),
+        ) {
+            return false;
+        }
+        !self.ctx.root().is_external() || {
+            let root = crate::auth::authorize(&self.ctx, crate::auth::Action::BlobRead, &resource);
+            root.allow && root.obligations.sensitive.is_empty()
+        }
+    }
 }
 
 impl PluginState {
@@ -193,15 +290,21 @@ impl PluginState {
             0 => DEFAULT_LIMIT,
             n => n.min(MAX_LIMIT),
         };
-        let bytes = self.granted_capabilities.reads_event_bytes;
         let log = Arc::clone(&self.event_log);
         let subscriptions = &self.subscriptions;
-        let refusal = self.event_refusal();
-        let chain: Vec<String> = ctx
-            .chain()
-            .iter()
-            .map(|h| h.caller_plugin.clone())
-            .collect();
+        let access = HistoryAccess {
+            refusal: self.event_refusal(),
+            // Read before the scan: the registry's locks aren't taken
+            // while the scan holds the database connection.
+            classes: self.devices.class_snapshot(),
+            chain: ctx
+                .chain()
+                .iter()
+                .map(|h| h.caller_plugin.clone())
+                .collect(),
+            bytes: self.granted_capabilities.reads_event_bytes,
+            ctx: ctx.clone(),
+        };
         let read = async {
             // The permit moves into the closure, so a call cancelled
             // or timed out while its read runs still holds the slot
@@ -214,11 +317,7 @@ impl PluginState {
                 .collect();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                // A row is hidden as live delivery would hide it, plus
-                // by the deny lists on this call's own chain.
-                read_page(&log, after_id, limit, &filters, bytes, |ev, upstream| {
-                    refusal.refuses(ev, upstream.iter().chain(chain.iter()))
-                })
+                read_page(&log, after_id, limit, &filters, &access)
             })
             .await
             .map(Some)
@@ -343,6 +442,59 @@ mod tests {
         assert_eq!(calls, vec![Some(expected.as_str()), None]);
     }
 
+    /// Hides the rows of `hidden`'s topic, and only for subscriptions
+    /// with an upstream plugin (H6 slice 5 tests).
+    struct HideTopic {
+        hidden: &'static str,
+    }
+
+    impl RowAccess for HideTopic {
+        fn refused(&self, event: &Event, upstream: &[String]) -> bool {
+            !upstream.is_empty()
+                && matches!(&event.payload, EventPayload::Custom(c) if c.topic == self.hidden)
+        }
+        fn releases_bytes(&self, _: &Event, _: &[String]) -> bool {
+            true
+        }
+    }
+
+    /// H6 slice 5: a hidden row is skipped before it counts toward a
+    /// page, and hiding follows the upstream of the subscription that
+    /// matched.
+    #[test]
+    fn hidden_rows_do_not_count_toward_a_page() {
+        let log = log();
+        record(
+            &log,
+            &[custom("secret", "1"), custom("t", "2"), custom("t", "3")],
+        );
+        let upstream: Arc<[String]> = Arc::from(["com.example.caller".to_owned()]);
+        let access = HideTopic { hidden: "secret" };
+        let p = read_page(&log, 0, 1, &[(all(), Arc::clone(&upstream))], &access)
+            .expect("read")
+            .expect("cursor");
+        let topics: Vec<_> = p
+            .events
+            .iter()
+            .map(|e| match &e.payload {
+                EventPayload::Custom(c) => c.topic.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(topics, ["t"]);
+        // A second subscription without an upstream still sees it.
+        let p = read_page(
+            &log,
+            0,
+            10,
+            &[(all(), upstream), (all(), Arc::from([]))],
+            &access,
+        )
+        .expect("read")
+        .expect("cursor");
+        assert_eq!(p.events.len(), 3);
+    }
+
     fn camera(device: &str, frame: Vec<u8>) -> Event {
         Event {
             device: Some(device.into()),
@@ -390,7 +542,7 @@ mod tests {
         bytes: bool,
     ) -> ScanPage {
         let filters: Vec<_> = filters.iter().map(|f| (f.clone(), Arc::from([]))).collect();
-        read_page(log, after, limit, &filters, bytes, |_, _| false)
+        read_page(log, after, limit, &filters, &Open { bytes })
             .expect("read")
             .expect("cursor")
     }
@@ -518,9 +670,15 @@ mod tests {
             &[custom("t", "1"), custom("t", "2"), custom("t", "3")],
         );
         log.trim_older_than(i64::MAX).expect("trim");
-        let expired = read_page(&log, 1, 10, &[(all(), Arc::from([]))], true, |_, _| false)
-            .expect("read")
-            .expect_err("expired");
+        let expired = read_page(
+            &log,
+            1,
+            10,
+            &[(all(), Arc::from([]))],
+            &Open { bytes: true },
+        )
+        .expect("read")
+        .expect_err("expired");
         assert_eq!(
             expired,
             CursorExpired {

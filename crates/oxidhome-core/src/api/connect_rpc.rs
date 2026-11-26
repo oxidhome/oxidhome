@@ -1264,7 +1264,7 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         &'a self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb_grant::GetPluginDenyRequest>,
-    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+    ) -> ServiceResult<impl Encodable<pb_grant::GetPluginDenyResponse> + Send + use<'a>> {
         let req = request.to_owned_message();
         require_connect(
             &ctx,
@@ -1272,15 +1272,21 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
             &Resource::plugin(req.plugin_id.as_str()),
         )?;
         let view =
-            super::plugin_deny_admin::plugin_deny(&self.engine.plugin_denies(), req.plugin_id);
-        Response::ok(proto_plugin_deny(view))
+            super::plugin_deny_admin::plugin_deny(&self.engine.plugin_denies(), req.plugin_id)
+                .map_err(|e| rpc_err(&ctx, ConnectError::invalid_argument(e.to_string())))?;
+        let (plugin_id, deny) = proto_plugin_deny(view);
+        Response::ok(pb_grant::GetPluginDenyResponse {
+            plugin_id,
+            deny,
+            ..Default::default()
+        })
     }
 
     async fn set_plugin_deny<'a>(
         &'a self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb_grant::SetPluginDenyRequest>,
-    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+    ) -> ServiceResult<impl Encodable<pb_grant::SetPluginDenyResponse> + Send + use<'a>> {
         // Owner only: refuse others before copying the list.
         require_connect(
             &ctx,
@@ -1289,25 +1295,35 @@ impl oxidhome_proto::connect::oxidhome::v1::PluginsService for OxidHomePlugins {
         )?;
         let req = request.to_owned_message();
         let specs = req.deny.into_iter().map(selector_spec).collect();
-        let view = self
+        let (plugin_id, deny) = self
             .change_plugin_deny(&ctx, req.plugin_id, Some(specs))
             .await?;
-        Response::ok(view)
+        Response::ok(pb_grant::SetPluginDenyResponse {
+            plugin_id,
+            deny,
+            ..Default::default()
+        })
     }
 
     async fn reset_plugin_deny<'a>(
         &'a self,
         ctx: RequestContext,
         request: ServiceRequest<'_, pb_grant::ResetPluginDenyRequest>,
-    ) -> ServiceResult<impl Encodable<pb_grant::PluginDeny> + Send + use<'a>> {
+    ) -> ServiceResult<impl Encodable<pb_grant::ResetPluginDenyResponse> + Send + use<'a>> {
         let req = request.to_owned_message();
-        let view = self.change_plugin_deny(&ctx, req.plugin_id, None).await?;
-        Response::ok(view)
+        let (plugin_id, deny) = self.change_plugin_deny(&ctx, req.plugin_id, None).await?;
+        Response::ok(pb_grant::ResetPluginDenyResponse {
+            plugin_id,
+            deny,
+            ..Default::default()
+        })
     }
 }
 
-/// H6 slice 5: a plugin's deny list as `PluginDeny`.
-fn proto_plugin_deny(view: super::plugin_deny_admin::PluginDenyView) -> pb_grant::PluginDeny {
+/// H6 slice 5: a plugin's deny list as proto selectors.
+fn proto_plugin_deny(
+    view: super::plugin_deny_admin::PluginDenyView,
+) -> (String, Vec<ProtoSelector>) {
     let strings = |v: &serde_json::Value, key: &str| -> Vec<String> {
         v.get(key)
             .and_then(serde_json::Value::as_array)
@@ -1317,21 +1333,18 @@ fn proto_plugin_deny(view: super::plugin_deny_admin::PluginDenyView) -> pb_grant
                     .collect()
             })
     };
-    pb_grant::PluginDeny {
-        plugin_id: view.plugin_id,
-        deny: view
-            .deny
-            .iter()
-            .map(|d| ProtoSelector {
-                actions: strings(d, "actions"),
-                category: strings(d, "category"),
-                devices: strings(d, "devices"),
-                services: strings(d, "services"),
-                ..Default::default()
-            })
-            .collect(),
-        ..Default::default()
-    }
+    let deny = view
+        .deny
+        .iter()
+        .map(|d| ProtoSelector {
+            actions: strings(d, "actions"),
+            category: strings(d, "category"),
+            devices: strings(d, "devices"),
+            services: strings(d, "services"),
+            ..Default::default()
+        })
+        .collect();
+    (view.plugin_id, deny)
 }
 
 impl OxidHomePlugins {
@@ -1343,7 +1356,7 @@ impl OxidHomePlugins {
         ctx: &RequestContext,
         plugin_id: String,
         specs: Option<Vec<super::token_admin::SelectorSpec>>,
-    ) -> Result<pb_grant::PluginDeny, ConnectError> {
+    ) -> Result<(String, Vec<ProtoSelector>), ConnectError> {
         use super::plugin_deny_admin::PluginDenyAdminError as E;
         require_connect(
             ctx,
@@ -1379,9 +1392,10 @@ impl OxidHomePlugins {
 /// Phase 8.5: the proto messages of the network grant RPCs.
 mod pb_grant {
     pub(super) use oxidhome_proto::proto::oxidhome::v1::{
-        GetPluginDenyRequest, NetworkGrantChange, NetworkGrants, NotRestartedInstance, PluginDeny,
-        ResetPluginDenyRequest, ResetPluginNetworkGrantRequest, ResetPluginNetworkGrantResponse,
-        SetPluginDenyRequest, SetPluginNetworkGrantRequest, SetPluginNetworkGrantResponse,
+        GetPluginDenyRequest, GetPluginDenyResponse, NetworkGrantChange, NetworkGrants,
+        NotRestartedInstance, ResetPluginDenyRequest, ResetPluginDenyResponse,
+        ResetPluginNetworkGrantRequest, ResetPluginNetworkGrantResponse, SetPluginDenyRequest,
+        SetPluginDenyResponse, SetPluginNetworkGrantRequest, SetPluginNetworkGrantResponse,
     };
 }
 

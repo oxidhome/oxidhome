@@ -58,7 +58,7 @@ service PluginsService {
 
   // A plugin's deny list (H6 slice 5), empty when the owner set none.
   // `policy.manage`. Same shape as `GET /api/v1/plugins/{plugin_id}/deny`.
-  rpc GetPluginDeny(GetPluginDenyRequest) returns (PluginDeny);
+  rpc GetPluginDeny(GetPluginDenyRequest) returns (GetPluginDenyResponse);
 
   // Replace a plugin's deny list: what the plugin, or any plugin whose
   // call reaches another, may not do (`service.call`, `state.read`,
@@ -66,11 +66,11 @@ service PluginsService {
   // plugin need not be installed; running instances apply it at once.
   // An empty list removes it. `policy.manage`. Same shape as
   // `PUT /api/v1/plugins/{plugin_id}/deny`.
-  rpc SetPluginDeny(SetPluginDenyRequest) returns (PluginDeny);
+  rpc SetPluginDeny(SetPluginDenyRequest) returns (SetPluginDenyResponse);
 
   // Remove a plugin's deny list. `policy.manage`. Same shape as
   // `DELETE /api/v1/plugins/{plugin_id}/deny`.
-  rpc ResetPluginDeny(ResetPluginDenyRequest) returns (PluginDeny);
+  rpc ResetPluginDeny(ResetPluginDenyRequest) returns (ResetPluginDenyResponse);
 }
 
 message ListPluginsRequest {}
@@ -230,8 +230,20 @@ message ResetPluginDenyRequest {
   string plugin_id = 1;
 }
 
-// A plugin's deny list after a read or change.
-message PluginDeny {
+// A plugin's deny list.
+message GetPluginDenyResponse {
+  string plugin_id = 1;
+  repeated Selector deny = 2;
+}
+
+// A plugin's deny list after the change.
+message SetPluginDenyResponse {
+  string plugin_id = 1;
+  repeated Selector deny = 2;
+}
+
+// A plugin's deny list after the reset (empty).
+message ResetPluginDenyResponse {
   string plugin_id = 1;
   repeated Selector deny = 2;
 }

@@ -1025,6 +1025,7 @@ impl IntoResponse for PluginDenyApiError {
 /// the plugin (`deny` empty when none). `policy.manage`.
 ///
 /// # Errors
+/// - `400` not a plugin id.
 /// - `403` not the owner.
 async fn get_plugin_deny(
     Extension(ctx): Extension<InvocationContext>,
@@ -1037,10 +1038,9 @@ async fn get_plugin_deny(
         &Resource::plugin(plugin_id.as_str()),
     )
     .map_err(PluginDenyApiError::Scope)?;
-    Ok(Json(super::plugin_deny_admin::plugin_deny(
-        &state.engine.plugin_denies(),
-        plugin_id,
-    )))
+    super::plugin_deny_admin::plugin_deny(&state.engine.plugin_denies(), plugin_id)
+        .map(Json)
+        .map_err(PluginDenyApiError::Change)
 }
 
 /// `PUT /api/v1/plugins/{plugin_id}/deny` with `{"deny": [...]}` —

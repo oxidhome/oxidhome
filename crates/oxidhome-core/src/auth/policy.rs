@@ -767,6 +767,8 @@ mod tests {
             br#"{"scopes":[],"deny":[{"actions":["*"],"devices":[""]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"devices":["*"]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"devices":["lamp"]}]}"#,
+            // H6 slice 5: a device selector can't match a host action.
+            br#"{"scopes":[],"deny":[{"actions":["host.status"],"category":["lock"]}]}"#,
             br#"{"scopes":[],"deny":[{"actions":["*"],"areas":["hall"]}]}"#,
             br#"{"scopes":[],"deny":[{"category":["lock"]}]}"#,
         ] {

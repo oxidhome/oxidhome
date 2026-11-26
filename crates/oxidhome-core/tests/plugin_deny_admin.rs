@@ -183,6 +183,15 @@ async fn the_owner_sets_and_resets_a_deny_list_over_rest() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {got}");
     }
     assert_eq!(applied(&f.engine), json!([]));
+    let (status, _) = api_status(
+        &f.router,
+        &f.owner,
+        "GET",
+        "/api/v1/plugins/fenced/deny",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // The plugin isn't installed: the list is set anyway.
     let (status, got) = api_status(&f.router, &f.owner, "PUT", &uri, body).await;

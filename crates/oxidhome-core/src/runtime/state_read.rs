@@ -193,6 +193,9 @@ pub(crate) enum DeniedRead {
     /// `host-events::read-events` refused; `scope` is the refusal's
     /// label (`subscribes_events` without the grant).
     Events { scope: &'static str },
+    /// `host-events::subscribe` refused (H6 slice 5); `scope` is the
+    /// refusal's label.
+    Subscribe { scope: &'static str },
     /// Network access the instance's `[capabilities] network` rules
     /// don't allow (Phase 8). `op` is `connect` / `send` / `bind` /
     /// `listen` / `lookup` / `http`; `target` the address, name or
@@ -353,6 +356,15 @@ fn deny_audit_worker(
                     *scope,
                 )
             }
+            // `subscribe` traced it when it refused.
+            DeniedRead::Subscribe { scope } => (
+                EVENT_READ_AUDIT_METHOD,
+                format!(
+                    "event.subscribe/{}",
+                    invocation::audit_cap(&job.instance_id)
+                ),
+                *scope,
+            ),
             // The policy already traced it (rate-limited with the row).
             DeniedRead::Network { op, target, .. } => (
                 NETWORK_AUDIT_METHOD,
@@ -375,9 +387,7 @@ fn deny_audit_worker(
         };
         let domain_error = match &job.read {
             DeniedRead::Network { reason, .. } => Some(reason.clone()),
-            DeniedRead::State { .. } | DeniedRead::Events { .. } | DeniedRead::TlsPinned { .. } => {
-                None
-            }
+            _ => None,
         };
         let allowed = matches!(job.read, DeniedRead::TlsPinned { .. });
         let ctx = job
@@ -507,11 +517,32 @@ impl host_state::Host for PluginState {
             n => n.min(MAX_LIST_LIMIT),
         };
         let grants = Arc::clone(&self.granted_capabilities);
-        let instance_id = self.instance_id.clone();
         let install = self.installation_uuid.to_string();
-        // Two passes: the scan keeps what a grant could show (cheap,
-        // under the store lock), then each kept entry is decided in
-        // full, off the lock. A page may come back short.
+        let ctx = &invocation::current_or_host(&self.instance_id);
+        let plugin = &self.principal();
+        // Every entry is decided in full inside the scan, so one this
+        // plugin may not see never counts toward the page: the device
+        // classes are read once, before, since the registry's locks
+        // aren't taken under the store's.
+        let classes = if grants.reads_state.is_empty() {
+            crate::state::devices::ClassSnapshot::default()
+        } else {
+            self.devices.class_snapshot()
+        };
+        let decide = |e: &DeviceState| {
+            if !maybe_visible(plugin.instance_id, &install, &grants.reads_state, e) {
+                return None;
+            }
+            visibility(
+                ctx,
+                plugin,
+                &install,
+                classes.class_of(&e.device_id),
+                classes.instance_is_camera(&e.owner_instance),
+                e,
+            )
+            .ok()
+        };
         let page = self.device_state.snapshot_page_capped(
             after.as_deref(),
             limit,
@@ -524,29 +555,17 @@ impl host_state::Host for PluginState {
                         .capability
                         .as_ref()
                         .is_none_or(|c| *c == e.capability)
-                    && maybe_visible(&instance_id, &install, &grants.reads_state, e)
+                    && decide(e).is_some()
             },
         );
         let next_cursor = page
             .resume_after
             .map(|after| self.device_state.seal_scan_position(&after));
-        let ctx = &invocation::current_or_host(&self.instance_id);
-        let plugin = &self.principal();
-        let install = install.as_str();
-        let devices = &self.devices;
         let entries = page
             .devices
             .iter()
-            .flat_map(|entries| {
-                let class = entries.first().map(|e| devices.class_of(&e.device_id));
-                entries.iter().filter_map(move |e| {
-                    let class = class.unwrap_or_else(DeviceClass::unregistered);
-                    let camera = devices.instance_is_camera(&e.owner_instance);
-                    visibility(ctx, plugin, install, class, camera, e)
-                        .ok()
-                        .map(|vis| to_wit(e, vis))
-                })
-            })
+            .flatten()
+            .filter_map(|e| decide(e).map(|vis| to_wit(e, vis)))
             .collect();
         Ok(StatePage {
             revision: page.revision,

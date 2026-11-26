@@ -69,6 +69,37 @@ pub struct DeviceMeta {
     pub info: DeviceInfo,
 }
 
+/// [`DeviceRegistry::class_snapshot`]: classes and camera sources as
+/// of one moment. An id it doesn't know is unregistered.
+#[derive(Debug, Clone, Default)]
+pub struct ClassSnapshot {
+    classes: HashMap<String, DeviceClass>,
+    cameras: std::collections::HashSet<String>,
+}
+
+impl ClassSnapshot {
+    /// The class of `id`, as [`DeviceRegistry::class_of`] answered.
+    #[must_use]
+    pub fn class_of(&self, id: &str) -> DeviceClass {
+        self.classes
+            .get(id)
+            .copied()
+            .unwrap_or_else(DeviceClass::unregistered)
+    }
+
+    /// The authorization resource for device `id`.
+    #[must_use]
+    pub fn resource(&self, id: &str) -> Resource {
+        Resource::device(id, self.class_of(id))
+    }
+
+    /// As [`DeviceRegistry::instance_is_camera`].
+    #[must_use]
+    pub fn instance_is_camera(&self, instance_id: &str) -> bool {
+        self.cameras.contains(instance_id)
+    }
+}
+
 /// In-memory device registry, one per [`Engine`](crate::Engine).
 ///
 /// IDs are deterministic — `dev-<16 hex chars>` from
@@ -217,6 +248,37 @@ impl DeviceRegistry {
     #[must_use]
     pub fn resource(&self, id: &str) -> Resource {
         Resource::device(id, self.class_of(id))
+    }
+
+    /// Every known device's class and every camera-source instance,
+    /// read once: for decisions made where the registry's locks must
+    /// not be taken (inside a database or store scan, H6 slice 5).
+    #[must_use]
+    pub fn class_snapshot(&self) -> ClassSnapshot {
+        let mut ids: std::collections::HashSet<String> = self.read().keys().cloned().collect();
+        let rows = self.meta.list();
+        let mut owners: std::collections::HashSet<String> = self
+            .read()
+            .values()
+            .map(|m| m.owner_instance.clone())
+            .collect();
+        for (id, row) in rows {
+            ids.insert(id);
+            owners.extend(row.owner_instance);
+        }
+        ClassSnapshot {
+            classes: ids
+                .into_iter()
+                .map(|id| {
+                    let class = self.class_of(&id);
+                    (id, class)
+                })
+                .collect(),
+            cameras: owners
+                .into_iter()
+                .filter(|o| self.instance_is_camera(o))
+                .collect(),
+        }
     }
 
     /// `true` when `instance_id` owns, or has ever registered, a camera

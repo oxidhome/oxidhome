@@ -62,17 +62,25 @@ pub type OwnedResetPluginNetworkGrantResponseView = ::buffa::view::OwnedView<
 pub type OwnedGetPluginDenyRequestView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyRequestView<'static>,
 >;
-///Shorthand for `OwnedView<PluginDenyView<'static>>`.
-pub type OwnedPluginDenyView = ::buffa::view::OwnedView<
-    crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+///Shorthand for `OwnedView<GetPluginDenyResponseView<'static>>`.
+pub type OwnedGetPluginDenyResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyResponseView<'static>,
 >;
 ///Shorthand for `OwnedView<SetPluginDenyRequestView<'static>>`.
 pub type OwnedSetPluginDenyRequestView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyRequestView<'static>,
 >;
+///Shorthand for `OwnedView<SetPluginDenyResponseView<'static>>`.
+pub type OwnedSetPluginDenyResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyResponseView<'static>,
+>;
 ///Shorthand for `OwnedView<ResetPluginDenyRequestView<'static>>`.
 pub type OwnedResetPluginDenyRequestView = ::buffa::view::OwnedView<
     crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyRequestView<'static>,
+>;
+///Shorthand for `OwnedView<ResetPluginDenyResponseView<'static>>`.
+pub type OwnedResetPluginDenyResponseView = ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyResponseView<'static>,
 >;
 impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ListPluginsResponse>
 for crate::proto::oxidhome::v1::__buffa::view::ListPluginsResponseView<'_> {
@@ -314,8 +322,8 @@ for ::buffa::view::OwnedView<
         )
     }
 }
-impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::PluginDeny>
-for crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'_> {
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::GetPluginDenyResponse>
+for crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyResponseView<'_> {
     fn encode(
         &self,
         codec: ::connectrpc::CodecFormat,
@@ -323,9 +331,77 @@ for crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'_> {
         ::connectrpc::__codegen::encode_view_body(self, codec)
     }
 }
-impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::PluginDeny>
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::GetPluginDenyResponse>
 for ::buffa::view::OwnedView<
-    crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+    crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::SetPluginDenyResponse>
+for crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::SetPluginDenyResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyResponseView<'static>,
+> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self.reborrow(), codec)
+    }
+    /// An `OwnedView` still holds the buffer it was decoded from, so
+    /// its large fields can be handed to the response body by
+    /// reference count instead of copied. The bare view impl above
+    /// cannot do this: it has borrows but no buffer to name.
+    fn encode_segments(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::connectrpc::EncodedBody, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body_segments(
+            self.reborrow(),
+            self.bytes(),
+            codec,
+        )
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ResetPluginDenyResponse>
+for crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyResponseView<'_> {
+    fn encode(
+        &self,
+        codec: ::connectrpc::CodecFormat,
+    ) -> ::std::result::Result<::buffa::bytes::Bytes, ::connectrpc::ConnectError> {
+        ::connectrpc::__codegen::encode_view_body(self, codec)
+    }
+}
+impl ::connectrpc::Encodable<crate::proto::oxidhome::v1::ResetPluginDenyResponse>
+for ::buffa::view::OwnedView<
+    crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyResponseView<'static>,
 > {
     fn encode(
         &self,
@@ -664,7 +740,7 @@ pub trait PluginsService: Send + Sync + 'static {
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
-                crate::proto::oxidhome::v1::PluginDeny,
+                crate::proto::oxidhome::v1::GetPluginDenyResponse,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -692,7 +768,7 @@ pub trait PluginsService: Send + Sync + 'static {
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
-                crate::proto::oxidhome::v1::PluginDeny,
+                crate::proto::oxidhome::v1::SetPluginDenyResponse,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -716,7 +792,7 @@ pub trait PluginsService: Send + Sync + 'static {
     ) -> impl ::std::future::Future<
         Output = ::connectrpc::ServiceResult<
             impl ::connectrpc::Encodable<
-                crate::proto::oxidhome::v1::PluginDeny,
+                crate::proto::oxidhome::v1::ResetPluginDenyResponse,
             > + Send + use<'a, Self>,
         >,
     > + Send;
@@ -976,7 +1052,9 @@ impl<S: PluginsService> PluginsServiceExt for S {
                             >::from_parts(req.reborrow(), req.bytes());
                             svc.get_plugin_deny(ctx, sreq)
                                 .await?
-                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                                .encode::<
+                                    crate::proto::oxidhome::v1::GetPluginDenyResponse,
+                                >(format)
                         }
                     })
                 },
@@ -1003,7 +1081,9 @@ impl<S: PluginsService> PluginsServiceExt for S {
                             >::from_parts(req.reborrow(), req.bytes());
                             svc.set_plugin_deny(ctx, sreq)
                                 .await?
-                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                                .encode::<
+                                    crate::proto::oxidhome::v1::SetPluginDenyResponse,
+                                >(format)
                         }
                     })
                 },
@@ -1030,7 +1110,9 @@ impl<S: PluginsService> PluginsServiceExt for S {
                             >::from_parts(req.reborrow(), req.bytes());
                             svc.reset_plugin_deny(ctx, sreq)
                                 .await?
-                                .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                                .encode::<
+                                    crate::proto::oxidhome::v1::ResetPluginDenyResponse,
+                                >(format)
                         }
                     })
                 },
@@ -1334,7 +1416,9 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                     >::from_parts(&req, &body);
                     svc.get_plugin_deny(ctx, req)
                         .await?
-                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        .encode::<
+                            crate::proto::oxidhome::v1::GetPluginDenyResponse,
+                        >(format)
                 })
             }
             "SetPluginDeny" => {
@@ -1354,7 +1438,9 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                     >::from_parts(&req, &body);
                     svc.set_plugin_deny(ctx, req)
                         .await?
-                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        .encode::<
+                            crate::proto::oxidhome::v1::SetPluginDenyResponse,
+                        >(format)
                 })
             }
             "ResetPluginDeny" => {
@@ -1374,7 +1460,9 @@ impl<T: PluginsService> ::connectrpc::Dispatcher for PluginsServiceServer<T> {
                     >::from_parts(&req, &body);
                     svc.reset_plugin_deny(ctx, req)
                         .await?
-                        .encode::<crate::proto::oxidhome::v1::PluginDeny>(format)
+                        .encode::<
+                            crate::proto::oxidhome::v1::ResetPluginDenyResponse,
+                        >(format)
                 })
             }
             _ => ::connectrpc::dispatcher::codegen::unimplemented_unary(path),
@@ -1827,7 +1915,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -1846,7 +1936,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::GetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -1868,7 +1960,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -1887,7 +1981,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::SetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -1909,7 +2005,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,
@@ -1928,7 +2026,9 @@ where
     ) -> Result<
         ::connectrpc::client::UnaryResponse<
             ::buffa::view::OwnedView<
-                crate::proto::oxidhome::v1::__buffa::view::PluginDenyView<'static>,
+                crate::proto::oxidhome::v1::__buffa::view::ResetPluginDenyResponseView<
+                    'static,
+                >,
             >,
         >,
         ::connectrpc::ConnectError,

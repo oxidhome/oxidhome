@@ -115,10 +115,22 @@ fn audit_path(by: &GrantActor, plugin_id: &str, old: &[DenyRule], new: &[DenyRul
 }
 
 /// The deny list of `plugin_id` (empty when none).
-#[must_use]
-pub fn plugin_deny(store: &PluginDenyStore, plugin_id: String) -> PluginDenyView {
+///
+/// # Errors
+///
+/// `plugin_id` is not a plugin id.
+pub fn plugin_deny(
+    store: &PluginDenyStore,
+    plugin_id: String,
+) -> Result<PluginDenyView, PluginDenyAdminError> {
+    if !oxidhome_manifest::is_plugin_id(&plugin_id) {
+        return Err(PluginDenyError::BadPluginId(plugin_id).into());
+    }
     let rules = store.get(&plugin_id);
-    PluginDenyView::new(plugin_id, rules.as_deref().unwrap_or_default())
+    Ok(PluginDenyView::new(
+        plugin_id,
+        rules.as_deref().unwrap_or_default(),
+    ))
 }
 
 /// Replace the deny list of `plugin_id` with `specs` (`None` or an empty
@@ -177,7 +189,7 @@ fn change_in(
                 })
             },
         )
-    });
+    })?;
     match (out, refused) {
         (Ok(()), _) => {
             tracing::warn!(
@@ -222,7 +234,7 @@ pub fn set_plugin_deny_offline(
     store.change(plugin_id, rules, |old, commit| {
         let path = audit_path(&by, plugin_id, old.unwrap_or_default(), &new);
         audited(audit, "cli", "-", &path, || Ok(commit()?))
-    })?;
+    })??;
     Ok(view)
 }
 
