@@ -18,6 +18,10 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 7
+    groups:
+      cargo:
+        patterns:
+          - "*"
     # The wasm toolchain moves together onto one wasm-tools release
     # (a skew breaks the build, #200); .github/workflows/wasm-toolchain.yaml
     # bumps it, so Dependabot leaves these crates alone.
