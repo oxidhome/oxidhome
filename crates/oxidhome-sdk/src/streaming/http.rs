@@ -1226,10 +1226,7 @@ impl Url {
         } else {
             format!("/{tail}")
         };
-        if path_and_query
-            .bytes()
-            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
-        {
+        if !plain_path_and_query(&path_and_query) {
             return Err(invalid());
         }
         Ok(Self {
@@ -1379,6 +1376,22 @@ fn plain_authority(authority: &str) -> bool {
     host_ok && port_ok
 }
 
+/// Whether the host takes `path_and_query` as is (`http`'s rules): no
+/// whitespace or control characters anywhere, no `<`, `>` or `` ` `` in
+/// the path, no `"`, `<` or `>` in the query. Checked here for the same
+/// reason as [`plain_authority`].
+fn plain_path_and_query(path_and_query: &str) -> bool {
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
+    let plain = |b: u8| !b.is_ascii_whitespace() && !b.is_ascii_control();
+    path.bytes()
+        .all(|b| plain(b) && !matches!(b, b'<' | b'>' | b'`'))
+        && query
+            .bytes()
+            .all(|b| plain(b) && !matches!(b, b'"' | b'<' | b'>'))
+}
+
 /// RFC 3986 §5.2.4, on an absolute path.
 fn remove_dot_segments(path: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
@@ -1422,6 +1435,8 @@ mod tests {
         assert_eq!(u.path_and_query, "/a/b?x=1");
         assert_eq!(url("http://h").path_and_query, "/");
         assert_eq!(url("http://h?q").path_and_query, "/?q");
+        // `http` takes these as they are.
+        assert_eq!(url("http://h/{\"a\"}?x={}").path_and_query, "/{\"a\"}?x={}");
         assert_eq!(url("HTTP://[::1]:80/").authority, "[::1]:80");
         for bad in [
             "ftp://h/",
@@ -1440,6 +1455,9 @@ mod tests {
             "http://h:1:2/",
             "http://cam|era/",
             "http://cam%20era/",
+            "http://h/bad<path",
+            "http://h/a`b",
+            "http://h/?q=\"x\"",
         ] {
             assert!(Url::parse(bad).is_err(), "{bad}");
         }

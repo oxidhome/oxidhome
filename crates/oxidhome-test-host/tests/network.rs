@@ -579,6 +579,21 @@ fn trickling_server() -> (SocketAddr, std::sync::mpsc::Receiver<Duration>) {
     (addr, rx)
 }
 
+/// A server on loopback that accepts one connection and never reads
+/// from it, until the test drops the returned sender.
+fn stalled_server() -> (SocketAddr, std::sync::mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((_stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = rx.recv();
+    });
+    (addr, tx)
+}
+
 /// A server on loopback that drops every connection it accepts (for
 /// TLS, mid-handshake).
 fn dropping_server() -> SocketAddr {
@@ -601,6 +616,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     let host = TestHost::new().unwrap();
     let cut = dropping_server();
     let (trickle, connected) = trickling_server();
+    let (stalled, _stalled_open) = stalled_server();
     // Freed after the other servers started, so none of them takes it.
     let closing = TcpListener::bind("127.0.0.1:0").unwrap();
     let closed = closing.local_addr().unwrap();
@@ -617,6 +633,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
             format!("tcp://127.0.0.1:{}", ok.port()),
             format!("tcp://{trickle}"),
             format!("tcp://{closed}"),
+            format!("tcp://{stalled}"),
             format!("https://{cut}"),
         ],
         &[
@@ -630,6 +647,9 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
             // Refused at the second hop: the first one was answered.
             format!("get-total 5000 http://127.0.0.1:{}/to-closed", ok.port()),
             format!("get-total 5000 http://127.0.0.1:{}/to-ftp", ok.port()),
+            // A 16 MiB upload nobody reads: the total timeout ends it long
+            // before the 30 s write stall would.
+            format!("post-total 1000 16777216 http://{stalled}/"),
         ],
     )
     .await;
@@ -662,6 +682,10 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     assert_eq!(
         results[8],
         "err:InvalidRedirect(\"ftp://cam.lan/x\")|sent:true"
+    );
+    assert!(
+        results[9].starts_with("err:TotalTimeout") && results[9].contains("dispatched: true"),
+        "{results:?}"
     );
     assert_eq!(ok.accepted(), 4);
 }

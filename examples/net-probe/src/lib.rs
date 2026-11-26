@@ -33,6 +33,8 @@ const POLL_WAIT: Duration = Duration::from_secs(5);
 /// Most reads from one held socket per tick, so a busy peer can't keep a
 /// tick running.
 const MAX_READS_PER_TICK: usize = 256;
+/// Most bytes `stream` reads.
+const STREAM_MAX: usize = 64 * 1024;
 /// Most redirects `http` follows.
 const MAX_REDIRECTS: usize = 3;
 
@@ -265,6 +267,24 @@ fn run(op: &str) -> Result<String, String> {
                 .map(|r| format!("{}:{}", r.status(), String::from_utf8_lossy(r.body())))
                 .map_err(|e| sdk_err(&e))
         }
+        // `post-total <ms> <bytes> <url>`: POST that many bytes with a
+        // total timeout.
+        "post-total" => {
+            let mut parts = arg.splitn(3, ' ');
+            let (Some(ms), Some(len), Some(url)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err("post-total <ms> <bytes> <url>".into());
+            };
+            let ms: u64 = ms.parse().map_err(|_| "bad milliseconds")?;
+            let len: usize = len.parse().map_err(|_| "bad length")?;
+            Request::post(url)
+                .body(vec![b'x'; len])
+                .timeout(Duration::from_secs(30))
+                .total_timeout(Duration::from_millis(ms))
+                .send()
+                .map(|r| format!("{}", r.status()))
+                .map_err(|e| sdk_err(&e))
+        }
         // `get-big <bytes> <url>`: GET with a header value that long.
         "get-big" => {
             let (len, url) = arg.split_once(' ').ok_or("get-big <bytes> <url>")?;
@@ -400,6 +420,9 @@ fn stream(url: &str) -> Result<String, String> {
         .map_err(|e| sdk_err(&e))?
     {
         body.extend_from_slice(&chunk);
+        if body.len() > STREAM_MAX {
+            return Err(format!("body over {STREAM_MAX} bytes"));
+        }
     }
     Ok(format!("{status}:{}", String::from_utf8_lossy(&body)))
 }

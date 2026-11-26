@@ -33,6 +33,7 @@ storage_quota_kb = 16
 #   get <url>          GET with the SDK client (`streaming::http`)
 #   post <bytes> <url> POST that many bytes with the SDK client
 #   get-total <ms> <url> GET with the SDK client and that total timeout
+#   post-total <ms> <len> <url> POST <len> bytes with the SDK client and that total timeout
 #   get-big <len> <url> GET with the SDK client and a <len>-byte header value
 #   stream <url>       GET with the SDK client's streaming body, read to the end
 #   hdr <len>          append a header with a <len>-byte name to new fields
