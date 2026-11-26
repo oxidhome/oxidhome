@@ -76,10 +76,9 @@
 //! plugin's grant applies. Plugins carry no deny lists yet, so the
 //! root is the only principal on the chain that contributes denies.
 //!
-//! The parity tests (`parity.rs`) pin that steps 1 and 2 match the
-//! checks they replaced on non-sensitive targets, list each
-//! intentional departure on sensitive ones, and check sample
-//! owner-defined roles against an independent oracle.
+//! The scenario tests (`scenarios.rs`) check the sensitive
+//! categories, the deny list and sample owner-defined roles against an
+//! independent oracle.
 //!
 //! Plugin principals are still authorized by their manifest grants at
 //! their own call sites (`consumes_services`, `reads_state`,
@@ -1227,7 +1226,7 @@ fn constraint_rule(action: Action, resource: &Resource) -> Option<ConstraintRule
 }
 
 #[cfg(test)]
-mod parity;
+mod scenarios;
 
 #[cfg(test)]
 mod tests {

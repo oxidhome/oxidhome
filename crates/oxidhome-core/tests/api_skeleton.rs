@@ -6127,18 +6127,16 @@ async fn rest_refuses_constraint_bearing_token() {
     );
 }
 
-/// Round-3 P1 on PR #147: legacy (bare scope-array) tokens
-/// must still work on REST — the refuse-on-constraints check
-/// only fires when the extended envelope carried a non-empty
-/// `constraints` map. Any regression here would break every
-/// pre-14.4 deployment on upgrade.
+/// A bare scope-list token (the shape the bootstrap `["*"]` token
+/// uses) works on REST: the refuse-on-constraints check only fires
+/// when the extended envelope carries a non-empty `constraints` map.
 #[tokio::test(flavor = "multi_thread")]
-async fn rest_accepts_legacy_scope_array_token() {
+async fn rest_accepts_scope_list_token() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("legacy-admin", b"[\"*\"]")
-        .expect("create legacy token");
+        .create("scope-list-admin", b"[\"*\"]")
+        .expect("create scope-list token");
     let router = build_router(engine);
     let resp = router
         .oneshot(

@@ -39,8 +39,6 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-#[cfg(test)]
-use crate::auth::Actor;
 use crate::auth::{Action, Decision, InvocationContext, Resource, authorize};
 
 /// Wildcard sentinel — a token whose scope list contains exactly this
@@ -123,19 +121,6 @@ pub(crate) fn require(
     authorize(ctx, action, resource)
         .into_result()
         .map_err(|required| ScopeDenied { required })
-}
-
-/// The pre-`authorize()` route check, kept as the reference the parity
-/// tests compare [`authorize`] against.
-#[cfg(test)]
-pub(crate) fn require_scope(actor: &Actor, required: Scope) -> Result<(), ScopeDenied> {
-    if required.satisfied_by(actor.scopes()) {
-        Ok(())
-    } else {
-        Err(ScopeDenied {
-            required: required.name(),
-        })
-    }
 }
 
 // ── Canonical scope constants ───────────────────────────────────────
@@ -288,25 +273,5 @@ mod tests {
         let scope = Scope::new("plugins:install");
         let scopes = vec!["devices:list".into(), "*".into()];
         assert!(scope.satisfied_by(&scopes));
-    }
-
-    #[test]
-    fn require_scope_passes_actor_with_scope() {
-        let actor = Actor::api("tok-1", vec!["devices:list".into()]);
-        require_scope(&actor, DEVICES_LIST).expect("authorized");
-    }
-
-    #[test]
-    fn require_scope_denies_actor_without_scope() {
-        let actor = Actor::api("tok-1", vec!["instances:list".into()]);
-        let err = require_scope(&actor, DEVICES_LIST).expect_err("denied");
-        assert_eq!(err.required, "devices:list");
-    }
-
-    #[test]
-    fn require_scope_accepts_wildcard_admin() {
-        let actor = Actor::api("admin-tok", vec!["*".into()]);
-        require_scope(&actor, INSTANCES_LIST).expect("authorized");
-        require_scope(&actor, DEVICES_LIST).expect("authorized");
     }
 }

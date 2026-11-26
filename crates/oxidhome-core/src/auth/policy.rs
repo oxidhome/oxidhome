@@ -17,12 +17,13 @@
 //! `parse_policy` accepts either of two JSON shapes, both
 //! round-tripped from the `auth_token.scope_json` column:
 //!
-//! - **Legacy** — a bare array of scope strings:
+//! - **Scope list** — a bare array of scope strings:
 //!   ```json
 //!   ["logs:read", "devices:command"]
 //!   ```
 //!   Parses to a [`TokenPolicy`] with those scopes and
-//!   **no constraints**. Every existing token row keeps working.
+//!   **no constraints**. [`TokenPolicy::to_json`] writes this
+//!   shape whenever the policy carries nothing but scopes.
 //!
 //! - **Extended** — an object with `scopes` + optional
 //!   `constraints`:
@@ -166,7 +167,7 @@ pub struct TokenPolicy {
 }
 
 impl TokenPolicy {
-    /// Serialize to the `scope_json` form: the legacy bare array when
+    /// Serialize to the `scope_json` form: the bare scope-list array when
     /// there are no constraints and no sensitive grants, the extended
     /// object otherwise. Round-trips through [`parse_policy`].
     #[must_use]
@@ -367,15 +368,15 @@ pub(crate) fn match_pattern(pattern: &str, id: &str) -> bool {
 
 // ── Wire deserialisation helpers ────────────────────────────────
 
-/// Legacy-or-extended envelope the JSON blob deserialises
+/// Scope-list-or-extended envelope the JSON blob deserialises
 /// into. Kept private — external callers go through
 /// [`parse_policy`] which normalises the two shapes into
 /// [`TokenPolicy`].
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum PolicyWire {
-    /// Legacy — bare scope-list array.
-    Legacy(Vec<String>),
+    /// Bare scope-list array.
+    ScopeList(Vec<String>),
     /// Extended — object with `scopes` + optional
     /// `constraints`. `deny_unknown_fields` so a typo like
     /// `"scope"` (singular) doesn't silently pin the token to
@@ -555,32 +556,6 @@ pub const DEVICE_COMMAND_ENFORCED: EnforcedConstraint = EnforcedConstraint {
 /// `device.send_command` allowlist refuses a device command.
 pub const DEVICE_COMMAND_DENIED_SENTINEL: &str = "constraint:device.send_command:devices";
 
-/// The pre-`authorize()` device-command resource check, kept as the
-/// reference the parity tests compare [`crate::auth::authorize()`]
-/// against. Production code calls `authorize`. The flat
-/// `devices:command` scope is checked by the caller first; this then
-/// applies the token's per-device allowlist, if it carries one. A token
-/// without a `device.send_command` constraint is unrestricted (legacy
-/// behaviour).
-///
-/// Pure string match on caller input — run it **before** resolving the
-/// device so a refused caller learns nothing about which ids exist.
-///
-/// # Errors
-///
-/// Returns [`DEVICE_COMMAND_DENIED_SENTINEL`] when the constraint does
-/// not cover `device_id`.
-#[cfg(test)]
-pub fn authorize_device_command(
-    actor: &crate::auth::Actor,
-    device_id: &str,
-) -> Result<(), &'static str> {
-    match actor.constraint(DEVICE_COMMAND_ENFORCED.key) {
-        Some(cx) if !cx.allows_device(device_id) => Err(DEVICE_COMMAND_DENIED_SENTINEL),
-        _ => Ok(()),
-    }
-}
-
 /// Decode the `scope_json` blob into a [`TokenPolicy`].
 ///
 /// Returns `None` when the blob is malformed. The
@@ -591,7 +566,7 @@ pub fn authorize_device_command(
 pub fn parse_policy(blob: &[u8]) -> Option<TokenPolicy> {
     let wire: PolicyWire = serde_json::from_slice(blob).ok()?;
     Some(match wire {
-        PolicyWire::Legacy(scopes) => TokenPolicy {
+        PolicyWire::ScopeList(scopes) => TokenPolicy {
             scopes,
             ..TokenPolicy::default()
         },
@@ -622,30 +597,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn authorize_device_command_applies_allowlist_only_when_present() {
-        use crate::auth::Actor;
-        // Legacy token: no constraint ⇒ every device allowed.
-        let legacy = Actor::api("tok", vec!["devices:command".into()]);
-        assert!(authorize_device_command(&legacy, "dev-0000000000000000").is_ok());
-
-        let mut constraints = HashMap::new();
-        constraints.insert(
-            "device.send_command".to_string(),
-            ToolConstraint {
-                devices: Some(vec!["dev-a1b2*".into()]),
-                plugins: None,
-            },
-        );
-        let narrowed = Actor::api_with_policy("tok", vec!["*".into()], constraints);
-        assert!(authorize_device_command(&narrowed, "dev-a1b2c3d4e5f60718").is_ok());
-        assert_eq!(
-            authorize_device_command(&narrowed, "dev-ffff000000000000"),
-            Err(DEVICE_COMMAND_DENIED_SENTINEL),
-        );
-    }
-
-    #[test]
-    fn legacy_scope_array_round_trips() {
+    fn scope_list_round_trips() {
         let policy = parse_policy(br#"["logs:read","devices:command"]"#).expect("parse");
         assert_eq!(policy.scopes, vec!["logs:read", "devices:command"]);
         assert!(policy.constraints.is_empty());
@@ -750,9 +702,9 @@ mod tests {
         assert!(cam.covers(SensitiveCategory::Camera, Some("dev-a1b2")));
         assert!(!cam.covers(SensitiveCategory::Camera, Some("dev-b1b2")));
         assert!(!cam.covers(SensitiveCategory::Camera, None));
-        // Legacy shape stays a bare array.
-        let legacy = parse_policy(br#"["devices:list"]"#).expect("parse");
-        assert_eq!(legacy.to_json(), br#"["devices:list"]"#.to_vec());
+        // A scopes-only policy stays a bare array.
+        let scope_list = parse_policy(br#"["devices:list"]"#).expect("parse");
+        assert_eq!(scope_list.to_json(), br#"["devices:list"]"#.to_vec());
     }
 
     #[test]

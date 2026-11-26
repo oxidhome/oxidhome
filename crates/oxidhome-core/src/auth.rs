@@ -48,8 +48,6 @@ pub use authorize::{
 };
 pub use category::{DeviceCategory, DeviceClass, SensitiveCategory, SensitiveSet};
 pub use invocation::{DelegationHop, InvocationContext, Principal, Transport};
-#[cfg(test)]
-pub use policy::authorize_device_command;
 pub use policy::{
     DEVICE_COMMAND_ENFORCED, EnforcedConstraint, SensitiveGrant, TokenPolicy, ToolConstraint,
     parse_policy,

@@ -3835,7 +3835,7 @@ async fn tool_denials_record_scope_and_constraint_sentinels() {
 /// The `plugins.show` allowlist narrows the `plugins.show` tool only:
 /// the `oxidhome://plugins/{id}` resource read has always been gated by
 /// the flat `plugins:list` scope, and still is. Pins the resource the
-/// production handler authorizes, which the parity table can't see.
+/// production handler authorizes.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
     let engine = Engine::new().expect("engine");
