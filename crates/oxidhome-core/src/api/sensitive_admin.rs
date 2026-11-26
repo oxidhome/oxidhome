@@ -52,8 +52,8 @@ pub struct SensitiveGap {
     pub token_id: String,
     /// Token label.
     pub label: String,
-    /// Categories its scopes span and no grant covers on every device
-    /// they reach.
+    /// Categories its scopes span that its grants (or its roles'
+    /// grants) don't fully cover.
     pub missing: SensitiveSet,
 }
 

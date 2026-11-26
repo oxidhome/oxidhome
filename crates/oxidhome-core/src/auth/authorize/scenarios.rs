@@ -37,6 +37,50 @@ fn constrained(scopes: &[&str], entries: &[(&str, ToolConstraint)]) -> Actor {
     )
 }
 
+/// Scopes match exactly: a near miss (case, a `prefix:*`, whitespace,
+/// a bare resource name, `**`) grants nothing and is refused with the
+/// missing scope.
+#[test]
+fn near_miss_scopes_grant_nothing() {
+    let actor = Actor::api(
+        "tok",
+        vec![
+            "Devices:List".into(),
+            "devices:*".into(),
+            " devices:read".into(),
+            "plugins".into(),
+            "**".into(),
+            String::new(),
+        ],
+    );
+    let device = Resource::device(
+        "dev-a1b2c3d4e5f60718",
+        DeviceClass::of(DeviceCategory::Light),
+    );
+    for (action, resource, want) in [
+        (
+            Action::DeviceList,
+            Resource::Collection(ResourceKind::Device),
+            "devices:list",
+        ),
+        (Action::DeviceRead, device.clone(), "devices:read"),
+        (Action::DeviceCommand, device, "devices:command"),
+        (
+            Action::PluginRead,
+            Resource::plugin("acme.lamp"),
+            "plugins:list",
+        ),
+        (Action::HostStatus, Resource::Host, "status:read"),
+    ] {
+        assert_eq!(
+            decide(&actor, action, &resource),
+            Err(want),
+            "{}",
+            action.as_str()
+        );
+    }
+}
+
 /// Each `plugins.*` allowlist narrows only its own action, so one
 /// token can start one plugin and uninstall another.
 #[test]
