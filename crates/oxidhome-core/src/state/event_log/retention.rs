@@ -74,9 +74,8 @@ impl EventLog {
                 )?,
                 None => None,
             };
-            // Rows: keep the `max_rows` highest ids. Ids can be sparse
-            // (databases from before migration 16 keep their ids), so
-            // the id span only rules a trim out cheaply; when the span
+            // Rows: keep the `max_rows` highest ids. The id
+            // span only rules a trim out cheaply; when the span
             // exceeds the limit the bound is the actual
             // `max_rows + 1`-th newest id.
             let by_rows: Option<i64> = match max_rows {
@@ -280,8 +279,7 @@ mod tests {
         assert_eq!(log.count().expect("count"), 5);
     }
 
-    /// Databases from before migration 16 keep sparse ids: the row
-    /// limit counts rows, not the id span.
+    /// The row limit counts rows, not the id span.
     #[test]
     fn row_limit_counts_rows_when_ids_are_sparse() {
         let log = log();

@@ -11,8 +11,8 @@
 //! - **A failed purge freeing the id.** A purge that fails (or is cut
 //!   off by a shutdown or a crash) used to free the sandbox id anyway,
 //!   so a new sandbox under it would inherit the old rows. The purge is
-//!   now announced by a persisted marker (migration 22,
-//!   `sandbox_removal`) written before it starts and deleted once it
+//!   now announced by a persisted marker (a
+//!   `sandbox_removal` row) written before it starts and deleted once it
 //!   succeeds. While a marker exists, `start-sandbox` refuses the id;
 //!   at boot, before any plugin runs, every marker's purge is run
 //!   again.

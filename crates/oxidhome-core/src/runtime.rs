@@ -354,32 +354,6 @@ impl Engine {
         // registry (for the plugin_installation table) and
         // `with_db` (for every other sub-store).
         let db = Arc::new(Db::open_file(state_dir)?);
-        // H2 round-2 F3: migration 14 dropped the legacy `blob` /
-        // `blob_usage` index but left `<blobs>/<instance_id>/`
-        // trees on disk — orphan bytes no later purge could
-        // reclaim. Run a **one-shot** blob-root sweep exactly on
-        // the boot where migration 14 first applies: we can tell
-        // from `Db::pre_open_user_version()` because migration 14
-        // hadn't yet run under version <14. Every top-level entry
-        // under `<blobs>/` at that moment is either pre-14
-        // legacy data (indexed by the just-dropped `blob` table,
-        // now unreclaimable through any purge path) or a stray
-        // manually-placed dir; both are reclaimed.
-        //
-        // Post-14 boots skip the sweep so legitimate dev-load
-        // paths — which use `manifest.plugin.id` as the
-        // installation_uuid — aren't clobbered. F2 crash-recovery
-        // is handled by the retryable purge-before-tombstone
-        // ordering in `uninstall_plugin`, not by a boot sweep.
-        if db.pre_open_user_version() < MIGRATION_14 {
-            sweep_all_blob_dirs(&blobs_root).with_context(|| {
-                format!(
-                    "H2 round-2 F3 one-shot sweep of legacy blob dirs under {} \
-                     (migration 14 just applied)",
-                    blobs_root.display()
-                )
-            })?;
-        }
         let installed = InstalledPluginRegistry::scan(plugins_root, Arc::clone(&db))
             .with_context(|| format!("scanning installed plugins under {}", state_dir.display()))?;
         Self::with_db_arc(db, Some(blobs_root), installed, clock)
@@ -866,8 +840,7 @@ impl Engine {
         // Tombstone the registry row last. Ordering matters: a
         // crash between purge success and tombstone leaves the
         // row live with empty state (recoverable by re-running
-        // uninstall — the boot sweep also cleans stale blob dirs
-        // for tombstoned uuids). The reverse — tombstone-then-
+        // uninstall). The reverse — tombstone-then-
         // purge — would strand blob bytes silently on any purge
         // failure (the pre-fix behaviour).
         if let Err(err) = self.installed_plugins.uninstall(plugin_id) {
@@ -1725,12 +1698,6 @@ pub fn is_operator_instance_id(instance_id: &str) -> bool {
     crate::state::is_safe_instance_id(instance_id) && !instance_id.contains(SANDBOX_SEPARATOR)
 }
 
-/// Migration 14 is the H2 rekey that dropped the legacy
-/// `blob` / `blob_usage` index. See `state/db.rs`. Extracted as a
-/// const so [`Engine::with_state_dir`]'s one-shot sweep guard
-/// stays readable.
-const MIGRATION_14: i64 = 14;
-
 /// Delete the TLS pins the (retired or tombstoned) installation
 /// `uuid`'s instances made, each one audited for `ctx` (the caller of an
 /// uninstall; `None`: the host itself): a durable intent row
@@ -1866,36 +1833,6 @@ fn purge_tls_pins_of_removed_installations(
             tracing::error!(target: "host.network", error = %err, "removing stale TLS pins failed");
         }
     }
-}
-
-/// H2 round-2 F3: reclaim every top-level entry under
-/// `<state_dir>/blobs/`. Called from
-/// [`Engine::with_state_dir`] exactly on the boot where
-/// migration 14 first applies (see the caller for the guard).
-/// After the sweep every legitimate blob dir will be recreated
-/// on demand by [`crate::state::BlobStore::write`] using the
-/// post-14 `<installation_uuid>/<instance_id>/` layout.
-///
-/// Not called from `Engine::new()` (in-memory) — no FS root, no
-/// blob dir to sweep. Only runs from `with_state_dir`.
-fn sweep_all_blob_dirs(blobs_root: &Path) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(blobs_root) {
-        Ok(e) => e,
-        // Fresh install — blob dir doesn't exist yet. Nothing to
-        // sweep. `BlobStore::write` will create it on first
-        // write.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    for entry in entries {
-        let entry = entry?;
-        tracing::info!(
-            dir = %entry.path().display(),
-            "H2 review F3 one-shot sweep: removing pre-migration-14 blob dir",
-        );
-        std::fs::remove_dir_all(entry.path())?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2308,100 +2245,6 @@ wasm = "plugin.wasm"
             "KV must be purged BEFORE the registry row is tombstoned",
         );
         assert!(engine.installed_plugins().get("example.h2.order").is_none());
-
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// H2 round-2 F3 mechanism: `sweep_all_blob_dirs` removes
-    /// every top-level entry under the blob root regardless of
-    /// naming — that's the one-shot reclaim behaviour the
-    /// migration-14 upgrade needs. Fresh install (no blob root
-    /// yet) is a no-op. Both cases are exercised here so the
-    /// helper's contract stays testable without simulating a
-    /// pre-14 database (which would need a Db constructor that
-    /// opens at a chosen `user_version` — bigger surface than
-    /// this fix warrants).
-    #[test]
-    fn sweep_all_blob_dirs_removes_every_top_level_entry() {
-        let base = std::env::temp_dir().join(format!(
-            "oxidhome-h2-sweep-unit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        ));
-        let blobs_root = base.join("blobs");
-        std::fs::create_dir_all(&blobs_root).unwrap();
-        // Legacy pre-14 layout (`<blobs>/<instance_id>/`), a
-        // post-14 uuid-shaped dir, and a bare file — all get
-        // reclaimed by the one-shot.
-        std::fs::create_dir_all(blobs_root.join("legacy.plugin.instance")).unwrap();
-        std::fs::write(
-            blobs_root
-                .join("legacy.plugin.instance")
-                .join("00-blob-bytes"),
-            b"legacy bytes",
-        )
-        .unwrap();
-        std::fs::create_dir_all(blobs_root.join("inst-post-14-shape")).unwrap();
-
-        sweep_all_blob_dirs(&blobs_root).expect("sweep");
-        assert!(
-            !blobs_root.join("legacy.plugin.instance").exists(),
-            "legacy pre-14 blob dir must be swept",
-        );
-        assert!(
-            !blobs_root.join("inst-post-14-shape").exists(),
-            "post-14 uuid-shaped dir must be swept by the one-shot",
-        );
-        // Missing blob root → no-op (fresh install path).
-        sweep_all_blob_dirs(&base.join("nonexistent-root")).expect("sweep noop");
-
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// H2 round-2 F3 guard: the sweep only runs when
-    /// `Db::pre_open_user_version() < MIGRATION_14`. That's how
-    /// dev-load blob dirs (created after migration 14 with
-    /// `manifest.plugin.id` as their name) survive across
-    /// subsequent boots. This test opens a state dir twice; the
-    /// second boot observes `pre_open_user_version >= 14` and
-    /// leaves a dev-shaped dir alone.
-    #[test]
-    fn with_state_dir_second_boot_leaves_dev_load_blob_dirs_alone() {
-        let base = std::env::temp_dir().join(format!(
-            "oxidhome-h2-sweep-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        let state_dir = base.join("state");
-
-        // First boot: fresh state dir → all migrations run,
-        // pre_open_user_version is 0 (< 14), sweep runs against
-        // an empty blob root (no-op).
-        drop(Engine::with_state_dir(&state_dir).expect("boot 1"));
-
-        // Now create a dev-load-shaped blob dir. On the next
-        // boot, migration 14 has already applied, so the sweep
-        // must NOT run and this dir must survive.
-        let blobs_root = state_dir.join("blobs");
-        std::fs::create_dir_all(blobs_root.join("example.dev-load.instance")).unwrap();
-        std::fs::write(
-            blobs_root
-                .join("example.dev-load.instance")
-                .join("blob-bytes"),
-            b"dev-load bytes",
-        )
-        .unwrap();
-
-        drop(Engine::with_state_dir(&state_dir).expect("boot 2"));
-        assert!(
-            blobs_root.join("example.dev-load.instance").is_dir(),
-            "post-upgrade boots must NOT clobber dev-load blob dirs",
-        );
 
         std::fs::remove_dir_all(&base).ok();
     }

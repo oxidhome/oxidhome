@@ -139,7 +139,7 @@ pub struct EventQuery {
     pub before_id: Option<u64>,
     /// Result ordering. Default `Desc` (highest id first) is
     /// the natural "newest first" view under normal
-    /// operation, since the migration-16 AUTOINCREMENT id
+    /// operation, since the AUTOINCREMENT id
     /// is monotonic in insertion time. `Asc` lets a
     /// forward-cursor caller (`after_id` + advance to `max
     /// returned`) walk the log without skipping rows past
@@ -150,7 +150,7 @@ pub struct EventQuery {
 /// Result-ordering policy for [`EventQuery`].
 ///
 /// Both variants sort by `id` — the monotonic AUTOINCREMENT
-/// row id (migration 16) — with **no** `received_ms`
+/// row id — with **no** `received_ms`
 /// component. Row id is insertion order; under normal
 /// operation that is identical to wall-clock order, so the
 /// visible shape matches the pre-14.3-events-subscribe
@@ -282,7 +282,7 @@ impl EventLog {
     /// normal operation `Desc` is newest-first, `Asc` is
     /// oldest-first; under a clock rollback both remain
     /// stable across paginated calls because id is a
-    /// monotonic AUTOINCREMENT (migration 16).
+    /// monotonic AUTOINCREMENT.
     ///
     /// # Errors
     ///
@@ -355,7 +355,7 @@ fn build_query(
     // Build a parameterized WHERE clause + ordered params list.
     // Avoids string-templating columns and uses `?N` binds for
     // every value. The query planner picks among `evt_received`
-    // and the various `(col, id)` indexes (migration 16) based
+    // and the various `(col, id)` indexes based
     // on selectivity.
     use std::fmt::Write as _;
 
@@ -449,8 +449,7 @@ fn build_query(
         i64::try_from(limit).unwrap_or(i64::MAX),
     ));
     // Both orderings sort by `id` alone (no `received_ms`
-    // primary): id is a monotonic autoincrement (schema
-    // migration 16), so pagination is stable under wall-
+    // primary): id is a monotonic autoincrement, so pagination is stable under wall-
     // clock jumps in either direction. Ordering by
     // `received_ms DESC, id DESC` under a rollback would
     // place a freshly-inserted row (lower ts, higher id)
@@ -1110,11 +1109,8 @@ mod tests {
         assert_eq!(asc_ts, vec![1000, 100, 500], "Asc must walk by id, not ts");
     }
 
-    /// Round-4 P1 on PR #157: migration 16 gave `event_log.id`
-    /// AUTOINCREMENT semantics — `SQLite` must NOT reuse an id
-    /// after retention deletes a row (even when the deleted
-    /// row is the current max, e.g. a clock-rollback row
-    /// caught by `trim_older_than`).
+    /// `event_log.id` is AUTOINCREMENT — `SQLite` must NOT reuse an id
+    /// after a delete, even when the deleted row is the current max.
     #[test]
     fn autoincrement_prevents_id_reuse_after_retention() {
         let log = log();
@@ -1142,8 +1138,7 @@ mod tests {
             .expect("delete");
         assert_eq!(dropped, 1);
 
-        // Next insert MUST NOT reuse id=4 (that's the
-        // pre-migration bug). AUTOINCREMENT bumps to 5.
+        // Next insert MUST NOT reuse id=4. AUTOINCREMENT bumps to 5.
         let next = log
             .record(40, &switch_event("d-1", true, 0), "alpha", "example.alpha")
             .expect("record after trim");

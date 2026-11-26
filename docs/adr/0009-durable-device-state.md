@@ -17,7 +17,7 @@ rule that a disk problem never stops live control, and it must not add disk work
 
 ## Decision
 
-- The projection is persisted in a `device_state` table (migration 19), one row per `(device, capability)` slot, plus
+- The projection is persisted in a `device_state` table, one row per `(device, capability)` slot, plus
   a one-row `device_state_meta` (epoch, flushed revision, eviction watermark, skipped revision ranges). The store is
   restored at boot, before any plugin runs.
 - Writes are write-behind. A mutation only marks its key dirty in memory. A flusher thread writes the dirty slots in

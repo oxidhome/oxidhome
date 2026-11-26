@@ -90,8 +90,9 @@ impl EventLog {
             while let Some(row) = rows.next()? {
                 let id = u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0);
                 if id != pos + 1 {
-                    // A hole inside history (left by pre-H4 retention,
-                    // which deleted by time): stop before it, so the
+                    // A hole inside history (retention only removes an
+                    // id prefix, so only a damaged or hand-edited
+                    // database has one): stop before it, so the
                     // next read from `pos` reports `cursor-expired`
                     // instead of silently crossing it.
                     break;

@@ -150,7 +150,7 @@ pub struct AuditEntry {
     /// H6: host-minted invocation id (`call-<32 hex>`). The entry
     /// point's row and every downstream row the invocation caused
     /// (delegated `call-service` hops, `method = "CALL"`) share it.
-    /// `None` on probe rows and rows written before migration 17.
+    /// `None` on probe rows.
     #[serde(default)]
     pub call_id: Option<String>,
     /// H6: JSON summary of the invocation context — root principal
@@ -162,8 +162,7 @@ pub struct AuditEntry {
     /// H5: host-minted device-command id (`cmd-<32 hex>`) on rows for
     /// a device-command dispatch and on the `method = "COMMAND"`
     /// resolution rows that record how an `accepted` (or abandoned)
-    /// command finally ended. `None` everywhere else and on rows
-    /// written before migration 18.
+    /// command finally ended. `None` everywhere else.
     #[serde(default)]
     pub command_id: Option<String>,
     /// H5: the explicit command outcome (`accepted`, `completed`,

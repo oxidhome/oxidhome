@@ -5,7 +5,7 @@
 //! It does two jobs, in the order they were queued:
 //!
 //! - **Persist** an externally-rooted `accepted` command into the
-//!   `pending_command` table (migration 20), so a daemon restart can't
+//!   `pending_command` table, so a daemon restart can't
 //!   drop it without a final outcome.
 //! - **Resolve** a command: append its `COMMAND` resolution row to the
 //!   audit ledger and, when the command was persisted, delete its

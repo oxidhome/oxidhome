@@ -78,8 +78,7 @@ pub struct TokenRecord {
     pub revoked_ms: Option<i64>,
     /// H6 slice 2: `true` for the owner token, the one the host minted
     /// at first-run bootstrap or with `recover-admin-token`. Set only
-    /// by those two code paths (and the migration's backfill from
-    /// their audit rows); never from a label or an API call.
+    /// by those two code paths; never from a label or an API call.
     pub owner: bool,
 }
 

@@ -10,7 +10,7 @@
 //!
 //! Architecture-review C1b: every install mints a
 //! **`installation_uuid`** that is persisted to the `SQLite`
-//! `plugin_installation` table (migration 11). This UUID feeds
+//! `plugin_installation` table. This UUID feeds
 //! [`crate::state::devices::stable_device_id`] so that uninstalling a plugin
 //! and installing a fresh copy with the same `plugin_id` mints
 //! different device ids — the new install can't inherit the old
