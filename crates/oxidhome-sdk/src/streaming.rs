@@ -23,14 +23,16 @@
 //! [`Plugin::tick`](crate::Plugin::tick) early when a socket the plugin
 //! keeps open between calls becomes readable: a connected `TcpStream`, or
 //! a `UdpSocket` that has connected, sent, or tried a receive (a
-//! non-blocking `recv_from` that answered `WouldBlock` counts), or a
-//! [`discovery::DiscoverySocket`]. The
+//! non-blocking `recv_from` that answered `WouldBlock` counts), a
+//! [`discovery::DiscoverySocket`], or the body of an HTTP response the
+//! plugin is reading ([`http::BodyReader`], or a `wasi:http`
+//! `incoming-body` stream). The
 //! cadence can then be a slow fallback rather than a polling rate.
 //! Wakeups are coalesced (one tick however much arrived) and start at
 //! least 100 ms after the previous tick returned. Read what a tick finds,
 //! up to a bound per tick so a busy peer can't hold the call, and drop
-//! sockets that reached their end: a socket left readable (data still
-//! queued, or at its end) wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
+//! sockets and bodies that reached their end: one left readable (data
+//! still queued, or at its end) wakes the plugin again after each gap. Without `tick_interval_ms` the plugin is never ticked.
 //!
 //! # Discovery
 //!
@@ -41,9 +43,9 @@
 //!
 //! # HTTP
 //!
-//! [`http::Request`] is a blocking client over
-//! `wasi:http/outgoing-handler` with body limits, timeouts and redirect
-//! handling; the raw bindings are in [`wasi::http`]. `http://` and
+//! [`http::Request`] is a client over `wasi:http/outgoing-handler` with
+//! body limits, timeouts and redirect handling, which reads the response
+//! whole or as a stream; the raw bindings are in [`wasi::http`]. `http://` and
 //! `https://` are served. The host itself never follows redirects: a 3xx
 //! response comes back to the plugin, and following it (as
 //! [`http::Request::send`] does) is a new request that the host checks

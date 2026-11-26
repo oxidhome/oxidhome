@@ -125,7 +125,9 @@ pub(crate) const FIELD_SIZE_LIMIT: usize = 16 * 1024;
 const MAX_FIELD_NAME_LEN: usize = 256;
 
 /// `fields` constructors and mutators, wrapped to refuse header names over
-/// [`MAX_FIELD_NAME_LEN`] (`invalid-syntax`).
+/// [`MAX_FIELD_NAME_LEN`] (`invalid-syntax`), and to fail a map over
+/// [`FIELD_SIZE_LIMIT`] (or over `http`'s entry cap) with
+/// `invalid-syntax` where upstream traps.
 fn limit_field_names(
     types: &mut wasmtime::component::LinkerInstance<'_, crate::runtime::state::PluginState>,
 ) -> wasmtime::Result<()> {
@@ -138,7 +140,7 @@ fn limit_field_names(
     ) -> wasmtime::Result<(Result<T, HeaderError>,)> {
         Ok((match result {
             Ok(value) => Ok(value),
-            Err(err) => Err(err.downcast()?),
+            Err(err) => Err(header_error(err)?),
         },))
     }
     let too_long = |name: &str| name.len() > MAX_FIELD_NAME_LEN;
@@ -183,6 +185,28 @@ fn limit_field_names(
         },
     )?;
     Ok(())
+}
+
+/// The guest-facing code for a failed `fields` call; a trap only for
+/// what isn't the guest's doing (a missing table entry).
+fn header_error(
+    err: wasmtime_wasi_http::p2::HeaderError,
+) -> wasmtime::Result<wasmtime_wasi_http::p2::bindings::http::types::HeaderError> {
+    use wasmtime_wasi_http::FieldMapError;
+    use wasmtime_wasi_http::p2::bindings::http::types::HeaderError;
+    let err = match err.downcast() {
+        Ok(code) => return Ok(code),
+        Err(err) => err,
+    };
+    // Upstream traps on these: a plugin building headers from
+    // operator config would die on a long value instead of failing
+    // the request.
+    match err.downcast_ref::<FieldMapError>() {
+        Some(FieldMapError::TotalSizeTooBig | FieldMapError::TooManyFields) => {
+            Ok(HeaderError::InvalidSyntax)
+        }
+        _ => Err(err),
+    }
 }
 
 /// The `outgoing-request` setters `wasmtime-wasi-http` stores without a
@@ -340,6 +364,26 @@ impl WasiHttpHooks for HttpHooks {
 
     fn p2_outgoing_body_buffer_chunks(&mut self) -> usize {
         1
+    }
+
+    /// A failed TCP connect sent nothing, so its code must not be one a
+    /// cut after the request went out also has: upstream maps a reset
+    /// to `connection-terminated`.
+    fn p2_error_from_connect(&mut self, err: &std::io::Error) -> HttpErrorCode {
+        connect_error(err)
+    }
+}
+
+/// The `wasi:http` code of a failed TCP connect (see
+/// [`HttpHooks::p2_error_from_connect`]).
+fn connect_error(err: &std::io::Error) -> HttpErrorCode {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable | ErrorKind::NetworkDown => {
+            HttpErrorCode::DestinationUnavailable
+        }
+        ErrorKind::TimedOut => HttpErrorCode::ConnectionTimeout,
+        _ => HttpErrorCode::ConnectionRefused,
     }
 }
 
@@ -690,6 +734,51 @@ mod tests {
 
     fn plain(s: &str) -> bool {
         plain_authority(&s.parse().expect("authority"))
+    }
+
+    #[test]
+    fn oversized_header_maps_fail_instead_of_trapping() {
+        use wasmtime_wasi_http::FieldMapError;
+        use wasmtime_wasi_http::p2::HeaderError;
+        use wasmtime_wasi_http::p2::bindings::http::types::HeaderError as Code;
+        for err in [FieldMapError::TotalSizeTooBig, FieldMapError::TooManyFields] {
+            assert!(matches!(
+                super::header_error(HeaderError::from(err)),
+                Ok(Code::InvalidSyntax)
+            ));
+        }
+        assert!(matches!(
+            super::header_error(HeaderError::from(FieldMapError::Forbidden)),
+            Ok(Code::Forbidden)
+        ));
+        assert!(
+            super::header_error(HeaderError::trap(wasmtime::format_err!("missing entry"))).is_err()
+        );
+    }
+
+    #[test]
+    fn a_failed_connect_never_looks_like_a_cut_after_sending() {
+        use std::io::{Error, ErrorKind};
+        use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::Other,
+        ] {
+            assert!(matches!(
+                super::connect_error(&Error::from(kind)),
+                ErrorCode::ConnectionRefused
+            ));
+        }
+        assert!(matches!(
+            super::connect_error(&Error::from(ErrorKind::TimedOut)),
+            ErrorCode::ConnectionTimeout
+        ));
+        assert!(matches!(
+            super::connect_error(&Error::from(ErrorKind::HostUnreachable)),
+            ErrorCode::DestinationUnavailable
+        ));
     }
 
     #[test]

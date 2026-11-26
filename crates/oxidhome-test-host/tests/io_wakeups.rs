@@ -69,6 +69,38 @@ fn tcp_peer() -> (SocketAddr, mpsc::Sender<()>) {
     (addr, done_tx)
 }
 
+/// An HTTP peer on loopback: answers one request with a chunked `200`
+/// whose first chunk is `one`, sends `two` when the test signals, and
+/// ends the body at the next signal (or when the test drops the
+/// sender).
+fn http_peer() -> (SocketAddr, mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http peer");
+    let addr = listener.local_addr().expect("local addr");
+    let (next_tx, next_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\none\r\n");
+        let _ = stream.flush();
+        let _ = next_rx.recv();
+        let _ = stream.write_all(b"3\r\ntwo\r\n");
+        let _ = stream.flush();
+        let _ = next_rx.recv();
+        let _ = stream.write_all(b"0\r\n\r\n");
+        let _ = stream.flush();
+        // Open until the test is done.
+        let _ = next_rx.recv();
+    });
+    (addr, next_tx)
+}
+
 /// Stage net-probe with `rule`, the given tick cadence, and run `ops`.
 fn probe(rule: &str, tick_interval_ms: Option<i64>) -> support::TempDir {
     let rule = rule.to_owned();
@@ -334,4 +366,47 @@ async fn a_discovery_socket_wakes_only_for_allowed_senders() {
     assert_eq!(string(&storage, "last"), "allowed");
     assert_eq!(int(&storage, "ticks"), 2);
     instance.stop().await.unwrap();
+}
+
+/// A `wasi:http` response body the plugin keeps (the SDK's streaming
+/// reader) wakes it when more of the body arrives, and when it ends;
+/// once the plugin drops the ended body, nothing wakes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_body_wakes_the_plugin_before_its_tick() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let (peer, next) = http_peer();
+    let dir = probe(&format!("tcp://{peer}"), Some(HOUR_MS));
+    let instance = start(&host, &dir, &format!("hold-http http://{peer}/live")).await;
+    let storage = instance.storage();
+
+    wait_for(&storage, "received", 1).await;
+    assert_eq!(string(&storage, "last"), "one");
+    assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
+    wait_for_gate(&host).await;
+    let ticks = int(&storage, "ticks");
+
+    // More of the body: one early tick once the gap ends.
+    next.send(()).unwrap();
+    tokio::time::sleep(QUIET).await;
+    host.advance(GAP).await.unwrap();
+    wait_for(&storage, "received", 2).await;
+    assert_eq!(string(&storage, "last"), "two");
+    assert_eq!(int(&storage, "ticks"), ticks + 1);
+
+    // The end of the body wakes it too; the plugin drops the body then.
+    next.send(()).unwrap();
+    tokio::time::sleep(QUIET).await;
+    let deadline = Instant::now() + WAIT;
+    while int(&storage, "ticks") < ticks + 2 {
+        assert!(Instant::now() < deadline, "the body's end never woke it");
+        host.advance(GAP).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Dropped: no more wakeups.
+    host.advance(GAP * 5).await.unwrap();
+    tokio::time::sleep(QUIET).await;
+    host.advance(GAP * 5).await.unwrap();
+    assert_eq!(int(&storage, "ticks"), ticks + 2);
+    instance.stop().await.unwrap();
+    drop(next);
 }

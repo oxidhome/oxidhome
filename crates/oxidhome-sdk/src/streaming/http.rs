@@ -1,11 +1,13 @@
 //! A blocking HTTP client over `wasi:http`.
 //!
 //! ```no_run
+//! use std::time::Duration;
 //! use oxidhome_sdk::streaming::http::Request;
 //!
 //! let response = Request::get("https://camera.lan:10443/status")
 //!     .header("accept", "application/json")
-//!     .timeout(std::time::Duration::from_secs(5))
+//!     .timeout(Duration::from_secs(5))
+//!     .total_timeout(Duration::from_secs(10))
 //!     .send()?;
 //! if response.status() == 200 {
 //!     let text = response.text().unwrap_or_default();
@@ -20,10 +22,31 @@
 //! whole request body before reading the response body: an exchange
 //! that streams both ways at once needs `wasi:http` directly.
 //!
+//! [`Request::send_streaming`] returns once the response head has
+//! arrived, with a [`BodyReader`] that reads the body without blocking:
+//! for bodies that don't end (a multipart camera stream, MJPEG,
+//! server-sent events, a long poll) or that are read a little each
+//! `tick`. A plugin that keeps the reader between calls is ticked early
+//! when more of the body arrives (see the readiness wakeups in
+//! [`crate::streaming`]).
+//!
+//! - **Timeouts.** [`Request::timeout`] (30 s by default) bounds
+//!   connecting, waiting for the response head, and each gap between
+//!   body chunks, each on its own: a server that trickles its body keeps
+//!   [`Request::send`] busy for as long as it trickles.
+//!   [`Request::total_timeout`] bounds the whole exchange, redirects
+//!   included ([`Error::TotalTimeout`]); with
+//!   [`Request::send_streaming`], everything up to the response head.
+//!   Set it on calls from `tick` or a command: a call blocked inside the
+//!   host is out of the liveness watchdog's reach.
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
-//!   the request with [`Error::BodyTooLarge`]. [`Request::timeout`] (30 s
-//!   by default) bounds connecting, waiting for the response head, and
-//!   each gap between body chunks.
+//!   the request with [`Error::BodyTooLarge`]. The host caps a request's
+//!   headers at [`MAX_HEADER_BYTES`]; more fails it with
+//!   [`Error::Request`].
+//! - **Headers.** [`FORBIDDEN_HEADERS`] (hop-by-hop headers and `host`,
+//!   which the host sets) and `content-length` (set from the body) are
+//!   dropped by [`Request::header`], so a header list copied from a
+//!   packet capture can be sent as is.
 //! - **Redirects.** `301`, `302`, `303`, `307` and `308` with a
 //!   `Location` are followed, at most [`MAX_REDIRECTS`] times (fewer with
 //!   [`Request::max_redirects`]). Each hop is a new request that the host
@@ -34,20 +57,27 @@
 //!   are kept: set [`Request::max_redirects`] to `0` to follow redirects
 //!   yourself). `303`, and `301` / `302` after a `POST`, continue as a
 //!   `GET` without a body.
+//! - **Sent or not.** [`Error::may_have_reached_server`] tells a failure
+//!   where nothing reached the server (an invalid request, no network
+//!   rule allowing it, a failed lookup, connect or TLS handshake) from
+//!   one where the server may have received the request and acted on it,
+//!   as a command's outcome needs (an error, or unknown).
 //! - **HTTPS.** The host verifies certificates against the system's
 //!   roots. A local device (a private, link-local or loopback address)
 //!   with a self-signed certificate is trusted on first use: the host pins the
 //!   certificate it sees first and refuses any other until the operator
 //!   resets the pin.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::http::outgoing_handler;
 use crate::bindings::wasi::http::types::{
     ErrorCode, Fields, FutureIncomingResponse, IncomingBody, IncomingResponse,
     Method as WasiMethod, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
 };
-use crate::bindings::wasi::io::streams::{OutputStream, StreamError};
+use crate::bindings::wasi::io::poll::{Pollable, poll};
+use crate::bindings::wasi::io::streams::{InputStream, OutputStream, StreamError};
 
 /// Most redirects one [`Request::send`] follows.
 pub const MAX_REDIRECTS: u8 = 5;
@@ -55,14 +85,36 @@ pub const MAX_REDIRECTS: u8 = 5;
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 /// Default [`Request::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Most bytes of request headers the host takes (names and values).
+pub const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// Headers `wasi:http` refuses from a plugin: hop-by-hop headers, and
+/// `host`, which the host sets from the URL. [`Request::header`] drops
+/// them (and `content-length`, which is set from the body).
+pub const FORBIDDEN_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "http2-settings",
+];
 /// Largest write `wasi:io` takes at once.
 const WRITE_CHUNK: usize = 4096;
 /// Largest read asked of the response stream at once.
 const READ_CHUNK: u64 = 64 * 1024;
 /// Headers dropped when a redirect leaves the origin.
 const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
+/// Most of a [`Request::total_timeout`]'s remainder the host's connect
+/// timeout leaves unused, so a server that can't be reached fails as
+/// `connection-timeout` (nothing sent) before the total timeout (maybe
+/// sent) ends the request.
+const CONNECT_MARGIN: Duration = Duration::from_millis(500);
 
-/// Why a request failed.
+/// Why a request failed. [`Error::may_have_reached_server`] tells
+/// whether the server may have received it.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The URL isn't `http(s)://host[:port][/path][?query]`.
@@ -72,7 +124,9 @@ pub enum Error {
     /// means no network rule allows it ([`Error::is_denied`]).
     #[error("HTTP request failed: {0:?}")]
     Http(ErrorCode),
-    /// The request couldn't be built or its body written.
+    /// The request couldn't be built: a header the host refuses (invalid,
+    /// or over [`MAX_HEADER_BYTES`] in all), or another invalid part.
+    /// Nothing was sent.
     #[error("{0}")]
     Request(String),
     /// The response body is larger than [`Request::max_body`].
@@ -80,6 +134,12 @@ pub enum Error {
     BodyTooLarge {
         /// The limit that was exceeded.
         limit: usize,
+    },
+    /// [`Request::total_timeout`] ran out.
+    #[error("the exchange took longer than {limit:?}")]
+    TotalTimeout {
+        /// The limit that was exceeded.
+        limit: Duration,
     },
     /// More redirects than [`Request::max_redirects`].
     #[error("more than {limit} redirects")]
@@ -90,6 +150,19 @@ pub enum Error {
     /// An `https` response redirected to `http`.
     #[error("refusing to follow an https redirect to plain http: `{0}`")]
     InsecureRedirect(String),
+    /// A redirect's `Location` isn't an `http(s)` URL.
+    #[error("refusing to follow a redirect to `{0}`")]
+    InvalidRedirect(String),
+    /// The request a redirect pointed to failed (`error` says how): no
+    /// response came from it. The servers before it did answer.
+    #[error("after {hops} redirect(s): {error}")]
+    AfterRedirect {
+        /// Redirects followed before the failed request.
+        hops: u8,
+        /// Why that request failed.
+        #[source]
+        error: Box<Error>,
+    },
 }
 
 impl Error {
@@ -97,8 +170,68 @@ impl Error {
     /// allows it.
     #[must_use]
     pub fn is_denied(&self) -> bool {
-        matches!(self, Error::Http(ErrorCode::HttpRequestDenied))
+        match self {
+            Error::Http(ErrorCode::HttpRequestDenied) => true,
+            Error::AfterRedirect { error, .. } => error.is_denied(),
+            _ => false,
+        }
     }
+
+    /// Whether a server may have received the request (and acted on it).
+    ///
+    /// `false` only when nothing went out: the URL or request was
+    /// invalid, no network rule allows it, or the name lookup, the
+    /// connect or the TLS handshake failed (including a connection cut
+    /// during the handshake, which the host reports as
+    /// `TLS-protocol-error`). Any failure after that may have come after
+    /// the server read the request, and so may a [`Error::TotalTimeout`].
+    /// After a redirect it is always `true`: an earlier request reached
+    /// its server.
+    #[must_use]
+    pub fn may_have_reached_server(&self) -> bool {
+        match self {
+            Error::InvalidUrl(_) | Error::Request(_) => false,
+            Error::Http(code) => !nothing_sent(code),
+            Error::BodyTooLarge { .. }
+            | Error::TotalTimeout { .. }
+            | Error::TooManyRedirects { .. }
+            | Error::InsecureRedirect(_)
+            | Error::InvalidRedirect(_)
+            | Error::AfterRedirect { .. } => true,
+        }
+    }
+}
+
+/// Whether the host fails a request with `code` only before any of it
+/// is sent.
+fn nothing_sent(code: &ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::DnsTimeout
+            | ErrorCode::DnsError(_)
+            | ErrorCode::DestinationNotFound
+            | ErrorCode::DestinationUnavailable
+            | ErrorCode::DestinationIpProhibited
+            | ErrorCode::DestinationIpUnroutable
+            | ErrorCode::ConnectionRefused
+            | ErrorCode::ConnectionTimeout
+            | ErrorCode::ConnectionLimitReached
+            | ErrorCode::TlsProtocolError
+            | ErrorCode::TlsCertificateError
+            | ErrorCode::TlsAlertReceived(_)
+            | ErrorCode::HttpRequestDenied
+            | ErrorCode::HttpRequestMethodInvalid
+            | ErrorCode::HttpRequestUriInvalid
+            | ErrorCode::HttpRequestUriTooLong
+            | ErrorCode::HttpRequestHeaderSectionSize(_)
+            | ErrorCode::HttpRequestHeaderSize(_)
+    )
+}
+
+/// A failure the host reports oddly (a response gone missing): treated
+/// as possibly sent.
+fn internal(what: &str) -> Error {
+    Error::Http(ErrorCode::InternalError(Some(what.to_owned())))
 }
 
 /// An HTTP method.
@@ -137,6 +270,61 @@ impl Method {
     }
 }
 
+/// When a [`Request::total_timeout`] runs out.
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    at: Instant,
+    limit: Duration,
+}
+
+impl Deadline {
+    /// `limit` from now; none for a limit too far out to represent.
+    fn after(limit: Option<Duration>) -> Option<Self> {
+        let limit = limit?;
+        Some(Self {
+            at: Instant::now().checked_add(limit)?,
+            limit,
+        })
+    }
+
+    fn expired(self) -> Error {
+        Error::TotalTimeout { limit: self.limit }
+    }
+
+    /// The time left; an error once there is none.
+    fn left(self) -> Result<Duration, Error> {
+        let left = self.at.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(self.expired())
+        } else {
+            Ok(left)
+        }
+    }
+
+    /// A pollable that is ready when the deadline passes.
+    fn timer(self) -> Result<Pollable, Error> {
+        Ok(monotonic_clock::subscribe_duration(nanos(self.left()?)))
+    }
+}
+
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Wait until `ready` is, or `deadline` passes (an error).
+fn wait(ready: &Pollable, deadline: Option<Deadline>) -> Result<(), Error> {
+    let Some(deadline) = deadline else {
+        ready.block();
+        return Ok(());
+    };
+    let timer = deadline.timer()?;
+    if poll(&[ready, &timer]).contains(&0) {
+        Ok(())
+    } else {
+        Err(deadline.expired())
+    }
+}
+
 /// A request to send. Build it with [`Request::get`] / [`Request::new`]
 /// and the setters, then [`Request::send`] it.
 ///
@@ -148,6 +336,7 @@ pub struct Request {
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
     timeout: Duration,
+    total_timeout: Option<Duration>,
     max_body: usize,
     max_redirects: u8,
 }
@@ -162,6 +351,7 @@ impl Request {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            total_timeout: None,
             max_body: DEFAULT_MAX_BODY,
             max_redirects: MAX_REDIRECTS,
         }
@@ -192,10 +382,13 @@ impl Request {
     }
 
     /// Add a header (names are case-insensitive; repeats are kept).
+    /// [`FORBIDDEN_HEADERS`] and `content-length` are dropped.
     #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
-        self.headers
-            .push((name.into().to_ascii_lowercase(), value.into()));
+        let name = name.into().to_ascii_lowercase();
+        if name != "content-length" && !FORBIDDEN_HEADERS.contains(&name.as_str()) {
+            self.headers.push((name, value.into()));
+        }
         self
     }
 
@@ -211,6 +404,15 @@ impl Request {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Bound the whole exchange, from the call to [`Request::send`] until
+    /// the body has arrived (redirects included), or until the response
+    /// head has arrived for [`Request::send_streaming`]. None by default.
+    #[must_use]
+    pub fn total_timeout(mut self, limit: Duration) -> Self {
+        self.total_timeout = Some(limit);
         self
     }
 
@@ -236,27 +438,98 @@ impl Request {
     /// See [`Error`]; a request no network rule allows fails with
     /// [`Error::Http`] (`HTTP-request-denied`).
     pub fn send(self) -> Result<Response, Error> {
-        let mut current = self;
-        let mut url = Url::parse(&current.url)?;
+        let max_body = self.max_body;
+        let deadline = Deadline::after(self.total_timeout);
+        let (head, url) = self.exchange(deadline)?;
+        let Head {
+            status,
+            headers,
+            incoming,
+            _response,
+            _upload,
+        } = head;
+        let body = read_body(incoming, max_body, deadline)?;
+        Ok(Response {
+            status,
+            headers,
+            body,
+            url: url.to_string(),
+        })
+    }
+
+    /// Send the request, following redirects, and return once the
+    /// response head has arrived; read the body with the returned
+    /// [`BodyReader`]. [`Request::max_body`] doesn't apply.
+    ///
+    /// The response holds one of the instance's concurrent HTTP requests
+    /// until it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`Request::send`], except [`Error::BodyTooLarge`].
+    pub fn send_streaming(self) -> Result<StreamingResponse, Error> {
+        let deadline = Deadline::after(self.total_timeout);
+        let (head, url) = self.exchange(deadline)?;
+        let Head {
+            status,
+            headers,
+            incoming,
+            _response: response,
+            _upload: upload,
+        } = head;
+        let stream = incoming
+            .stream()
+            .map_err(|()| internal("response stream already taken"))?;
+        Ok(StreamingResponse {
+            status,
+            headers,
+            url: url.to_string(),
+            body: BodyReader {
+                ready: stream.subscribe(),
+                stream,
+                _incoming: incoming,
+                _response: response,
+                _upload: upload,
+                ended: false,
+            },
+        })
+    }
+
+    /// Send the request, following redirects, until a response that
+    /// isn't one to follow; return its head and URL.
+    fn exchange(mut self, deadline: Option<Deadline>) -> Result<(Head, Url), Error> {
+        let mut url = Url::parse(&self.url)?;
         let mut hops = 0u8;
         loop {
-            let head = current.start(&url)?;
+            let head = self.start(&url, deadline).map_err(|error| {
+                if hops == 0 {
+                    error
+                } else {
+                    Error::AfterRedirect {
+                        hops,
+                        error: Box::new(error),
+                    }
+                }
+            })?;
             let location = match redirect_location(head.status, &head.headers) {
-                Some(location) if current.max_redirects > 0 => location,
-                // The final response: only its body is read.
-                _ => return head.read(current.max_body, &url),
+                Some(location) if self.max_redirects > 0 => location,
+                // The final response.
+                _ => return Ok((head, url)),
             };
-            if hops >= current.max_redirects {
+            if hops >= self.max_redirects {
                 return Err(Error::TooManyRedirects {
-                    limit: current.max_redirects,
+                    limit: self.max_redirects,
                 });
             }
             hops += 1;
-            let next = url.join(&location)?;
+            let next = url.join(&location).map_err(|err| match err {
+                Error::InvalidUrl(location) => Error::InvalidRedirect(location),
+                other => other,
+            })?;
             if url.https && !next.https {
                 return Err(Error::InsecureRedirect(next.to_string()));
             }
-            current.follow(head.status, &url, &next);
+            self.follow(head.status, &url, &next);
             // The redirect's own body is dropped unread.
             drop(head);
             url = next;
@@ -286,15 +559,15 @@ impl Request {
     }
 
     /// Send one request and wait for the response head.
-    fn start(&self, url: &Url) -> Result<Head, Error> {
+    fn start(&self, url: &Url, deadline: Option<Deadline>) -> Result<Head, Error> {
         let headers = Fields::new();
         for (name, value) in &self.headers {
-            if name == "content-length" {
-                continue;
-            }
-            headers
-                .append(name, value)
-                .map_err(|e| Error::Request(format!("header `{name}`: {e:?}")))?;
+            headers.append(name, value).map_err(|e| {
+                Error::Request(format!(
+                    "header `{name}`: {e:?} (an invalid name or value, or more than \
+                     {MAX_HEADER_BYTES} bytes of headers)"
+                ))
+            })?;
         }
         // An empty POST / PUT / PATCH still says so: some servers refuse a
         // chunked request without a length (`411`).
@@ -323,11 +596,18 @@ impl Request {
         request
             .set_path_with_query(Some(&url.path_and_query))
             .map_err(|()| fail("path"))?;
+        let (connect, first_byte) = match deadline {
+            None => (self.timeout, self.timeout),
+            Some(deadline) => {
+                let left = deadline.left()?;
+                let connect = left.saturating_sub((left / 10).min(CONNECT_MARGIN));
+                (self.timeout.min(connect), self.timeout.min(left))
+            }
+        };
         let options = RequestOptions::new();
-        let nanos = u64::try_from(self.timeout.as_nanos()).unwrap_or(u64::MAX);
-        let _ = options.set_connect_timeout(Some(nanos));
-        let _ = options.set_first_byte_timeout(Some(nanos));
-        let _ = options.set_between_bytes_timeout(Some(nanos));
+        let _ = options.set_connect_timeout(Some(nanos(connect)));
+        let _ = options.set_first_byte_timeout(Some(nanos(first_byte)));
+        let _ = options.set_between_bytes_timeout(Some(nanos(self.timeout)));
 
         let outgoing = request.body().map_err(|()| fail("body"))?;
         let pending = outgoing_handler::handle(request, Some(options)).map_err(Error::Http)?;
@@ -339,7 +619,7 @@ impl Request {
         // answered anyway (a `413` mid-upload); the write error itself
         // adds nothing.
         let written = match outgoing.write() {
-            Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout)?,
+            Ok(stream) => write_body(&stream, &self.body, &pending, self.timeout, deadline)?,
             Err(()) => Written::Broken(None),
         };
         let (early, upload) = match written {
@@ -359,7 +639,7 @@ impl Request {
 
         let response = match early {
             Some(response) => response,
-            None => take_response(&pending)?,
+            None => take_response(&pending, deadline)?,
         };
         let status = response.status();
         let headers = {
@@ -368,7 +648,7 @@ impl Request {
         };
         let incoming = response
             .consume()
-            .map_err(|()| Error::Request("response body already taken".into()))?;
+            .map_err(|()| internal("response body already taken"))?;
         Ok(Head {
             status,
             headers,
@@ -390,33 +670,16 @@ struct Head {
     _upload: Option<OutgoingBody>,
 }
 
-impl Head {
-    /// Read the body (at most `max_body` bytes) into a [`Response`].
-    fn read(self, max_body: usize, url: &Url) -> Result<Response, Error> {
-        let Head {
-            status,
-            headers,
-            incoming,
-            _response,
-            _upload,
-        } = self;
-        let body = read_body(incoming, max_body)?;
-        Ok(Response {
-            status,
-            headers,
-            body,
-            url: url.to_string(),
-        })
-    }
-}
-
-/// Wait for and take the response.
-fn take_response(pending: &FutureIncomingResponse) -> Result<IncomingResponse, Error> {
-    pending.subscribe().block();
+/// Wait (until `deadline`, if any) for the response and take it.
+fn take_response(
+    pending: &FutureIncomingResponse,
+    deadline: Option<Deadline>,
+) -> Result<IncomingResponse, Error> {
+    wait(&pending.subscribe(), deadline)?;
     pending
         .get()
-        .ok_or_else(|| Error::Request("response not ready".into()))?
-        .map_err(|()| Error::Request("response already taken".into()))?
+        .ok_or_else(|| internal("response not ready"))?
+        .map_err(|()| internal("response already taken"))?
         .map_err(Error::Http)
 }
 
@@ -431,11 +694,12 @@ enum Written {
     Broken(Option<IncomingResponse>),
 }
 
-/// Write `body` and flush it. A response that arrives while the write is
-/// blocked is taken: a refusal (`413`) stops the upload, since such a
-/// server may never read the rest; an early `1xx`/`2xx` doesn't, since
-/// such a server may still be reading it, but once answered, the upload
-/// must keep moving: `timeout` without progress fails it.
+/// Write `body` and flush it, by `deadline` if any. A response that
+/// arrives while the write is blocked is taken: a refusal (`413`) stops
+/// the upload, since such a server may never read the rest; an early
+/// `1xx`/`2xx` doesn't, since such a server may still be reading it, but
+/// once answered, the upload must keep moving: `timeout` without
+/// progress fails it.
 ///
 /// An `Err` is the request's outcome (the host's error code, the stall).
 fn write_body(
@@ -443,12 +707,11 @@ fn write_body(
     body: &[u8],
     pending: &FutureIncomingResponse,
     timeout: Duration,
+    deadline: Option<Deadline>,
 ) -> Result<Written, Error> {
-    use crate::bindings::wasi::clocks::monotonic_clock;
-    use crate::bindings::wasi::io::poll::poll;
     let writable = stream.subscribe();
     let answered = pending.subscribe();
-    let stall = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+    let expiry = deadline.map(Deadline::timer).transpose()?;
     let mut early = None;
     let mut rest = body;
     let mut flushed = false;
@@ -457,17 +720,29 @@ fn write_body(
             return Ok(Written::Broken(early));
         };
         if room == 0 {
-            if early.is_some() {
-                let timer = monotonic_clock::subscribe_duration(stall);
-                if !poll(&[&writable, &timer]).contains(&0) {
+            // Once answered, the stall timer instead of the response.
+            let stall = early
+                .is_some()
+                .then(|| monotonic_clock::subscribe_duration(nanos(timeout)));
+            let mut waits = vec![&writable, stall.as_ref().unwrap_or(&answered)];
+            waits.extend(expiry.as_ref());
+            let ready = poll(&waits);
+            if ready.contains(&0) {
+                continue;
+            }
+            if ready.contains(&1) {
+                if early.is_some() {
                     return Err(Error::Http(ErrorCode::ConnectionWriteTimeout));
                 }
-            } else if poll(&[&writable, &answered]).contains(&1) {
-                let response = take_response(pending)?;
+                let response = take_response(pending, None)?;
                 if response.status() >= 300 {
                     return Ok(Written::Refused(response));
                 }
                 early = Some(response);
+                continue;
+            }
+            if let Some(deadline) = deadline {
+                return Err(deadline.expired());
             }
             continue;
         }
@@ -493,16 +768,42 @@ fn write_body(
     }
 }
 
-/// Read a whole response body, refusing more than `max_body` bytes.
-fn read_body(incoming: IncomingBody, max_body: usize) -> Result<Vec<u8>, Error> {
+/// The error a failed response-body read reports.
+fn read_error(err: &crate::bindings::wasi::io::error::Error) -> Error {
+    match crate::bindings::wasi::http::types::http_error_code(err) {
+        Some(code) => Error::Http(code),
+        None => Error::Http(ErrorCode::InternalError(Some(err.to_debug_string()))),
+    }
+}
+
+/// Read a whole response body, refusing more than `max_body` bytes, by
+/// `deadline` if any.
+fn read_body(
+    incoming: IncomingBody,
+    max_body: usize,
+    deadline: Option<Deadline>,
+) -> Result<Vec<u8>, Error> {
     let mut body = Vec::new();
     {
         let stream = incoming
             .stream()
-            .map_err(|()| Error::Request("response stream already taken".into()))?;
+            .map_err(|()| internal("response stream already taken"))?;
+        let ready = stream.subscribe();
+        let expiry = deadline.map(Deadline::timer).transpose()?;
         loop {
+            // Checked before every read: a server that keeps a little
+            // data ready would otherwise never reach the wait below.
+            if let Some(deadline) = deadline {
+                deadline.left()?;
+            }
             let room = max_body.saturating_sub(body.len()) as u64 + 1;
-            match stream.blocking_read(room.min(READ_CHUNK)) {
+            match stream.read(room.min(READ_CHUNK)) {
+                Ok(chunk) if chunk.is_empty() => match &expiry {
+                    Some(expiry) => {
+                        poll(&[&ready, expiry]);
+                    }
+                    None => ready.block(),
+                },
                 Ok(chunk) => {
                     // Checked before growing the buffer.
                     if chunk.len() > max_body - body.len() {
@@ -511,14 +812,7 @@ fn read_body(incoming: IncomingBody, max_body: usize) -> Result<Vec<u8>, Error> 
                     body.extend_from_slice(&chunk);
                 }
                 Err(StreamError::Closed) => break,
-                Err(StreamError::LastOperationFailed(e)) => {
-                    return Err(
-                        match crate::bindings::wasi::http::types::http_error_code(&e) {
-                            Some(code) => Error::Http(code),
-                            None => Error::Request(e.to_debug_string()),
-                        },
-                    );
-                }
+                Err(StreamError::LastOperationFailed(e)) => return Err(read_error(&e)),
             }
         }
     }
@@ -535,6 +829,14 @@ fn redirect_location(status: u16, headers: &[(String, Vec<u8>)]) -> Option<Strin
         .find(|(n, _)| n.eq_ignore_ascii_case("location"))
         .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .map(str::to_owned)
+}
+
+/// The first value of header `name` (case-insensitive) in `headers`.
+fn find_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_slice())
 }
 
 /// A response with its whole body.
@@ -558,10 +860,7 @@ impl Response {
     /// The first value of header `name` (case-insensitive).
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_slice())
+        find_header(&self.headers, name)
     }
 
     /// Every header, in the order received.
@@ -607,6 +906,129 @@ impl Response {
     }
 }
 
+/// A response whose body is read as it arrives, from
+/// [`Request::send_streaming`].
+///
+/// `Debug` shows header names, never their values.
+pub struct StreamingResponse {
+    status: u16,
+    headers: Vec<(String, Vec<u8>)>,
+    url: String,
+    body: BodyReader,
+}
+
+impl StreamingResponse {
+    /// The status code.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The first value of header `name` (case-insensitive).
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        find_header(&self.headers, name)
+    }
+
+    /// Every header, in the order received.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, Vec<u8>)] {
+        &self.headers
+    }
+
+    /// The URL that answered, after redirects.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The body.
+    pub fn body(&mut self) -> &mut BodyReader {
+        &mut self.body
+    }
+
+    /// The body, taken.
+    #[must_use]
+    pub fn into_body(self) -> BodyReader {
+        self.body
+    }
+}
+
+/// A response body read as it arrives. Dropping it ends the exchange.
+///
+/// [`Request::timeout`] still bounds each gap between body chunks: after
+/// that long without data, a read fails with `connection-read-timeout`.
+/// A reader the plugin keeps between calls wakes it early when it has
+/// something to read, including its end: drop the reader once it has
+/// ended, or the plugin keeps being woken.
+pub struct BodyReader {
+    // Fields drop in order: the pollable before its stream, the stream
+    // before the body it came from, the body before its response.
+    ready: Pollable,
+    stream: InputStream,
+    _incoming: IncomingBody,
+    _response: IncomingResponse,
+    /// An upload the server answered before it finished.
+    _upload: Option<OutgoingBody>,
+    ended: bool,
+}
+
+impl BodyReader {
+    /// What has arrived, at most `max` bytes, without waiting: empty when
+    /// nothing has yet, `None` once the body has ended.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Http`] when the body failed (the connection was cut, or
+    /// [`Request::timeout`] passed without data); the body has ended then.
+    pub fn read(&mut self, max: usize) -> Result<Option<Vec<u8>>, Error> {
+        if self.ended {
+            return Ok(None);
+        }
+        match self.stream.read(u64::try_from(max).unwrap_or(u64::MAX)) {
+            Ok(chunk) => Ok(Some(chunk)),
+            Err(StreamError::Closed) => {
+                self.ended = true;
+                Ok(None)
+            }
+            Err(StreamError::LastOperationFailed(e)) => {
+                self.ended = true;
+                Err(read_error(&e))
+            }
+        }
+    }
+
+    /// As [`BodyReader::read`], but wait until something has arrived (or
+    /// the body has ended or failed). [`Request::timeout`] bounds the wait.
+    ///
+    /// # Errors
+    ///
+    /// As [`BodyReader::read`].
+    pub fn read_blocking(&mut self, max: usize) -> Result<Option<Vec<u8>>, Error> {
+        loop {
+            match self.read(max)? {
+                Some(chunk) if chunk.is_empty() && max > 0 => self.ready.block(),
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// A pollable that is ready when [`BodyReader::read`] has something to
+    /// return: data, the end, or an error. For waiting on several things
+    /// at once with [`poll`].
+    #[must_use]
+    pub fn pollable(&self) -> &Pollable {
+        &self.ready
+    }
+
+    /// Whether the body has ended (or failed): [`BodyReader::read`]
+    /// returns `None` from now on.
+    #[must_use]
+    pub fn is_ended(&self) -> bool {
+        self.ended
+    }
+}
+
 /// Header names only: values may be credentials (`authorization`,
 /// `set-cookie`).
 struct HeaderNames<'a>(&'a [(String, Vec<u8>)]);
@@ -627,9 +1049,29 @@ impl std::fmt::Debug for Request {
             .field("headers", &HeaderNames(&self.headers))
             .field("body_len", &self.body.len())
             .field("timeout", &self.timeout)
+            .field("total_timeout", &self.total_timeout)
             .field("max_body", &self.max_body)
             .field("max_redirects", &self.max_redirects)
             .finish()
+    }
+}
+
+impl std::fmt::Debug for StreamingResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingResponse")
+            .field("status", &self.status)
+            .field("headers", &HeaderNames(&self.headers))
+            .field("url", &self.url)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BodyReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodyReader")
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
     }
 }
 
@@ -991,6 +1433,74 @@ mod tests {
         r.follow(302, &from, &same);
         assert_eq!(r.method, Method::Put);
         assert_eq!(r.body, b"on");
+    }
+
+    #[test]
+    fn hop_by_hop_and_host_set_headers_are_dropped() {
+        let mut request = Request::get("http://h");
+        for name in FORBIDDEN_HEADERS {
+            request = request.header(name.to_ascii_uppercase(), "x");
+        }
+        let request = request
+            .header("Content-Length", "3")
+            .header("Authorization", "Basic x");
+        let names: Vec<&str> = request.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["authorization"]);
+    }
+
+    #[test]
+    fn errors_tell_whether_the_request_may_have_gone_out() {
+        for not_sent in [
+            Error::InvalidUrl("x".into()),
+            Error::Request("header".into()),
+            Error::Http(ErrorCode::HttpRequestDenied),
+            Error::Http(ErrorCode::ConnectionRefused),
+            Error::Http(ErrorCode::ConnectionTimeout),
+            Error::Http(ErrorCode::TlsProtocolError),
+            Error::Http(ErrorCode::TlsCertificateError),
+            Error::Http(ErrorCode::DnsTimeout),
+        ] {
+            assert!(!not_sent.may_have_reached_server(), "{not_sent:?}");
+        }
+        for maybe in [
+            Error::Http(ErrorCode::ConnectionTerminated),
+            Error::Http(ErrorCode::ConnectionReadTimeout),
+            Error::Http(ErrorCode::HttpResponseTimeout),
+            Error::Http(ErrorCode::HttpProtocolError),
+            Error::Http(ErrorCode::InternalError(None)),
+            Error::TotalTimeout {
+                limit: Duration::from_secs(1),
+            },
+            Error::BodyTooLarge { limit: 1 },
+            Error::InvalidRedirect("mailto:x".into()),
+        ] {
+            assert!(maybe.may_have_reached_server(), "{maybe:?}");
+        }
+        // The hop before reached its server, whatever stopped this one.
+        let denied = Error::AfterRedirect {
+            hops: 1,
+            error: Box::new(Error::Http(ErrorCode::HttpRequestDenied)),
+        };
+        assert!(denied.may_have_reached_server());
+        assert!(denied.is_denied());
+        assert!(!Error::Http(ErrorCode::ConnectionRefused).is_denied());
+        assert_eq!(
+            denied.to_string(),
+            "after 1 redirect(s): HTTP request failed: ErrorCode::HttpRequestDenied"
+        );
+    }
+
+    #[test]
+    fn total_timeouts_beyond_the_clock_are_none() {
+        assert!(Deadline::after(None).is_none());
+        assert!(Deadline::after(Some(Duration::MAX)).is_none());
+        let deadline = Deadline::after(Some(Duration::from_secs(60))).expect("deadline");
+        assert!(deadline.left().is_ok());
+        let past = Deadline::after(Some(Duration::ZERO)).expect("deadline");
+        assert!(matches!(
+            past.left(),
+            Err(Error::TotalTimeout { limit }) if limit.is_zero()
+        ));
     }
 
     #[test]

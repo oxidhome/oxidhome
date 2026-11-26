@@ -546,6 +546,107 @@ async fn http_requests_are_checked_on_every_hop() {
     wait_for_deny(&host, "http", "http", "https://").await;
 }
 
+/// A server on loopback that answers one request with a head promising
+/// 1000 bytes, then trickles them a byte every 100 ms.
+fn trickling_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickle server");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n");
+        for _ in 0..1000 {
+            if stream
+                .write_all(b"x")
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    addr
+}
+
+/// A server on loopback that drops every connection it accepts (for
+/// TLS, mid-handshake).
+fn dropping_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind dropping server");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    addr
+}
+
+/// The SDK client: a total timeout ends a trickling body, refused
+/// headers are dropped, oversized ones fail without trapping, a body can
+/// be streamed, and each error says whether the request may have gone
+/// out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
+    let host = TestHost::new().unwrap();
+    let ok = TcpServer::http(|_| http_ok("hello"));
+    let trickle = trickling_server();
+    let cut = dropping_server();
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    };
+    let started = Instant::now();
+    let results = probe(
+        &host,
+        "sdk",
+        &[
+            format!("tcp://127.0.0.1:{}", ok.port()),
+            format!("tcp://{trickle}"),
+            format!("tcp://{closed}"),
+            format!("https://{cut}"),
+        ],
+        &[
+            format!("get-total 1000 http://{trickle}/"),
+            format!("get-total 5000 https://{cut}/"),
+            format!("get-total 5000 http://{closed}/"),
+            format!("get-big 20000 http://127.0.0.1:{}/", ok.port()),
+            "hdrval 20000".to_owned(),
+            format!("stream http://127.0.0.1:{}/", ok.port()),
+            format!("get-total 5000 http://127.0.0.1:{}/", ok.port()),
+        ],
+    )
+    .await;
+    // The trickle alone would take 100 s.
+    assert!(started.elapsed() < Duration::from_secs(20), "{results:?}");
+    assert!(
+        results[0].starts_with("err:TotalTimeout") && results[0].ends_with("|sent:true"),
+        "{results:?}"
+    );
+    assert_eq!(
+        results[1],
+        "err:Http(ErrorCode::TlsProtocolError)|sent:false"
+    );
+    assert_eq!(
+        results[2],
+        "err:Http(ErrorCode::ConnectionRefused)|sent:false"
+    );
+    assert!(
+        results[3].starts_with("err:Request(") && results[3].ends_with("|sent:false"),
+        "{results:?}"
+    );
+    assert_eq!(results[4], "err:HeaderError::InvalidSyntax");
+    assert_eq!(results[5], "ok:200:hello");
+    assert_eq!(results[6], "ok:200:hello");
+    assert_eq!(ok.accepted(), 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn plugin_world_components_get_no_network_imports() {
     let host = TestHost::new().unwrap();

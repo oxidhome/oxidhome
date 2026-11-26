@@ -502,7 +502,11 @@ fn first_use_outcome(
     }
 }
 
-/// Map a handshake error to the `wasi:http` error code.
+/// Map a handshake error to the `wasi:http` error code. Always a `TLS-*`
+/// code: nothing of the request has gone out before the handshake
+/// completes, and a plugin tells "not sent" from "maybe sent" by the
+/// code, so a connection cut mid-handshake is `TLS-protocol-error`, not
+/// the `connection-terminated` of a cut after the request went out.
 fn tls_error(err: &std::io::Error) -> Error {
     if let Some(err) = err
         .get_ref()
@@ -517,18 +521,30 @@ fn tls_error(err: &std::io::Error) -> Error {
             _ => Error::TlsProtocolError,
         };
     }
-    match err.kind() {
-        std::io::ErrorKind::ConnectionReset
-        | std::io::ErrorKind::ConnectionAborted
-        | std::io::ErrorKind::BrokenPipe
-        | std::io::ErrorKind::UnexpectedEof => Error::ConnectionTerminated,
-        _ => Error::TlsProtocolError,
-    }
+    Error::TlsProtocolError
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cut_handshake_is_a_tls_error() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert!(matches!(
+                tls_error(&std::io::Error::from(kind)),
+                Error::TlsProtocolError
+            ));
+        }
+        let cert = std::io::Error::other(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired,
+        ));
+        assert!(matches!(tls_error(&cert), Error::TlsCertificateError));
+    }
 
     #[test]
     fn first_use_trust_is_for_local_peers_only() {
