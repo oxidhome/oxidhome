@@ -1275,6 +1275,25 @@ mod tests {
             },
         ));
 
+        // Both fields on `device.send_command`: `devices` is
+        // enforced, `plugins` still refuses the token.
+        let mut both_fields = std::collections::HashMap::new();
+        both_fields.insert(
+            "device.send_command".to_string(),
+            crate::auth::ToolConstraint {
+                devices: Some(vec!["dev-a1b2c3d4*".into()]),
+                plugins: Some(vec!["acme.*".into()]),
+            },
+        );
+        let both_actor = Actor::api_with_policy("tok-both-fields", vec!["*".into()], both_fields);
+        assert!(matches!(
+            first_constraint_refusal(&both_actor, enforced_device),
+            Some(ConstraintRefusal::FieldNotEnforced {
+                key: "device.send_command",
+                field: "plugins",
+            }),
+        ));
+
         // Audit sentinels surface the offending key + field
         // so operators can slice per-cause on the ledger.
         assert_eq!(

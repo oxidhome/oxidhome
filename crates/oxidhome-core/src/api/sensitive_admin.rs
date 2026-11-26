@@ -17,9 +17,9 @@
 //!
 //! [`sensitive_access_report`] is the startup check: it names every
 //! live non-owner token whose `*`, `devices:command` or `blobs:read`
-//! scope reaches sensitive categories (lock, opener and alarm
+//! scope spans sensitive categories (lock, opener and alarm
 //! commands, camera bytes) that its grants, or its roles' grants,
-//! don't cover everywhere the scope reaches.
+//! don't fully cover.
 
 use std::path::Path;
 
@@ -44,7 +44,7 @@ const MAX_DEVICE_PATTERN_LEN: usize = 64;
 /// Most device patterns one grant may carry.
 const MAX_DEVICE_PATTERNS: usize = 64;
 
-/// One live token whose broad scopes reach sensitive categories its
+/// One live token whose broad scopes span sensitive categories its
 /// grants don't fully cover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SensitiveGap {
@@ -157,9 +157,9 @@ fn in_id_space(pattern: &str) -> &str {
 }
 
 /// Startup check: log at `warn` every live non-owner token whose
-/// `*` / `devices:command` / `blobs:read` scope reaches locks,
-/// openers, alarms or camera bytes that its grants don't fully cover,
-/// and how to grant them. Returns what it logged.
+/// `*` / `devices:command` / `blobs:read` scope spans locks, openers,
+/// alarms or camera bytes that its grants don't fully cover, and how
+/// to grant them. Returns what it logged.
 pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
     let records = match tokens.list() {
         Ok(r) => r,
@@ -196,7 +196,7 @@ pub fn sensitive_access_report(tokens: &TokenStore) -> Vec<SensitiveGap> {
             token_id = %gap.token_id,
             label = %gap.label,
             missing = %gap.missing.to_csv(),
-            "token's scopes reach sensitive categories its grants don't cover on every device \
+            "token's broad scopes span sensitive categories its grants don't fully cover \
              (lock, opener and alarm commands and camera bytes need an explicit grant); grant \
              with `oxidhome token grant-sensitive <token-id> <category>`",
         );

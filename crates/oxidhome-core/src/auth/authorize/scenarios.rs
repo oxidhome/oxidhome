@@ -278,6 +278,7 @@ fn resources() -> Vec<Resource> {
         Resource::blob("cam", "snap.jpg", true),
         Resource::blob("lamp", "x.bin", false),
         Resource::dashboard(7),
+        Resource::service("acme.notify", "n", "notify", "send"),
     ];
     for kind in [
         ResourceKind::Device,
@@ -628,7 +629,7 @@ fn roles_compose_with_sensitive_grants_constraints_and_denies() {
 }
 
 /// A token's own deny list beats the wildcard and the owner flag, and
-/// never blocks a pre-check.
+/// a deny with a selector never blocks a pre-check.
 #[test]
 fn deny_list_beats_every_grant() {
     use crate::auth::{ActionSet, DenyRule};
