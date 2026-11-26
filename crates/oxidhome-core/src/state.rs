@@ -75,7 +75,6 @@ pub use tls_pins::{
 };
 // Crate-private wrapper for the gated-install flow; see the
 // type doc for why this stays out of the public re-export.
-pub(crate) use installed_plugins::GatedInstallError;
 pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
 pub use log_store::{

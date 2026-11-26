@@ -1,11 +1,10 @@
-//! H6 slice 3: owner-defined roles, the `auth_role` table.
+//! Custom roles, the `auth_role` table.
 //!
-//! A role is a name plus a definition (grants, sensitive categories,
-//! denies; see [`crate::auth::RoleDef`]). Token policies reference a
-//! role by its id, so editing a role applies to every token holding it
-//! from the next request on. A role
-//! that live tokens still reference is deleted only when forced; the
-//! dangling references then grant nothing.
+//! A role is a name plus a definition (a list of grants; see
+//! [`crate::auth::RoleDef`]). Tokens hold roles by name, so editing a
+//! role applies to every token holding it from the next request on. A
+//! role that live tokens hold can't be deleted. The built-in roles
+//! (`crate::auth::role::builtin`) are not stored.
 //!
 //! The store is `TokenStore`'s: roles and tokens share the auth
 //! domain, its database handle and its `synchronous = FULL` writes.
@@ -14,14 +13,12 @@ use rusqlite::{OptionalExtension, params};
 use thiserror::Error;
 
 use super::TokenStore;
-use super::auth_token::{generate_secret, now_ms};
-use crate::auth::{RoleDef, parse_policy};
+use super::auth_token::{now_ms, parse_roles};
+use crate::auth::RoleDef;
 
 /// One stored role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleRecord {
-    /// `role-<16 hex>`.
-    pub id: String,
     /// Unique name.
     pub name: String,
     /// The definition JSON (see [`RoleDef::parse`]).
@@ -37,7 +34,7 @@ impl RoleRecord {
     /// stored JSON is malformed.
     #[must_use]
     pub fn def(&self) -> Option<RoleDef> {
-        RoleDef::parse(&self.id, &self.name, &self.definition)
+        RoleDef::parse(&self.name, &self.definition)
     }
 }
 
@@ -56,8 +53,8 @@ pub enum RoleError {
     /// No role has the name.
     #[error("no role named `{0}`")]
     NotFound(String),
-    /// Live tokens still hold the role; delete with `force`.
-    #[error("role `{name}` is held by {} live token(s) ({}); delete with force to leave them without it", tokens.len(), tokens.join(", "))]
+    /// Live tokens still hold the role.
+    #[error("role `{name}` is held by {} live token(s) ({}); revoke them first", tokens.len(), tokens.join(", "))]
     InUse {
         /// The role.
         name: String,
@@ -77,42 +74,28 @@ impl From<super::TokenError> for RoleError {
     }
 }
 
-/// Most roles the host stores.
+/// Most custom roles the host stores.
 pub const MAX_ROLES: usize = 64;
 
-const SELECT: &str = "SELECT id, name, definition, created_ms, updated_ms FROM auth_role";
+const SELECT: &str = "SELECT name, definition, created_ms, updated_ms FROM auth_role";
 
 fn row_to_role(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoleRecord> {
     Ok(RoleRecord {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        definition: row.get(2)?,
-        created_ms: row.get(3)?,
-        updated_ms: row.get(4)?,
+        name: row.get(0)?,
+        definition: row.get(1)?,
+        created_ms: row.get(2)?,
+        updated_ms: row.get(3)?,
     })
 }
 
-fn mint_role_id() -> String {
-    let bytes = generate_secret();
-    let mut id = String::from("role-");
-    for b in &bytes[..8] {
-        use std::fmt::Write as _;
-        let _ = write!(id, "{b:02x}");
-    }
-    id
-}
-
-/// Ids of the live tokens whose policy references `role_id`.
-fn holders(conn: &rusqlite::Connection, role_id: &str) -> rusqlite::Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT id, scope_json FROM auth_token WHERE revoked_ms IS NULL")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-    })?;
+/// Ids of the live tokens holding the role `name`.
+fn holders(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id, roles FROM auth_token WHERE revoked_ms IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, scope_json) = row?;
-        if parse_policy(&scope_json).is_some_and(|p| p.roles.iter().any(|r| r == role_id)) {
+        let (id, roles) = row?;
+        if parse_roles(&roles).iter().any(|r| r == name) {
             out.push(id);
         }
     }
@@ -120,7 +103,7 @@ fn holders(conn: &rusqlite::Connection, role_id: &str) -> rusqlite::Result<Vec<S
 }
 
 impl TokenStore {
-    /// Every role, by name.
+    /// Every custom role, by name.
     ///
     /// # Errors
     ///
@@ -133,39 +116,23 @@ impl TokenStore {
         })
     }
 
-    /// The role named `name`.
+    /// The custom roles among `names` that exist, in `names` order.
+    /// Read on every request of a token that holds custom roles.
     ///
     /// # Errors
     ///
     /// On database failure.
-    pub fn role_by_name(&self, name: &str) -> Result<Option<RoleRecord>, RoleError> {
-        let name = name.to_owned();
-        self.db
-            .read(move |conn| -> Result<Option<RoleRecord>, RoleError> {
-                Ok(conn
-                    .query_row(&format!("{SELECT} WHERE name = ?1"), [&name], row_to_role)
-                    .optional()?)
-            })
-    }
-
-    /// The roles among `ids` that still exist, in `ids` order. A
-    /// deleted id is skipped. Read on every request of a token that
-    /// holds roles.
-    ///
-    /// # Errors
-    ///
-    /// On database failure.
-    pub fn roles_by_id(&self, ids: &[String]) -> Result<Vec<RoleRecord>, RoleError> {
-        if ids.is_empty() {
+    pub fn roles_by_name(&self, names: &[String]) -> Result<Vec<RoleRecord>, RoleError> {
+        if names.is_empty() {
             return Ok(Vec::new());
         }
-        let ids = ids.to_vec();
+        let names = names.to_vec();
         self.db
             .read(move |conn| -> Result<Vec<RoleRecord>, RoleError> {
-                let mut stmt = conn.prepare(&format!("{SELECT} WHERE id = ?1"))?;
-                let mut out = Vec::with_capacity(ids.len());
-                for id in &ids {
-                    if let Some(r) = stmt.query_row([id], row_to_role).optional()? {
+                let mut stmt = conn.prepare(&format!("{SELECT} WHERE name = ?1"))?;
+                let mut out = Vec::with_capacity(names.len());
+                for name in &names {
+                    if let Some(r) = stmt.query_row([name], row_to_role).optional()? {
                         out.push(r);
                     }
                 }
@@ -173,15 +140,15 @@ impl TokenStore {
             })
     }
 
-    /// Ids of the live tokens holding `role_id`.
+    /// Ids of the live tokens holding the role `name`.
     ///
     /// # Errors
     ///
     /// On database failure.
-    pub fn role_holders(&self, role_id: &str) -> Result<Vec<String>, RoleError> {
-        let role_id = role_id.to_owned();
+    pub fn role_holders(&self, name: &str) -> Result<Vec<String>, RoleError> {
+        let name = name.to_owned();
         self.db
-            .read(move |conn| -> Result<Vec<String>, RoleError> { Ok(holders(conn, &role_id)?) })
+            .read(move |conn| -> Result<Vec<String>, RoleError> { Ok(holders(conn, &name)?) })
     }
 
     /// Store a new role. The caller validated `name` and `definition`.
@@ -193,7 +160,6 @@ impl TokenStore {
     pub fn create_role(&self, name: &str, definition: &[u8]) -> Result<RoleRecord, RoleError> {
         let now = now_ms();
         let record = RoleRecord {
-            id: mint_role_id(),
             name: name.to_owned(),
             definition: definition.to_vec(),
             created_ms: now,
@@ -218,15 +184,9 @@ impl TokenStore {
                     return Ok(Err(RoleError::Full));
                 }
                 tx.execute(
-                    "INSERT INTO auth_role (id, name, definition, created_ms, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        row.id,
-                        row.name,
-                        row.definition,
-                        row.created_ms,
-                        row.updated_ms
-                    ],
+                    "INSERT INTO auth_role (name, definition, created_ms, updated_ms) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![row.name, row.definition, row.created_ms, row.updated_ms],
                 )?;
                 tx.commit()?;
                 Ok(Ok(()))
@@ -264,29 +224,23 @@ impl TokenStore {
                 }
                 let role =
                     tx.query_row(&format!("{SELECT} WHERE name = ?1"), [&name], row_to_role)?;
-                let tokens = holders(&tx, &role.id)?;
+                let tokens = holders(&tx, &name)?;
                 tx.commit()?;
                 Ok(Ok((role, tokens)))
             },
         )?
     }
 
-    /// Delete the role named `name`. Refused while live tokens hold it
-    /// unless `force`; returns the ids of the tokens that held it (now
-    /// dangling references, which grant nothing).
+    /// Delete the role named `name`. Refused while live tokens hold it.
     ///
     /// # Errors
     ///
     /// [`RoleError::NotFound`], [`RoleError::InUse`]; on database
     /// failure.
-    pub fn delete_role(
-        &self,
-        name: &str,
-        force: bool,
-    ) -> Result<(RoleRecord, Vec<String>), RoleError> {
+    pub fn delete_role(&self, name: &str) -> Result<RoleRecord, RoleError> {
         let name = name.to_owned();
         self.durable_write(
-            move |conn| -> Result<Result<(RoleRecord, Vec<String>), RoleError>, super::TokenError> {
+            move |conn| -> Result<Result<RoleRecord, RoleError>, super::TokenError> {
                 let tx =
                     conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 let Some(role) = tx
@@ -295,13 +249,13 @@ impl TokenStore {
                 else {
                     return Ok(Err(RoleError::NotFound(name)));
                 };
-                let tokens = holders(&tx, &role.id)?;
-                if !tokens.is_empty() && !force {
+                let tokens = holders(&tx, &name)?;
+                if !tokens.is_empty() {
                     return Ok(Err(RoleError::InUse { name, tokens }));
                 }
-                tx.execute("DELETE FROM auth_role WHERE id = ?1", [&role.id])?;
+                tx.execute("DELETE FROM auth_role WHERE name = ?1", [&name])?;
                 tx.commit()?;
-                Ok(Ok((role, tokens)))
+                Ok(Ok(role))
             },
         )?
     }
@@ -321,31 +275,24 @@ mod tests {
     #[test]
     fn roles_create_update_delete() {
         let tokens = store();
-        let def = br#"{"grants":[{"actions":["device.read"]}]}"#;
-        let role = tokens.create_role("tablet", def).unwrap();
-        assert!(crate::auth::role::is_role_id(&role.id));
+        let def = br#"[{"actions":["device.read"]}]"#;
+        tokens.create_role("tablet", def).unwrap();
         assert!(matches!(
             tokens.create_role("tablet", def),
             Err(RoleError::Exists(_))
         ));
-        let holder = tokens
-            .create(
-                "t",
-                format!(r#"{{"scopes":[],"roles":["{}"]}}"#, role.id).as_bytes(),
-            )
-            .unwrap();
+        let holder = tokens.create("t", &["tablet"]).unwrap();
         assert_eq!(
-            tokens.role_holders(&role.id).unwrap(),
+            tokens.role_holders("tablet").unwrap(),
             vec![holder.id.clone()]
         );
 
-        let (edited, held) = tokens
-            .update_role("tablet", br#"{"grants":[{"actions":["device.list"]}]}"#)
+        let (_, held) = tokens
+            .update_role("tablet", br#"[{"actions":["device.list"]}]"#)
             .unwrap();
         assert_eq!(held, vec![holder.id.clone()]);
-        assert_eq!(edited.id, role.id);
         let found = tokens
-            .roles_by_id(&[role.id.clone(), "role-ffffffffffffffff".into()])
+            .roles_by_name(&["tablet".into(), "gone".into()])
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(
@@ -354,28 +301,31 @@ mod tests {
         );
 
         assert!(matches!(
-            tokens.delete_role("tablet", false),
+            tokens.delete_role("tablet"),
             Err(RoleError::InUse { .. })
         ));
-        // A mint revalidates its roles in its own transaction.
+        // A mint revalidates its custom roles in its own transaction.
         let issued = TokenStore::generate();
         assert_eq!(
             tokens
-                .insert_with_roles(&issued, "late", b"{}", &["role-ffffffffffffffff".into()])
+                .insert_with_roles(&issued, "late", &["member".into(), "gone".into()])
                 .unwrap()
                 .unwrap_err(),
-            "role-ffffffffffffffff"
+            "gone"
         );
         assert!(tokens.list().unwrap().iter().all(|t| t.id != issued.id));
-        let (_, held) = tokens.delete_role("tablet", true).unwrap();
-        assert_eq!(held, vec![holder.id]);
-        assert_eq!(tokens.roles_by_id(&[role.id]).unwrap(), Vec::new());
+        tokens.revoke(&holder.id).unwrap();
+        tokens.delete_role("tablet").unwrap();
+        assert_eq!(
+            tokens.roles_by_name(&["tablet".into()]).unwrap(),
+            Vec::new()
+        );
         assert!(matches!(
-            tokens.delete_role("tablet", true),
+            tokens.delete_role("tablet"),
             Err(RoleError::NotFound(_))
         ));
         assert!(matches!(
-            tokens.update_role("tablet", b"{}"),
+            tokens.update_role("tablet", b"[]"),
             Err(RoleError::NotFound(_))
         ));
     }

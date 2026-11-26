@@ -113,7 +113,7 @@ pub(crate) enum TicketError {
 /// Sign a fresh ticket for `plugin_id` @ `installation_uuid`
 /// with expiry `now + TICKET_TTL`. Called by the
 /// authenticated `/ui-session` handler after the
-/// bearer + `plugins:ui` scope check succeeds.
+/// bearer + `plugin.ui` permission check succeeds.
 pub(crate) fn issue(
     secret: &[u8; 32],
     plugin_id: &str,

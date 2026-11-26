@@ -235,7 +235,10 @@ async fn supervised_invocation_keeps_plugin_span_path_prefix() {
         .expect("device")
         .id
         .clone();
-    let actor = oxidhome_core::Actor::api("tok-log", vec!["*".into()]);
+    let actor = oxidhome_core::Actor::api(
+        "tok-log",
+        vec![oxidhome_core::auth::role::builtin("admin").unwrap()],
+    );
     let ctx =
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
     let report = handle

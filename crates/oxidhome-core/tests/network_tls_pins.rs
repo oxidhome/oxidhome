@@ -6,6 +6,8 @@
 #[path = "support.rs"]
 mod support;
 
+use support::Mint;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use oxidhome_core::Engine;
@@ -84,21 +86,21 @@ async fn operators_list_and_reset_pins() {
     let owner = ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), state.path())
         .expect("bootstrap")
         .expect("first run mints the owner token");
-    let wildcard = engine.auth_tokens().create("ha", br#"["*"]"#).unwrap();
+    let wildcard = engine.auth_tokens().mint("ha", &["*"]).unwrap();
     let lister = engine
         .auth_tokens()
-        .create("viewer", br#"["instances:list"]"#)
+        .mint("viewer", &["instance.read"])
         .unwrap();
     let devices = engine
         .auth_tokens()
-        .create("devices", br#"["devices:list"]"#)
+        .mint("devices", &["device.list"])
         .unwrap();
     pin(&engine, "cam", "192.168.1.20", 443, b"one");
     pin(&engine, "cam", "camera.lan", 8443, b"two");
     pin(&engine, "plug", "10.0.0.7", 443, b"three");
     let router = build_router(engine.clone());
 
-    // Listing needs `instances:list`.
+    // Listing needs `instance.read`.
     let (status, _) = send(
         &router,
         "GET",

@@ -8,6 +8,8 @@
 #[path = "support.rs"]
 mod support;
 
+use support::Mint;
+
 use std::time::Duration;
 
 use axum::body::Body;
@@ -159,12 +161,12 @@ fn owner_and_wildcard(engine: &Engine) -> (String, String) {
     assert!(
         engine
             .auth_tokens()
-            .insert_owner_if_empty(&issued, "admin", br#"["*"]"#)
+            .insert_owner_if_empty(&issued, "admin")
             .expect("owner")
     );
     let wildcard = engine
         .auth_tokens()
-        .create("wildcard", br#"["*"]"#)
+        .mint("wildcard", &["*"])
         .unwrap()
         .plaintext;
     (issued.plaintext, wildcard)
@@ -330,7 +332,7 @@ async fn every_listing_shows_requested_granted_and_effective_rules() {
     );
     let bearer = engine
         .auth_tokens()
-        .create("admin", b"[\"*\"]")
+        .mint("admin", &["*"])
         .unwrap()
         .plaintext;
     let router = build_router(engine.clone());

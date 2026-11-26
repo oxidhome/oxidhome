@@ -207,7 +207,8 @@ const INITIAL_SCHEMA: &str = "
     END;
 
     -- API tokens (`state::auth_token`): 256-bit random secrets stored
-    -- as plain SHA-256 hashes. `scope_json` is the token's policy.
+    -- as plain SHA-256 hashes. `roles` is a JSON array of the names of
+    -- the roles the token holds.
     -- `revoked_ms` is a tombstone; rows are kept for the audit trail.
     -- `owner` marks the owner token (first-run bootstrap or
     -- `recover-admin-token`); the partial unique index keeps one live
@@ -216,7 +217,7 @@ const INITIAL_SCHEMA: &str = "
       id            TEXT PRIMARY KEY,
       label         TEXT NOT NULL,
       hash          BLOB NOT NULL,
-      scope_json    BLOB NOT NULL,
+      roles         TEXT NOT NULL,
       created_ms    INTEGER NOT NULL,
       last_used_ms  INTEGER,
       revoked_ms    INTEGER,
@@ -367,12 +368,10 @@ const INITIAL_SCHEMA: &str = "
         PRIMARY KEY (installation_uuid, instance_id)
     ) WITHOUT ROWID;
 
-    -- Owner-defined roles (`state::auth_role`). Token policies name a
-    -- role by `id`, so an edit of its definition applies to every
-    -- holder.
+    -- Custom roles (`state::auth_role`). Tokens hold a role by name,
+    -- so an edit of its definition applies to every holder.
     CREATE TABLE auth_role (
-        id          TEXT PRIMARY KEY,
-        name        TEXT NOT NULL UNIQUE,
+        name        TEXT PRIMARY KEY,
         definition  BLOB NOT NULL,
         created_ms  INTEGER NOT NULL,
         updated_ms  INTEGER NOT NULL

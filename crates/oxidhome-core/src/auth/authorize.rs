@@ -1,168 +1,107 @@
-//! One authorization decision point (H6 slice 2).
+//! One authorization decision point.
 //!
-//! Every external token-scope check goes through [`authorize`]:
-//! REST and Connect handlers, MCP tools, resources and prompts, the
-//! 14.4 per-token constraints, and the M7 byte-withholding check. A
-//! call names *what* is being done ([`Action`], a closed enum) and *to
-//! what* ([`Resource`], built by host code), and gets back a
-//! [`Decision`] with a [`Reason`] for the audit ledger and the
-//! [`Obligations`] that come with an allow.
+//! Every external permission check goes through [`authorize`]: REST
+//! and Connect handlers, MCP tools, resources and prompts, and the M7
+//! byte-withholding check. A call names *what* is being done
+//! ([`Action`], a closed enum) and *to what* ([`Resource`], built by
+//! host code), and gets back a [`Decision`].
 //!
-//! The decision is made against the root principal's resolved
-//! [`Authority`] carried on the [`InvocationContext`]: its scopes, its
-//! 14.4 constraints, its resolved roles and deny list, its sensitive
-//! grants and owner flag. Nothing is read from the request itself.
+//! The decision is made against the root principal's [`Authority`]
+//! carried on the [`InvocationContext`]: its owner flag and its roles.
+//! Nothing is read from the request itself.
 //!
 //! # Evaluator
 //!
-//! The evaluator reproduces the token scope semantics, then adds
-//! owner-defined roles, the deny list and the sensitive-category rule:
+//! - The **owner token** ([`Authority::is_owner`]) may do everything,
+//!   and alone holds [`Action::TokenManage`] and [`Action::PolicyManage`].
+//! - Anyone else needs a role grant that covers the action on the
+//!   resource ([`crate::auth::RoleGrant::permits`]); otherwise the
+//!   action is refused ([`Reason::NoPermit`], labelled with the action
+//!   name). There is no deny list: access is absent unless granted.
+//! - **Sensitive categories.** A command on a device whose class
+//!   ([`DeviceClass`], host-derived) includes `lock`, `opener` or
+//!   `alarm`, and `blob.read` of camera bytes (a camera device, or a
+//!   blob of a camera instance), need a grant whose `category` names
+//!   every such category. An allow on one carries the categories in
+//!   [`Decision::sensitive`]; the caller writes a `warn` audit row
+//!   ([`crate::auth::sensitive::record`]) before it acts.
 //!
-//! 0. **Deny list (H6 slice 3).** A [`crate::auth::DenyRule`] of the
-//!    token, or a deny that comes with one of its roles, that matches
-//!    the action and resource refuses it ([`Reason::Denied`], label
-//!    `deny`), whatever grants it below.
-//! 1. Each action maps to the one scope that has always gated it
-//!    (`Action::legacy_scope`). A token holds the action when its scope
-//!    list contains that scope literally or the wildcard `*`, **or**
-//!    when one of its roles ([`crate::auth::RoleDef`]) has a grant for
-//!    the action that covers the resource ([`Reason::Role`]). A role
-//!    grant narrowed to device categories or ids covers a matching
-//!    device and the device pre-check ([`Resource::PreCheck`]), never a
-//!    whole collection. A token with no grant for the action is
-//!    refused with the scope it lacks ([`Reason::MissingScope`]); one
-//!    whose role grants the action elsewhere, with
-//!    [`Reason::NoPermit`]. An action no scope maps to is refused
-//!    ([`Reason::NoPermit`]).
-//! 2. For a few (action, resource) pairs, a 14.4 per-token constraint
-//!    narrows the scope to an id allowlist: `device.send_command`
-//!    (`devices`) on a device command, and `plugins.show` /
-//!    `plugins.start` / `plugins.stop` / `plugins.uninstall` /
-//!    `plugins.install` (`plugins`) on the matching plugin action. A
-//!    constraint only applies to a resource that names its target; a
-//!    collection-level check ([`Resource::Collection`], [`Resource::Host`])
-//!    is the flat scope alone.
-//! 3. **Sensitive categories.** A command on a device whose class
-//!    ([`DeviceClass`], host-derived) includes `lock`, `opener` or
-//!    `alarm`, and `blob.read` of camera bytes (a camera device, or a
-//!    blob of a camera instance), additionally need a
-//!    [`SensitiveGrant`] (or a role's sensitive category) covering
-//!    every such category and the device ([`Reason::MissingSensitive`],
-//!    label `sensitive:<category>`).
-//!    The wildcard scope never satisfies this; the owner token
-//!    ([`Authority::is_owner`]) does. An allow carries
-//!    [`Obligations`] — `warn` audit level, the categories, and a
-//!    per-category [`RateLimit`] for non-owners — which the caller
-//!    meets with [`crate::auth::sensitive::SensitiveGuard`] before it
-//!    acts. Collection-level checks are never sensitive.
-//! 4. [`Action::PolicyManage`] (category overrides) and
-//!    [`Action::TokenManage`] (minting and listing tokens) are the
-//!    owner's alone; no scope or role grants them.
-//!
-//! # Delegated hops (H6 slice 4)
+//! # Delegated hops
 //!
 //! A `call-service` hop is decided by [`authorize_hop`]:
-//! `allow = permit(root) ∧ permit(calling plugin) ∧ no deny on the
-//! chain`. The calling plugin's permit is its `consumes_services`
-//! grant (requested ∩ granted), which the dispatcher matches and
-//! passes in. When the root is external, the root must also hold
-//! [`Action::ServiceCall`] on the target [`Resource::Service`] — the
-//! `services:call` scope (or the wildcard), or a role grant whose
-//! `services` selector covers it — and none of its denies may match
-//! the hop. A narrow token therefore can't have a script use the
-//! script's broader grants on its behalf. Host-rooted work (`init`,
-//! `tick`, `on-event`, including reactions to an event an external
-//! request caused) has the plugin itself as its root: only the
-//! plugin's grant applies. Plugins carry no deny lists yet, so the
-//! root is the only principal on the chain that contributes denies.
+//! `allow = permit(calling plugin) ∧ permit(root)`. The calling
+//! plugin's permit is its `consumes_services` grant (requested ∩
+//! granted), which the dispatcher matches and passes in. When the root
+//! is external it must also hold [`Action::ServiceCall`], so a narrow
+//! token can't have a script use the script's broader grants on its
+//! behalf. Host-rooted work (`init`, `tick`, `on-event`) has the plugin
+//! as its root: only the plugin's grant applies.
 //!
-//! The scenario tests (`scenarios.rs`) check the sensitive
-//! categories, the deny list and sample owner-defined roles against an
-//! independent oracle.
-//!
-//! Plugin principals are still authorized by their manifest grants at
-//! their own call sites (`consumes_services`, `reads_state`,
-//! `subscribes_events`); [`Action::StateRead`] exists so the taxonomy
-//! is complete, and is refused here.
-//!
-//! Each transport keeps its existing deny wire shape (an empty REST
-//! 403, Connect `permission_denied` with `scope <label> required`, a
-//! generic MCP `-32001` for tools and resources, the missing scope
-//! named for prompts); [`Reason::audit_label`] is what lands in the
-//! audit row's `required_scope` column.
+//! Plugin principals are otherwise authorized by their manifest grants
+//! at their own call sites (`reads_state`, `subscribes_events`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::Actor;
 use super::category::{DeviceClass, SensitiveCategory, SensitiveSet};
 use super::invocation::InvocationContext;
-use super::policy::{
-    DEVICE_COMMAND_DENIED_SENTINEL, DEVICE_COMMAND_ENFORCED, SensitiveGrant, ToolConstraint,
-};
-use super::role::{DenyRule, RoleDef};
-use crate::api::scopes::{self, Scope};
+use super::role::RoleDef;
 
 /// What the caller wants to do. Closed: a new action is a host change,
 /// never caller input. Names follow `kind.verb` ([`Self::as_str`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// List registered devices (`devices:list`).
+    /// List registered devices.
     DeviceList,
-    /// Read device state (`devices:read`).
+    /// Read device state.
     DeviceRead,
-    /// Send a command to a device (`devices:command`).
+    /// Send a command to a device.
     DeviceCommand,
-    /// Subscribe to the live event stream (`events:tail`).
+    /// Subscribe to the live event stream.
     EventSubscribe,
-    /// Read event history (`events:read`).
+    /// Read event history.
     EventRead,
     /// Read blob payloads, including `bytes-val` in state, events and
-    /// command results (`blobs:read`).
+    /// command results.
     BlobRead,
-    /// List running instances (`instances:list`).
+    /// List running instances.
     InstanceRead,
-    /// Start an instance of an installed plugin (`plugins:start`).
+    /// Start an instance of an installed plugin.
     InstanceStart,
-    /// Stop instances of a plugin (`plugins:stop`).
+    /// Stop instances of a plugin.
     InstanceStop,
-    /// Read installed plugins, their detail and schema (`plugins:list`).
+    /// Read installed plugins, their detail and schema.
     PluginRead,
-    /// Install a plugin (`plugins:install`).
+    /// Install a plugin.
     PluginInstall,
-    /// Remove an installed plugin (`plugins:uninstall`).
+    /// Remove an installed plugin.
     PluginUninstall,
-    /// Open a plugin's UI (`plugins:ui`).
+    /// Open a plugin's UI.
     PluginUi,
-    /// Read dashboards (`dashboards:read`).
+    /// Read dashboards.
     DashboardRead,
-    /// Create, replace or delete dashboards (`dashboards:write`).
+    /// Create, replace or delete dashboards.
     DashboardWrite,
-    /// Read host status and effective configuration (`status:read`).
+    /// Read host status and effective configuration.
     HostStatus,
-    /// Read host logs (`logs:read`).
+    /// Read host logs.
     HostLogs,
-    /// Read the audit ledger (`audit:read`).
+    /// Read the audit ledger.
     HostAudit,
-    /// Mint and list tokens over the API. The owner's alone; no scope
-    /// or role grants it.
-    TokenManage,
-    /// Manage authorization policy. No scope grants it.
-    PolicyManage,
-    /// Call a plugin service through a delegated hop
-    /// (`services:call`). Checked for the root of every hop
-    /// ([`authorize_hop`]), on top of the calling plugin's
-    /// `consumes_services` grant.
+    /// Call a plugin service through a delegated hop. Checked for the
+    /// root of every hop ([`authorize_hop`]), on top of the calling
+    /// plugin's `consumes_services` grant.
     ServiceCall,
-    /// Read another plugin's device state. Plugin principals are
-    /// authorized by `reads_state`; no scope grants it.
-    StateRead,
+    /// Mint and list tokens. The owner's alone.
+    TokenManage,
+    /// Manage roles, device categories and plugin grants. The owner's
+    /// alone.
+    PolicyManage,
 }
 
 impl Action {
     /// Every action, for exhaustive tests and listings.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 21] = [
         Action::DeviceList,
         Action::DeviceRead,
         Action::DeviceCommand,
@@ -181,10 +120,9 @@ impl Action {
         Action::HostStatus,
         Action::HostLogs,
         Action::HostAudit,
+        Action::ServiceCall,
         Action::TokenManage,
         Action::PolicyManage,
-        Action::ServiceCall,
-        Action::StateRead,
     ];
 
     /// Stable `kind.verb` name.
@@ -209,43 +147,15 @@ impl Action {
             Action::HostStatus => "host.status",
             Action::HostLogs => "host.logs",
             Action::HostAudit => "host.audit",
+            Action::ServiceCall => "service.call",
             Action::TokenManage => "token.manage",
             Action::PolicyManage => "policy.manage",
-            Action::ServiceCall => "service.call",
-            Action::StateRead => "state.read",
         }
     }
 
     /// This action's bit in an [`crate::auth::ActionSet`].
     pub(crate) const fn bit(self) -> u32 {
         1 << (self as u32)
-    }
-
-    /// The token scope that grants this action, if any.
-    #[must_use]
-    pub(crate) fn legacy_scope(self) -> Option<Scope> {
-        Some(match self {
-            Action::DeviceList => scopes::DEVICES_LIST,
-            Action::DeviceRead => scopes::DEVICES_READ,
-            Action::DeviceCommand => scopes::DEVICES_COMMAND,
-            Action::EventSubscribe => scopes::EVENTS_TAIL,
-            Action::EventRead => scopes::EVENTS_READ,
-            Action::BlobRead => scopes::BLOBS_READ,
-            Action::InstanceRead => scopes::INSTANCES_LIST,
-            Action::InstanceStart => scopes::PLUGINS_START,
-            Action::InstanceStop => scopes::PLUGINS_STOP,
-            Action::PluginRead => scopes::PLUGINS_LIST,
-            Action::PluginInstall => scopes::PLUGINS_INSTALL,
-            Action::PluginUninstall => scopes::PLUGINS_UNINSTALL,
-            Action::PluginUi => scopes::PLUGINS_UI,
-            Action::DashboardRead => scopes::DASHBOARDS_READ,
-            Action::DashboardWrite => scopes::DASHBOARDS_WRITE,
-            Action::HostStatus => scopes::STATUS_READ,
-            Action::HostLogs => scopes::LOGS_READ,
-            Action::HostAudit => scopes::AUDIT_READ,
-            Action::ServiceCall => scopes::SERVICES_CALL,
-            Action::TokenManage | Action::PolicyManage | Action::StateRead => return None,
-        })
     }
 }
 
@@ -280,17 +190,13 @@ pub enum Resource {
     /// install before its manifest is read.
     Host,
     /// Every resource of one kind: list endpoints and streams that
-    /// release every item, and reads not checked per target. Never
-    /// narrowed by a per-target constraint. A role grant narrowed to
-    /// device categories never covers it, and a deny with a selector
-    /// covers it when the kind can hold a denied device (devices,
-    /// events, blobs).
+    /// release every item, and reads not checked per target. A role
+    /// grant narrowed to categories or devices never covers it.
     Collection(ResourceKind),
     /// A pre-check made before the target is known, which a
     /// per-target check (or a per-item filter) always follows: may the
-    /// root do this to *some* resource of this kind? The scope check
-    /// alone, like [`Self::Collection`]; a category-narrowed role grant
-    /// covers it and a selector deny never does, since the per-target
+    /// root do this to *some* resource of this kind? A narrowed role
+    /// grant covers it for devices and blobs, since the per-target
     /// check decides.
     PreCheck(ResourceKind),
     /// One device.
@@ -556,55 +462,24 @@ impl DashboardResource {
     }
 }
 
-/// The resolved authority of an invocation's root principal: the token
-/// id plus its scopes and 14.4 constraints, as verified by the bearer
-/// middleware (or the ambient grant of a local-process transport).
-/// Host-only: never serialized, never in an audit row, never visible to
-/// a plugin.
+/// The resolved authority of an invocation's root principal: the
+/// verified token's owner flag and roles (or the roles a local-process
+/// transport runs with). Host-only: never serialized, never in an audit
+/// row, never visible to a plugin.
 ///
-/// Host-origin work (`init`, `tick`, `on-event`) has an empty
-/// authority: plugins are authorized by their manifest grants, not
-/// scopes.
+/// Host-origin work (`init`, `tick`, `on-event`) has no authority:
+/// plugins are authorized by their manifest grants.
 #[derive(Debug, Clone, Default)]
 pub struct Authority {
-    source: Source,
-}
-
-/// Where the policy lives. A token authority shares the verified
-/// [`Actor`]'s `Arc` instead of copying its scopes and constraints, so
-/// building a principal per request or per MCP read is a refcount bump.
-#[derive(Debug, Clone)]
-enum Source {
-    Owned(Arc<AuthorityInner>),
-    Actor { actor: Actor, token: bool },
-}
-
-impl Default for Source {
-    fn default() -> Self {
-        Self::Owned(Arc::default())
-    }
-}
-
-#[derive(Debug, Default)]
-struct AuthorityInner {
-    token_id: Option<String>,
-    scopes: Vec<String>,
-    constraints: HashMap<String, ToolConstraint>,
-    sensitive: Vec<SensitiveGrant>,
-    owner: bool,
-    roles: Vec<Arc<RoleDef>>,
-    deny: Vec<DenyRule>,
+    actor: Option<Actor>,
+    token: bool,
 }
 
 impl PartialEq for Authority {
     fn eq(&self, other: &Self) -> bool {
         self.token_id() == other.token_id()
-            && self.scopes() == other.scopes()
-            && self.constraints() == other.constraints()
-            && self.sensitive_grants() == other.sensitive_grants()
-            && self.owner_flag() == other.owner_flag()
+            && self.is_owner() == other.is_owner()
             && self.roles() == other.roles()
-            && self.deny_rules() == other.deny_rules()
     }
 }
 
@@ -617,193 +492,65 @@ impl Authority {
         Self::default()
     }
 
-    /// The authority a verified token carries. `token_id` is the
-    /// credential id (`None` for a local-process grant).
-    #[must_use]
-    pub fn new(
-        token_id: Option<String>,
-        scopes: Vec<String>,
-        constraints: HashMap<String, ToolConstraint>,
-    ) -> Self {
-        Self {
-            source: Source::Owned(Arc::new(AuthorityInner {
-                token_id,
-                scopes,
-                constraints,
-                sensitive: Vec::new(),
-                owner: false,
-                roles: Vec::new(),
-                deny: Vec::new(),
-            })),
-        }
-    }
-
-    /// The authority of a bearer-token [`Actor`]: its id as the token
-    /// id, its scopes and its constraints.
+    /// The authority of a bearer-token [`Actor`]. Shares the actor's
+    /// `Arc`, so building one per request is a refcount bump.
     #[must_use]
     pub fn of_token(actor: &Actor) -> Self {
         Self {
-            source: Source::Actor {
-                actor: actor.clone(),
-                token: true,
-            },
+            actor: Some(actor.clone()),
+            token: true,
         }
     }
 
     /// The authority of an actor authorized by the local process
-    /// boundary rather than a credential (MCP stdio): its scopes and
-    /// constraints, no token id.
+    /// boundary rather than a credential (MCP stdio): its roles, no
+    /// token id, never the owner.
     #[must_use]
     pub fn of_local_process(actor: &Actor) -> Self {
         Self {
-            source: Source::Actor {
-                actor: actor.clone(),
-                token: false,
-            },
+            actor: Some(actor.clone()),
+            token: false,
         }
     }
 
     /// Token that carries this authority, if any.
     #[must_use]
     pub fn token_id(&self) -> Option<&str> {
-        match &self.source {
-            Source::Owned(inner) => inner.token_id.as_deref(),
-            Source::Actor { actor, token } => token.then(|| actor.id()),
-        }
+        self.actor.as_ref().filter(|_| self.token).map(Actor::id)
     }
 
-    /// Resolved scope list.
-    #[must_use]
-    pub fn scopes(&self) -> &[String] {
-        match &self.source {
-            Source::Owned(inner) => &inner.scopes,
-            Source::Actor { actor, .. } => actor.scopes(),
-        }
-    }
-
-    /// The 14.4 constraint for `key` (a tool name), if the token
-    /// carries one.
-    #[must_use]
-    pub fn constraint(&self, key: &str) -> Option<&ToolConstraint> {
-        self.constraints().get(key)
-    }
-
-    fn constraints(&self) -> &HashMap<String, ToolConstraint> {
-        match &self.source {
-            Source::Owned(inner) => &inner.constraints,
-            Source::Actor { actor, .. } => actor.constraints(),
-        }
-    }
-
-    /// Explicit sensitive-category grants (H6 slice 2).
-    #[must_use]
-    pub fn sensitive_grants(&self) -> &[SensitiveGrant] {
-        match &self.source {
-            Source::Owned(inner) => &inner.sensitive,
-            Source::Actor { actor, .. } => actor.sensitive_grants(),
-        }
-    }
-
-    /// Resolved owner-defined roles (H6 slice 3).
+    /// The roles the principal holds.
     #[must_use]
     pub fn roles(&self) -> &[Arc<RoleDef>] {
-        match &self.source {
-            Source::Owned(inner) => &inner.roles,
-            Source::Actor { actor, .. } => actor.roles(),
-        }
-    }
-
-    /// The token's own deny list (H6 slice 3); role denies are not
-    /// included.
-    #[must_use]
-    pub fn deny_rules(&self) -> &[DenyRule] {
-        match &self.source {
-            Source::Owned(inner) => &inner.deny,
-            Source::Actor { actor, .. } => actor.deny_rules(),
-        }
-    }
-
-    fn owner_flag(&self) -> bool {
-        match &self.source {
-            Source::Owned(inner) => inner.owner,
-            // A local-process grant is never the owner, whatever the
-            // actor says: the owner is a token the host minted.
-            Source::Actor { actor, token } => *token && actor.is_owner(),
-        }
+        self.actor.as_ref().map_or(&[], Actor::roles)
     }
 
     /// `true` for the owner token: the token the host recorded as the
-    /// bootstrap or `recover-admin-token` admin (`auth_token.owner`),
-    /// still holding the wildcard scope. The owner holds every
-    /// sensitive category. A token's label is not proof, and no
-    /// caller input can set this.
+    /// bootstrap or `recover-admin-token` admin (`auth_token.owner`).
+    /// A local-process grant is never the owner, and no caller input
+    /// can set this.
     #[must_use]
     pub fn is_owner(&self) -> bool {
-        self.owner_flag() && self.scopes().iter().any(|s| s == scopes::WILDCARD)
+        self.token && self.actor.as_ref().is_some_and(Actor::is_owner)
     }
 }
 
-/// Why a decision came out the way it did. Not `Copy`: later slices
-/// add reasons that carry owned data (the deny entry that matched).
+/// Why a decision came out the way it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Reason {
-    /// Allowed: the token holds `scope` (or the wildcard) and no
-    /// constraint narrows it for this resource.
-    Scope {
-        /// Scope that granted the action.
-        scope: &'static str,
-    },
-    /// Allowed: a grant of the role named `role` covers the action on
-    /// this resource (H6 slice 3), and no constraint narrows it.
+    /// Allowed: a grant of the role named `role` covers the action.
     Role {
         /// Name of the role whose grant decided.
         role: String,
     },
-    /// Denied: an entry of the deny list matched (the token's own, or
-    /// one of the role named `role`).
-    Denied {
-        /// The role whose deny matched; `None` for the token's own.
-        role: Option<String>,
-    },
-    /// Denied: the token does not hold `scope`.
-    MissingScope {
-        /// Scope the action needs.
-        scope: &'static str,
-    },
-    /// Denied: the token holds the scope, but a 14.4 constraint does not
-    /// cover the resource.
-    Constraint {
-        /// Constraint key (a tool name, e.g. `device.send_command`).
-        key: &'static str,
-        /// Constraint field that refused (`devices`, `plugins`).
-        field: &'static str,
-        /// Audit sentinel, `constraint:<key>:<field>`.
-        sentinel: &'static str,
-    },
-    /// Denied: no scope grants this action.
-    NoPermit,
-    /// Allowed on a sensitive resource: the token holds `scope` (or a
-    /// role grant) and either an explicit grant for every sensitive
-    /// category the resource falls under, or is the owner.
-    Sensitive {
-        /// Scope that granted the action, or [`ROLE_LABEL`] when a
-        /// role grant did.
-        scope: &'static str,
-        /// The sensitive categories the resource falls under.
-        categories: SensitiveSet,
-        /// `true` when the owner token's standing grant decided.
-        owner: bool,
-    },
-    /// Denied: the token holds the scope, but no explicit grant covers
-    /// `category` on this resource. A wildcard scope never does.
-    MissingSensitive {
-        /// The first category without a grant.
-        category: SensitiveCategory,
-    },
-    /// Allowed: an owner-only host action (`policy.manage`,
-    /// `token.manage`).
+    /// Allowed: the owner token.
     Owner,
+    /// Denied: no grant covers `action` on this resource.
+    NoPermit {
+        /// The refused action.
+        action: Action,
+    },
     /// Allowed: a hop of host-rooted work, which the calling plugin's
     /// own manifest grant `grant` decides alone.
     PluginGrant {
@@ -818,87 +565,18 @@ pub enum Reason {
     },
 }
 
-/// Audit label for [`Reason::NoPermit`].
-pub const NO_PERMIT_LABEL: &str = "no-permit";
-
-/// Audit label for [`Reason::Denied`].
-pub const DENIED_LABEL: &str = "deny";
-
-/// What [`Reason::Sensitive`] names as the grant when a role decided.
-pub const ROLE_LABEL: &str = "role";
-
 impl Reason {
     /// The value a deny writes to the audit row's `required_scope`
-    /// column: the missing scope, the constraint sentinel, or
-    /// [`NO_PERMIT_LABEL`]. `None` for an allow.
+    /// column: the refused action's name, or the missing plugin
+    /// grant's. `None` for an allow.
     #[must_use]
     pub fn audit_label(&self) -> Option<&'static str> {
         match self {
-            Reason::Scope { .. }
-            | Reason::Role { .. }
-            | Reason::Sensitive { .. }
-            | Reason::Owner
-            | Reason::PluginGrant { .. } => None,
-            Reason::Denied { .. } => Some(DENIED_LABEL),
-            Reason::MissingScope { scope } => Some(*scope),
-            Reason::Constraint { sentinel, .. } => Some(*sentinel),
-            Reason::NoPermit => Some(NO_PERMIT_LABEL),
-            Reason::MissingSensitive { category } => Some(category.deny_label()),
-            Reason::MissingPluginGrant { grant } => Some(*grant),
+            Reason::Role { .. } | Reason::Owner | Reason::PluginGrant { .. } => None,
+            Reason::NoPermit { action } => Some(action.as_str()),
+            Reason::MissingPluginGrant { grant } => Some(grant),
         }
     }
-}
-
-/// Audit level an allowed action requires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AuditLevel {
-    /// The transport's ordinary per-request row.
-    #[default]
-    Info,
-    /// An extra row at `warn`, written before the action runs:
-    /// every allowed sensitive action.
-    Warn,
-}
-
-/// A rate limit an allowed action must pass, per principal and per
-/// sensitive category.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateLimit {
-    /// Allowed calls per window.
-    pub max: u32,
-    /// Window length.
-    pub per: Duration,
-}
-
-impl RateLimit {
-    /// The limit for one sensitive category: 10 commands per 10
-    /// minutes for locks, openers and alarms; 120 camera byte releases
-    /// per 10 minutes.
-    #[must_use]
-    pub const fn for_category(category: SensitiveCategory) -> Self {
-        Self {
-            max: if category.guards_commands() { 10 } else { 120 },
-            per: Duration::from_mins(10),
-        }
-    }
-}
-
-/// What the caller must do on top of an allow. A sensitive allow sets
-/// `audit_level` to [`AuditLevel::Warn`] and names its `sensitive`
-/// categories; a non-owner sensitive allow also carries a
-/// `rate_limit` (the owner is not rate limited). Confirmation is not
-/// produced yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Obligations {
-    /// How the allow is audited.
-    pub audit_level: AuditLevel,
-    /// Rate limit to apply, if any: each category in `sensitive` is
-    /// charged against its own [`RateLimit::for_category`] bucket.
-    pub rate_limit: Option<RateLimit>,
-    /// The sensitive categories this allow touched.
-    pub sensitive: SensitiveSet,
-    /// Whether the request must carry a fresh confirmation.
-    pub require_confirmation: bool,
 }
 
 /// The outcome of [`authorize`].
@@ -908,24 +586,25 @@ pub struct Decision {
     pub allow: bool,
     /// Why.
     pub reason: Reason,
-    /// Obligations on an allow; default on a deny.
-    pub obligations: Obligations,
+    /// On an allow, the sensitive categories the action touches; the
+    /// caller writes a `warn` audit row for them before it acts.
+    pub sensitive: SensitiveSet,
 }
 
 impl Decision {
-    fn allow(reason: Reason) -> Self {
-        Self {
-            allow: true,
-            reason,
-            obligations: Obligations::default(),
-        }
-    }
-
     fn deny(reason: Reason) -> Self {
         Self {
             allow: false,
             reason,
-            obligations: Obligations::default(),
+            sensitive: SensitiveSet::empty(),
+        }
+    }
+
+    fn allow(reason: Reason, sensitive: SensitiveSet) -> Self {
+        Self {
+            allow: true,
+            reason,
+            sensitive,
         }
     }
 
@@ -939,7 +618,7 @@ impl Decision {
         if self.allow {
             Ok(self)
         } else {
-            Err(self.reason.audit_label().unwrap_or(NO_PERMIT_LABEL))
+            Err(self.reason.audit_label().unwrap_or("no-permit"))
         }
     }
 }
@@ -954,29 +633,12 @@ pub fn authorize(ctx: &InvocationContext, action: Action, resource: &Resource) -
 /// Manifest grant name of a plugin's service-call permit.
 pub const CONSUMES_SERVICES_GRANT: &str = "consumes_services";
 
-/// Decide a delegated hop (H6 slice 4): `ctx` is the callee's
-/// context (the hop already on its chain), `plugin_permit` whether the
-/// calling plugin's own manifest grant (`plugin_grant`, e.g.
-/// [`CONSUMES_SERVICES_GRANT`]) covers the hop.
-///
-/// The rule is `permit(root) ∧ permit(calling plugin) ∧ no deny on the
-/// chain`:
-///
-/// - the calling plugin's grant is checked first, so a hop no grant
-///   covers is refused with [`Reason::MissingPluginGrant`] whoever the
-///   root is;
-/// - an external root must itself be allowed `action` on `resource` by
-///   [`authorize`] (its scopes, roles, constraints and sensitive
-///   grants), and its denies refuse the hop whatever the plugin may;
-/// - a host-rooted hop (`init`, `tick`, `on-event`) is the plugin's own
-///   work: its grant decides ([`Reason::PluginGrant`]).
-///
-/// Plugins carry no deny lists yet, so the chain's other principals
-/// add no denies; when they do, every plugin on `ctx.chain()`
-/// contributes its own.
-///
-/// An allow may carry [`Obligations`] (a sensitive target); the caller
-/// meets them when it dispatches, as for a direct request.
+/// Decide a delegated hop: `ctx` is the callee's context (the hop
+/// already on its chain), `plugin_permit` whether the calling plugin's
+/// own manifest grant (`plugin_grant`, e.g. [`CONSUMES_SERVICES_GRANT`])
+/// covers the hop. The plugin's grant is checked first; an external
+/// root must then itself be allowed `action` on `resource`, while a
+/// host-rooted hop is decided by the plugin's grant alone.
 #[must_use]
 pub fn authorize_hop(
     ctx: &InvocationContext,
@@ -993,248 +655,70 @@ pub fn authorize_hop(
     if ctx.root().is_external() {
         return authorize(ctx, action, resource);
     }
-    Decision::allow(Reason::PluginGrant {
-        grant: plugin_grant,
-    })
+    Decision::allow(
+        Reason::PluginGrant {
+            grant: plugin_grant,
+        },
+        SensitiveSet::empty(),
+    )
 }
 
 /// The evaluator behind [`authorize`], on an [`Authority`] directly.
 #[must_use]
 pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resource) -> Decision {
-    if let Some(reason) = denied_by(authority, action, resource) {
-        return Decision::deny(reason);
+    let sensitive = sensitive_requirement(action, resource);
+    if authority.is_owner() {
+        return Decision::allow(Reason::Owner, sensitive);
     }
-    let Some(scope) = action.legacy_scope() else {
-        // Owner-only host actions: no scope or role grants them, so a
-        // wildcard admin token can't either.
-        if matches!(action, Action::PolicyManage | Action::TokenManage) && authority.is_owner() {
-            return Decision::allow(Reason::Owner);
-        }
-        return Decision::deny(Reason::NoPermit);
-    };
-    let granted = if scope.satisfied_by(authority.scopes()) {
-        Reason::Scope {
-            scope: scope.name(),
-        }
-    } else if let Some(role) = authority
+    match authority
         .roles()
         .iter()
-        .find(|r| r.permits(action, resource))
+        .find(|r| r.permits(action, resource, sensitive))
     {
-        Reason::Role {
-            role: role.name.clone(),
-        }
-    } else if authority
-        .roles()
-        .iter()
-        .any(|r| r.actions().contains(action))
-    {
-        // A role grants the action, but not on this resource.
-        return Decision::deny(Reason::NoPermit);
-    } else {
-        return Decision::deny(Reason::MissingScope {
-            scope: scope.name(),
-        });
-    };
-    if let Some(rule) = constraint_rule(action, resource)
-        && let Some(cx) = authority.constraint(rule.key)
-        && !rule.allows(cx)
-    {
-        return Decision::deny(Reason::Constraint {
-            key: rule.key,
-            field: rule.field.as_str(),
-            sentinel: rule.sentinel,
-        });
-    }
-    let (categories, device_id) = sensitive_requirement(action, resource);
-    if categories.is_empty() {
-        return Decision::allow(granted);
-    }
-    let owner = authority.is_owner();
-    if !owner {
-        for category in categories.iter() {
-            let granted = authority
-                .sensitive_grants()
-                .iter()
-                .any(|g| g.covers(category, device_id))
-                || authority
-                    .roles()
-                    .iter()
-                    .any(|r| r.sensitive.contains(&category));
-            if !granted {
-                return Decision::deny(Reason::MissingSensitive { category });
-            }
-        }
-    }
-    let rate_limit = (!owner).then(|| {
-        categories
-            .iter()
-            .map(RateLimit::for_category)
-            .min_by_key(|r| r.max)
-            .unwrap_or(RateLimit::for_category(SensitiveCategory::Lock))
-    });
-    Decision {
-        allow: true,
-        reason: Reason::Sensitive {
-            scope: match granted {
-                Reason::Role { .. } => ROLE_LABEL,
-                _ => scope.name(),
+        Some(role) => Decision::allow(
+            Reason::Role {
+                role: role.name.clone(),
             },
-            categories,
-            owner,
-        },
-        obligations: Obligations {
-            audit_level: AuditLevel::Warn,
-            rate_limit,
-            sensitive: categories,
-            require_confirmation: false,
-        },
+            sensitive,
+        ),
+        None => Decision::deny(Reason::NoPermit { action }),
     }
 }
 
-/// [`Reason::Denied`] when a deny entry refuses `action` on `resource`:
-/// the token's own deny list first, then its roles'.
-fn denied_by(authority: &Authority, action: Action, resource: &Resource) -> Option<Reason> {
-    if authority
-        .deny_rules()
-        .iter()
-        .any(|d| d.matches(action, resource))
-    {
-        return Some(Reason::Denied { role: None });
-    }
-    authority
-        .roles()
-        .iter()
-        .find(|r| r.denies(action, resource))
-        .map(|r| Reason::Denied {
-            role: Some(r.name.clone()),
-        })
-}
-
-/// The sensitive categories `action` on `resource` needs a grant for,
-/// and the device the resource names (for device-narrowed grants).
-/// Commands on a lock, opener or alarm; `blob.read` on a camera's
-/// bytes or a camera instance's blob. Collection-level checks are
-/// never sensitive: they are pre-checks, and the per-target check
-/// that follows decides.
-fn sensitive_requirement(action: Action, resource: &Resource) -> (SensitiveSet, Option<&str>) {
+/// The sensitive categories `action` on `resource` touches: commands on
+/// a lock, opener or alarm; `blob.read` of a camera's bytes or a camera
+/// instance's blob. Collections and pre-checks never are: the
+/// per-target check that follows decides.
+fn sensitive_requirement(action: Action, resource: &Resource) -> SensitiveSet {
     match (action, resource) {
-        (Action::DeviceCommand, Resource::Device(d)) => (
-            d.class
-                .sensitive()
-                .iter()
-                .filter(|c| c.guards_commands())
-                .collect(),
-            Some(d.id.as_str()),
-        ),
-        (Action::BlobRead, Resource::Device(d)) if d.class.is_camera() => (
-            [SensitiveCategory::Camera].into_iter().collect(),
-            Some(d.id.as_str()),
-        ),
-        (Action::BlobRead, Resource::Blob(b)) if b.camera => {
-            ([SensitiveCategory::Camera].into_iter().collect(), None)
+        (Action::DeviceCommand, Resource::Device(d)) => d
+            .class()
+            .sensitive()
+            .iter()
+            .filter(|c| c.guards_commands())
+            .collect(),
+        (Action::BlobRead, Resource::Device(d)) if d.class().is_camera() => {
+            [SensitiveCategory::Camera].into_iter().collect()
         }
-        _ => (SensitiveSet::empty(), None),
+        (Action::BlobRead, Resource::Blob(b)) if b.is_camera() => {
+            [SensitiveCategory::Camera].into_iter().collect()
+        }
+        _ => SensitiveSet::empty(),
     }
 }
-
-/// Which [`ToolConstraint`] field a rule consults.
-#[derive(Debug, Clone, Copy)]
-enum ConstraintField {
-    Devices,
-    Plugins,
-}
-
-impl ConstraintField {
-    const fn as_str(self) -> &'static str {
-        match self {
-            ConstraintField::Devices => "devices",
-            ConstraintField::Plugins => "plugins",
-        }
-    }
-}
-
-/// One 14.4 constraint that narrows an (action, resource) pair.
-struct ConstraintRule<'r> {
-    key: &'static str,
-    field: ConstraintField,
-    sentinel: &'static str,
-    target: &'r str,
-}
-
-impl ConstraintRule<'_> {
-    fn allows(&self, cx: &ToolConstraint) -> bool {
-        match self.field {
-            ConstraintField::Devices => cx.allows_device(self.target),
-            ConstraintField::Plugins => cx.allows_plugin(self.target),
-        }
-    }
-}
-
-/// `required_scope` sentinels for the `plugins.*` constraints,
-/// `constraint:<key>:plugins`.
-pub const PLUGINS_SHOW_DENIED_SENTINEL: &str = "constraint:plugins.show:plugins";
-/// See [`PLUGINS_SHOW_DENIED_SENTINEL`].
-pub const PLUGINS_STOP_DENIED_SENTINEL: &str = "constraint:plugins.stop:plugins";
-/// See [`PLUGINS_SHOW_DENIED_SENTINEL`].
-pub const PLUGINS_UNINSTALL_DENIED_SENTINEL: &str = "constraint:plugins.uninstall:plugins";
-/// See [`PLUGINS_SHOW_DENIED_SENTINEL`].
-pub const PLUGINS_START_DENIED_SENTINEL: &str = "constraint:plugins.start:plugins";
-/// See [`PLUGINS_SHOW_DENIED_SENTINEL`].
-pub const PLUGINS_INSTALL_DENIED_SENTINEL: &str = "constraint:plugins.install:plugins";
-
-/// The 14.4 constraint table. A constraint applies only to a resource
-/// that names its target; the key names the tool whose argument the
-/// constraint was written against.
-fn constraint_rule(action: Action, resource: &Resource) -> Option<ConstraintRule<'_>> {
-    let plugins = |key, sentinel, target| {
-        Some(ConstraintRule {
-            key,
-            field: ConstraintField::Plugins,
-            sentinel,
-            target,
-        })
-    };
-    match (action, resource) {
-        (Action::DeviceCommand, Resource::Device(d)) => Some(ConstraintRule {
-            key: DEVICE_COMMAND_ENFORCED.key,
-            field: ConstraintField::Devices,
-            sentinel: DEVICE_COMMAND_DENIED_SENTINEL,
-            target: &d.id,
-        }),
-        (Action::PluginRead, Resource::Plugin(p)) => {
-            plugins("plugins.show", PLUGINS_SHOW_DENIED_SENTINEL, &p.plugin_id)
-        }
-        (Action::InstanceStop, Resource::Instance(i)) => {
-            plugins("plugins.stop", PLUGINS_STOP_DENIED_SENTINEL, &i.plugin_id)
-        }
-        (Action::InstanceStart, Resource::Instance(i)) => {
-            plugins("plugins.start", PLUGINS_START_DENIED_SENTINEL, &i.plugin_id)
-        }
-        (Action::PluginUninstall, Resource::Plugin(p)) => plugins(
-            "plugins.uninstall",
-            PLUGINS_UNINSTALL_DENIED_SENTINEL,
-            &p.plugin_id,
-        ),
-        (Action::PluginInstall, Resource::Plugin(p)) => plugins(
-            "plugins.install",
-            PLUGINS_INSTALL_DENIED_SENTINEL,
-            &p.plugin_id,
-        ),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-mod scenarios;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{ActorKind, Principal, Transport};
+    use crate::auth::role::builtin;
+    use crate::auth::{ActorKind, DeviceCategory, Principal, Transport};
 
     fn ctx_for(actor: &Actor) -> InvocationContext {
         InvocationContext::external(Principal::token(ActorKind::Api, actor, Transport::Rest))
+    }
+
+    fn role(json: &str) -> Arc<RoleDef> {
+        Arc::new(RoleDef::parse("r", json.as_bytes()).expect("role parses"))
     }
 
     #[test]
@@ -1243,6 +727,7 @@ mod tests {
         for a in Action::ALL {
             assert!(seen.insert(a.as_str()), "duplicate {}", a.as_str());
             assert!(a.as_str().contains('.'), "{} is not kind.verb", a.as_str());
+            assert_eq!(a.as_str().parse::<Action>(), Ok(a));
         }
     }
 
@@ -1255,229 +740,110 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_actions_are_refused_even_for_wildcard() {
-        let ctx = ctx_for(&Actor::api("admin", vec!["*".into()]));
-        for a in [Action::TokenManage, Action::PolicyManage, Action::StateRead] {
-            let d = authorize(&ctx, a, &Resource::Host);
+    fn only_the_owner_manages_tokens_and_policy() {
+        let admin = ctx_for(&Actor::api("tok-a", vec![builtin("admin").unwrap()]));
+        let owner = ctx_for(&Actor::token("tok-o", true, Vec::new()));
+        for a in [Action::TokenManage, Action::PolicyManage] {
+            let d = authorize(&admin, a, &Resource::Host);
             assert!(!d.allow);
-            assert_eq!(d.reason, Reason::NoPermit);
-            assert_eq!(d.reason.audit_label(), Some(NO_PERMIT_LABEL));
+            assert_eq!(d.reason.audit_label(), Some(a.as_str()));
+            assert_eq!(authorize(&owner, a, &Resource::Host).reason, Reason::Owner);
         }
     }
 
-    fn bouncer() -> Resource {
-        Resource::service("example.bouncer", "alpha", "bouncer", "kick")
+    #[test]
+    fn a_role_grant_decides_and_a_missing_one_names_the_action() {
+        let ctx = ctx_for(&Actor::api(
+            "tok",
+            vec![role(r#"[{"actions":["host.logs"]}]"#)],
+        ));
+        assert_eq!(
+            authorize(&ctx, Action::HostLogs, &Resource::Host).reason,
+            Reason::Role { role: "r".into() }
+        );
+        assert_eq!(
+            authorize(&ctx, Action::HostAudit, &Resource::Host).into_result(),
+            Err("host.audit")
+        );
     }
 
-    /// H6 slice 4: a hop needs the plugin's grant and, for an external
-    /// root, the root's own `service.call`; host-rooted work is the
-    /// plugin's alone.
     #[test]
-    fn hops_need_the_plugin_grant_and_the_roots_permit() {
-        let hop = |ctx: &InvocationContext, plugin: bool| {
-            authorize_hop(
-                ctx,
-                Action::ServiceCall,
-                &bouncer(),
-                CONSUMES_SERVICES_GRANT,
-                plugin,
-            )
-        };
-        let host = InvocationContext::host_origin("alpha");
-        let d = hop(&host, true);
+    fn sensitive_allows_carry_their_categories() {
+        let lock = Resource::device("dev-a1", DeviceClass::of(DeviceCategory::Lock));
+        let ctx = ctx_for(&Actor::api("tok", vec![builtin("member").unwrap()]));
+        let d = authorize(&ctx, Action::DeviceCommand, &lock);
         assert!(d.allow);
-        assert_eq!(
-            d.reason,
-            Reason::PluginGrant {
-                grant: CONSUMES_SERVICES_GRANT
-            }
-        );
-        let reaction = InvocationContext::reacting_to("alpha", "call-x");
-        assert!(hop(&reaction, true).allow);
-        let d = hop(&host, false);
-        assert_eq!(d.reason.audit_label(), Some(CONSUMES_SERVICES_GRANT));
-
-        let narrow = ctx_for(&Actor::api("t", vec!["devices:command".into()]));
-        let d = hop(&narrow, true);
-        assert!(!d.allow);
-        assert_eq!(d.reason.audit_label(), Some("services:call"));
-        // The plugin's grant is asked first, whoever the root is.
-        let admin = ctx_for(&Actor::api("t", vec!["*".into()]));
-        assert_eq!(
-            hop(&admin, false).reason.audit_label(),
-            Some(CONSUMES_SERVICES_GRANT)
-        );
-        let d = hop(&admin, true);
-        assert!(d.allow);
-        assert_eq!(d.obligations, Obligations::default());
-        let scoped = ctx_for(&Actor::api("t", vec!["services:call".into()]));
-        assert!(hop(&scoped, true).allow);
-    }
-
-    /// A role's `services` selector narrows the delegation grant; a
-    /// deny refuses the hop whatever grants it.
-    #[test]
-    fn role_service_selectors_and_denies_decide_hops() {
-        use crate::auth::{ActionSet, DenyRule, RoleDef, RoleGrant};
-        let grant = |services: &[&str]| RoleGrant {
-            actions: ActionSet::of(&[Action::ServiceCall]),
-            categories: None,
-            devices: None,
-            services: Some(services.iter().map(|s| (*s).to_owned()).collect()),
-        };
-        let role = |grants, deny| {
-            Arc::new(RoleDef {
-                id: "role-0123456789abcdef".into(),
-                name: "scene".into(),
-                grants,
-                sensitive: Vec::new(),
-                deny,
-            })
-        };
-        let with = |r| ctx_for(&Actor::api("t", Vec::new()).with_roles(vec![r]));
-        for (pattern, allowed) in [
-            ("example.bouncer", true),
-            ("example.*", true),
-            ("*", true),
-            ("example.bouncer/bouncer", true),
-            ("example.bouncer/bou*", true),
-            ("example.bouncer/other", false),
-            ("acme.*", false),
-        ] {
-            let ctx = with(role(vec![grant(&[pattern])], Vec::new()));
-            let d = authorize(&ctx, Action::ServiceCall, &bouncer());
-            assert_eq!(d.allow, allowed, "{pattern}");
-            if !allowed {
-                assert_eq!(d.reason, Reason::NoPermit, "{pattern}");
-            }
-        }
-        // A `services` grant covers nothing else.
-        let ctx = with(role(vec![grant(&["*"])], Vec::new()));
-        assert!(!authorize(&ctx, Action::ServiceCall, &Resource::Host).allow);
-        assert!(!authorize(&ctx, Action::DeviceRead, &Resource::devices()).allow);
-
-        let deny = |services: Option<Vec<String>>| DenyRule {
-            actions: ActionSet::of(&[Action::ServiceCall]),
-            categories: None,
-            devices: None,
-            services,
-        };
-        let policy = crate::auth::TokenPolicy {
-            scopes: vec!["*".into()],
-            deny: vec![deny(Some(vec!["example.bouncer/bouncer".into()]))],
-            ..crate::auth::TokenPolicy::default()
-        };
-        let ctx = ctx_for(&Actor::from_token_policy("t", policy, false));
-        let d = authorize(&ctx, Action::ServiceCall, &bouncer());
-        assert_eq!(d.reason, Reason::Denied { role: None });
-        let other = Resource::service("acme.notify", "n", "notify", "send");
-        assert!(authorize(&ctx, Action::ServiceCall, &other).allow);
-        // A role deny without a selector refuses every service; with a
-        // device selector it refuses none (services carry no
-        // category).
-        let ctx = ctx_for(
-            &Actor::api("t", vec!["*".into()]).with_roles(vec![role(Vec::new(), vec![deny(None)])]),
-        );
-        assert_eq!(
-            authorize(&ctx, Action::ServiceCall, &other).reason,
-            Reason::Denied {
-                role: Some("scene".into())
-            }
-        );
-        let by_category = DenyRule {
-            categories: Some(vec![crate::auth::DeviceCategory::Lock]),
-            ..deny(None)
-        };
-        let ctx = ctx_for(
-            &Actor::api("t", vec!["*".into()])
-                .with_roles(vec![role(Vec::new(), vec![by_category])]),
-        );
-        assert!(authorize(&ctx, Action::ServiceCall, &other).allow);
-    }
-
-    #[test]
-    fn allow_carries_scope_and_info_audit() {
-        let ctx = ctx_for(&Actor::api("t", vec!["devices:list".into()]));
-        let d = authorize(&ctx, Action::DeviceList, &Resource::devices());
-        assert!(d.allow);
-        assert_eq!(
-            d.reason,
-            Reason::Scope {
-                scope: "devices:list"
-            }
-        );
-        assert_eq!(d.reason.audit_label(), None);
-        assert_eq!(d.obligations, Obligations::default());
-        assert_eq!(d.obligations.audit_level, AuditLevel::Info);
-        assert!(d.obligations.rate_limit.is_none());
-        assert!(!d.obligations.require_confirmation);
-        assert!(d.into_result().is_ok());
-    }
-
-    #[test]
-    fn constraint_deny_names_key_field_and_sentinel() {
-        let mut constraints = HashMap::new();
-        constraints.insert(
-            "plugins.stop".to_string(),
-            ToolConstraint {
-                devices: None,
-                plugins: Some(vec!["acme.*".into()]),
-            },
-        );
-        let actor = Actor::api_with_policy("t", vec!["*".into()], constraints);
-        let ctx = ctx_for(&actor);
-        let d = authorize(
-            &ctx,
-            Action::InstanceStop,
-            &Resource::instance("other.p", None),
-        );
-        assert_eq!(
-            d.reason,
-            Reason::Constraint {
-                key: "plugins.stop",
-                field: "plugins",
-                sentinel: PLUGINS_STOP_DENIED_SENTINEL,
-            }
-        );
-        assert_eq!(d.into_result(), Err(PLUGINS_STOP_DENIED_SENTINEL));
-        // Collection-level pre-check is the flat scope alone.
-        assert!(authorize(&ctx, Action::InstanceStop, &Resource::instances()).allow);
+        assert!(d.sensitive.contains(SensitiveCategory::Lock));
+        let guest = ctx_for(&Actor::api("tok", vec![builtin("guest").unwrap()]));
+        assert!(!authorize(&guest, Action::DeviceCommand, &lock).allow);
+        assert!(authorize(&guest, Action::DeviceRead, &lock).allow);
+        let owner = ctx_for(&Actor::token("tok-o", true, Vec::new()));
         assert!(
-            authorize(
-                &ctx,
-                Action::InstanceStop,
-                &Resource::instance("acme.lamp", Some("lamp".into())),
+            !authorize(&owner, Action::DeviceCommand, &lock)
+                .sensitive
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_local_process_authority_is_never_the_owner() {
+        let actor = Actor::token("stdio", true, Vec::new());
+        let ctx = InvocationContext::external(
+            Principal::local_process(ActorKind::Mcp, "stdio", Transport::McpStdio)
+                .with_authority(Authority::of_local_process(&actor)),
+        );
+        assert!(!authorize(&ctx, Action::HostStatus, &Resource::Host).allow);
+    }
+
+    #[test]
+    fn hops_need_the_plugin_grant_and_an_external_roots_permit() {
+        let svc = Resource::service("acme.notify", "n", "notify", "send");
+        let host = InvocationContext::host_origin("alpha");
+        assert!(
+            authorize_hop(
+                &host,
+                Action::ServiceCall,
+                &svc,
+                CONSUMES_SERVICES_GRANT,
+                true
             )
             .allow
         );
-    }
-
-    #[test]
-    fn authority_travels_with_derived_contexts() {
-        let actor = Actor::api("tok-a", vec!["devices:read".into()]);
-        let ctx = ctx_for(&actor).entering("alpha");
-        assert_eq!(ctx.root().authority().token_id(), Some("tok-a"));
-        assert_eq!(
-            ctx.root().authority().scopes(),
-            &["devices:read".to_string()]
+        assert!(
+            !authorize_hop(
+                &host,
+                Action::ServiceCall,
+                &svc,
+                CONSUMES_SERVICES_GRANT,
+                false
+            )
+            .allow
         );
-        assert!(authorize(&ctx, Action::DeviceRead, &Resource::devices()).allow);
-    }
-
-    #[test]
-    fn local_process_authority_has_no_token_id() {
-        let actor = Actor::api("mcp-stdio-parent-process", vec!["*".into()]);
-        let p = Principal::local_process(ActorKind::Mcp, actor.id(), Transport::McpStdio)
-            .with_authority(Authority::of_local_process(&actor));
-        let ctx = InvocationContext::external(p);
-        assert_eq!(ctx.root().authority().token_id(), None);
-        assert!(authorize(&ctx, Action::PluginInstall, &Resource::Host).allow);
-        // Without the authority a local-process principal holds nothing.
-        let bare = InvocationContext::external(Principal::local_process(
-            ActorKind::Mcp,
-            "x",
-            Transport::McpStdio,
+        let narrow = ctx_for(&Actor::api(
+            "tok",
+            vec![role(r#"[{"actions":["device.command"]}]"#)],
         ));
-        assert!(!authorize(&bare, Action::DeviceList, &Resource::devices()).allow);
+        assert_eq!(
+            authorize_hop(
+                &narrow,
+                Action::ServiceCall,
+                &svc,
+                CONSUMES_SERVICES_GRANT,
+                true
+            )
+            .into_result(),
+            Err("service.call")
+        );
+        let guest = ctx_for(&Actor::api("tok", vec![builtin("guest").unwrap()]));
+        assert!(
+            authorize_hop(
+                &guest,
+                Action::ServiceCall,
+                &svc,
+                CONSUMES_SERVICES_GRANT,
+                true
+            )
+            .allow
+        );
     }
 }

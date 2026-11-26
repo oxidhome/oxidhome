@@ -9,9 +9,12 @@
 //!
 //! Rotation and revocation are offline CLI operations. Tokens are
 //! minted by the first-run bootstrap, `recover-admin-token`, the
-//! offline `oxidhome token create`, and (H6 slice 3) the owner token's
+//! offline `oxidhome token create`, and the owner token's
 //! `POST /api/v1/tokens` / Connect `CreateToken`, all through
 //! `crate::api::token_admin`. The API otherwise only verifies.
+//!
+//! A token holds roles by name (`roles`, a JSON array) and an owner
+//! flag; nothing else.
 //!
 //! ## Wire shape
 //!
@@ -68,15 +71,13 @@ pub enum TokenError {
 pub struct TokenRecord {
     pub id: String,
     pub label: String,
-    /// Scope policy bytes verbatim. The auth layer parses this on
-    /// each verify; if parse fails the token is treated as deny-all
-    /// rather than panicked on (the store doesn't enforce shape on
-    /// insert beyond "valid UTF-8 JSON").
-    pub scope_json: Vec<u8>,
+    /// Names of the roles the token holds. A stored value that
+    /// doesn't parse reads as none (deny-all).
+    pub roles: Vec<String>,
     pub created_ms: i64,
     pub last_used_ms: Option<i64>,
     pub revoked_ms: Option<i64>,
-    /// H6 slice 2: `true` for the owner token, the one the host minted
+    /// `true` for the owner token, the one the host minted
     /// at first-run bootstrap or with `recover-admin-token`. Set only
     /// by those two code paths; never from a label or an API call.
     pub owner: bool,
@@ -122,10 +123,15 @@ impl TokenStore {
         }
     }
 
-    /// Mint a fresh token with `label` and the given `scope_json`
-    /// blob. Returns the id + plaintext (the only copy — caller
-    /// must surface it to the operator immediately).
-    pub fn create(&self, label: &str, scope_json: &[u8]) -> Result<IssuedToken, TokenError> {
+    /// Mint a fresh token with `label` holding `roles` (not checked
+    /// against the stored roles; see [`Self::insert_with_roles`]).
+    /// Returns the id + plaintext (the only copy — caller must surface
+    /// it to the operator immediately).
+    pub fn create(
+        &self,
+        label: &str,
+        roles: &[impl AsRef<str>],
+    ) -> Result<IssuedToken, TokenError> {
         let secret = generate_secret();
         let plaintext = format_token(&secret);
         let hash = sha256(&secret);
@@ -133,15 +139,15 @@ impl TokenStore {
         let now = now_ms();
 
         let label_owned = label.to_string();
-        let scope_owned = scope_json.to_vec();
+        let roles_owned = roles_json(roles);
         let id_for_db = id.clone();
         let hash_for_db = hash.to_vec();
         self.db.write(move |conn| -> Result<(), TokenError> {
             conn.execute(
                 "INSERT INTO auth_token \
-                   (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms) \
+                   (id, label, hash, roles, created_ms, last_used_ms, revoked_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
-                params![id_for_db, label_owned, hash_for_db, scope_owned, now],
+                params![id_for_db, label_owned, hash_for_db, roles_owned, now],
             )?;
             Ok(())
         })?;
@@ -157,7 +163,7 @@ impl TokenStore {
             .db
             .read(move |conn| -> Result<Option<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
+                    "SELECT id, label, roles, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE id = ?1",
                 )?;
                 let row = stmt
@@ -180,7 +186,7 @@ impl TokenStore {
             .db
             .read(|conn| -> Result<Vec<TokenRecord>, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
+                    "SELECT id, label, roles, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token ORDER BY created_ms ASC",
                 )?;
                 let iter = stmt.query_map([], row_to_record)?;
@@ -235,7 +241,7 @@ impl TokenStore {
         self.db
             .read(move |conn| -> Result<TokenRecord, TokenError> {
                 let mut stmt = conn.prepare(
-                    "SELECT id, label, scope_json, created_ms, last_used_ms, revoked_ms, owner \
+                    "SELECT id, label, roles, created_ms, last_used_ms, revoked_ms, owner \
                  FROM auth_token WHERE hash = ?1",
                 )?;
                 let row = stmt
@@ -361,10 +367,10 @@ impl TokenStore {
     pub fn create_if_empty(
         &self,
         label: &str,
-        scope_json: &[u8],
+        roles: &[impl AsRef<str>],
     ) -> Result<Option<IssuedToken>, TokenError> {
         let issued = Self::generate();
-        Ok(if self.insert_first(&issued, label, scope_json, false)? {
+        Ok(if self.insert_first(&issued, label, roles, false)? {
             Some(issued)
         } else {
             None
@@ -388,8 +394,8 @@ impl TokenStore {
     }
 
     /// Insert a token produced by [`Self::generate`] **as the owner**
-    /// (when `scope_json` is the minted `["*"]`) iff the table is
-    /// empty — the first-run bootstrap — inside one `BEGIN IMMEDIATE` transaction (see
+    /// iff the table is empty — the first-run bootstrap — inside one
+    /// `BEGIN IMMEDIATE` transaction (see
     /// [`Self::create_if_empty`] for the race argument). Returns
     /// `true` if the row was inserted.
     ///
@@ -401,19 +407,18 @@ impl TokenStore {
         &self,
         issued: &IssuedToken,
         label: &str,
-        scope_json: &[u8],
     ) -> Result<bool, TokenError> {
-        self.insert_first(issued, label, scope_json, true)
+        self.insert_first(issued, label, &[] as &[&str], true)
     }
 
     fn insert_first(
         &self,
         issued: &IssuedToken,
         label: &str,
-        scope_json: &[u8],
+        roles: &[impl AsRef<str>],
         owner: bool,
     ) -> Result<bool, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json, owner)?;
+        let row = PendingRow::new(issued, label, roles, owner)?;
         self.durable_write(move |conn| -> Result<bool, TokenError> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing: i64 =
@@ -432,10 +437,9 @@ impl TokenStore {
     /// and revoke every still-active id in `revoke_ids`, all in one
     /// transaction — the offline recovery command's rotation step.
     /// Any other live owner is revoked in the same transaction and
-    /// listed in the result. The row is marked owner only when
-    /// `scope_json` is the minted `["*"]`; this and [`Self::insert_owner_if_empty`] are the only
-    /// owner-minting inserts (H6 slice 2): every other insert
-    /// ([`Self::create`], [`Self::create_if_empty`]) is a plain token.
+    /// listed in the result. This and [`Self::insert_owner_if_empty`]
+    /// are the only owner-minting inserts: every other insert is a
+    /// plain token.
     /// Either the new token exists *and* the old ones are revoked,
     /// or nothing changed. Returns the ids that were newly revoked
     /// (already-revoked or unknown ids are skipped).
@@ -448,10 +452,9 @@ impl TokenStore {
         &self,
         issued: &IssuedToken,
         label: &str,
-        scope_json: &[u8],
         revoke_ids: &[String],
     ) -> Result<Vec<String>, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json, true)?;
+        let row = PendingRow::new(issued, label, &[] as &[&str], true)?;
         let revoke_ids = revoke_ids.to_vec();
         let now = row.created_ms;
         self.durable_write(move |conn| -> Result<Vec<String>, TokenError> {
@@ -469,8 +472,8 @@ impl TokenStore {
             }
             // One owner at a time: a still-live previous owner is
             // revoked with the rotation even when the caller didn't
-            // name it (H6 slice 2; a unique index enforces it too).
-            if row.is_owner() {
+            // name it (a unique index enforces it too).
+            if row.owner {
                 let previous: Vec<String> = {
                     let mut stmt = tx.prepare(
                         "SELECT id FROM auth_token WHERE owner = 1 AND revoked_ms IS NULL",
@@ -493,99 +496,56 @@ impl TokenStore {
     }
 
     /// Insert a plain (never owner) token produced by
-    /// [`Self::generate`]: the H6 slice 3 mint path (`oxidhome token
-    /// create`, and the owner's `POST /api/v1/tokens` and Connect
-    /// `TokensService.CreateToken`). Committed
-    /// durably, since the caller hands the secret out right after.
-    /// Returns the stored record, so the caller needn't read it back
-    /// (a failed read would strand a live token whose secret is lost).
+    /// [`Self::generate`] holding `roles`: the mint path (`oxidhome
+    /// token create`, and the owner's `POST /api/v1/tokens` and Connect
+    /// `TokensService.CreateToken`). A name that isn't built in must be
+    /// a stored role, checked in the same transaction as the insert so
+    /// a concurrent role delete can't leave the new token holding a
+    /// missing role; `Ok(Err(name))` names one that doesn't exist
+    /// (nothing was stored). Committed durably, since the caller hands
+    /// the secret out right after. Returns the stored record, so the
+    /// caller needn't read it back.
     ///
     /// # Errors
     ///
     /// [`TokenError::Malformed`] if `issued.plaintext` isn't a token
     /// this module produced; [`TokenError::Sqlite`] on DB failure.
-    pub fn insert(
-        &self,
-        issued: &IssuedToken,
-        label: &str,
-        scope_json: &[u8],
-    ) -> Result<TokenRecord, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json, false)?;
-        let record = TokenRecord {
-            id: row.id.clone(),
-            label: row.label.clone(),
-            scope_json: row.scope_json.clone(),
-            created_ms: row.created_ms,
-            last_used_ms: None,
-            revoked_ms: None,
-            owner: false,
-        };
-        self.durable_write(move |conn| row.insert(conn))?;
-        Ok(record)
-    }
-
-    /// [`Self::insert`] for a policy naming `role_ids`, which are
-    /// checked in the same transaction as the insert, so a concurrent
-    /// unforced role delete can't leave the new token with a dangling
-    /// reference. `Ok(Err(id))` names a role that no longer exists
-    /// (nothing was stored).
-    ///
-    /// # Errors
-    ///
-    /// [`TokenError::Sqlite`] on DB failure.
     pub fn insert_with_roles(
         &self,
         issued: &IssuedToken,
         label: &str,
-        scope_json: &[u8],
-        role_ids: &[String],
+        roles: &[String],
     ) -> Result<Result<TokenRecord, String>, TokenError> {
-        let row = PendingRow::new(issued, label, scope_json, false)?;
+        let row = PendingRow::new(issued, label, roles, false)?;
         let record = TokenRecord {
             id: row.id.clone(),
             label: row.label.clone(),
-            scope_json: row.scope_json.clone(),
+            roles: roles.to_vec(),
             created_ms: row.created_ms,
             last_used_ms: None,
             revoked_ms: None,
             owner: false,
         };
-        let role_ids = role_ids.to_vec();
+        let custom: Vec<String> = roles
+            .iter()
+            .filter(|r| crate::auth::role::builtin(r).is_none())
+            .cloned()
+            .collect();
         self.durable_write(move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            for id in role_ids {
+            for name in custom {
                 let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM auth_role WHERE id = ?1)",
-                    [&id],
+                    "SELECT EXISTS(SELECT 1 FROM auth_role WHERE name = ?1)",
+                    [&name],
                     |r| r.get(0),
                 )?;
                 if !exists {
-                    return Ok(Err(id));
+                    return Ok(Err(name));
                 }
             }
             row.insert(&tx)?;
             tx.commit()?;
             Ok(Ok(record))
-        })
-    }
-
-    /// Replace a token's policy blob (`scope_json`). The offline
-    /// `oxidhome token grant-sensitive` / `revoke-sensitive` commands
-    /// use it; the API never does. Returns `false` when no live token
-    /// has that id.
-    ///
-    /// # Errors
-    ///
-    /// [`TokenError::Sqlite`] on DB failure.
-    pub fn set_policy(&self, token_id: &str, scope_json: &[u8]) -> Result<bool, TokenError> {
-        let id_owned = token_id.to_string();
-        let blob = scope_json.to_vec();
-        self.durable_write(move |conn| -> Result<bool, TokenError> {
-            let n = conn.execute(
-                "UPDATE auth_token SET scope_json = ?2 WHERE id = ?1 AND revoked_ms IS NULL",
-                params![id_owned, blob],
-            )?;
-            Ok(n > 0)
         })
     }
 
@@ -662,7 +622,7 @@ struct PendingRow {
     id: String,
     label: String,
     hash: Vec<u8>,
-    scope_json: Vec<u8>,
+    roles: String,
     created_ms: i64,
     owner: bool,
 }
@@ -671,7 +631,7 @@ impl PendingRow {
     fn new(
         issued: &IssuedToken,
         label: &str,
-        scope_json: &[u8],
+        roles: &[impl AsRef<str>],
         owner: bool,
     ) -> Result<Self, TokenError> {
         let secret = parse_token(&issued.plaintext).ok_or(TokenError::Malformed)?;
@@ -684,33 +644,26 @@ impl PendingRow {
             id,
             label: label.to_string(),
             hash: hash.to_vec(),
-            scope_json: scope_json.to_vec(),
+            roles: roles_json(roles),
             created_ms: now_ms(),
             owner,
         })
     }
 
-    /// Whether the row is inserted as the owner.
-    fn is_owner(&self) -> bool {
-        self.owner && self.scope_json.as_slice() == br#"["*"]"#
-    }
-
     /// Insert the row, as the owner token when it was built for one
-    /// (bootstrap or recovery, H6 slice 2) and its scope is the minted
-    /// `["*"]`.
+    /// (bootstrap or recovery).
     fn insert(&self, conn: &rusqlite::Connection) -> Result<(), TokenError> {
-        let owner = self.is_owner();
         conn.execute(
             "INSERT INTO auth_token \
-               (id, label, hash, scope_json, created_ms, last_used_ms, revoked_ms, owner) \
+               (id, label, hash, roles, created_ms, last_used_ms, revoked_ms, owner) \
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
             params![
                 self.id,
                 self.label,
                 self.hash,
-                self.scope_json,
+                self.roles,
                 self.created_ms,
-                owner
+                self.owner
             ],
         )?;
         Ok(())
@@ -721,11 +674,24 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenRecord> {
     Ok(TokenRecord {
         id: row.get(0)?,
         label: row.get(1)?,
-        scope_json: row.get(2)?,
+        roles: parse_roles(&row.get::<_, String>(2)?),
         created_ms: row.get(3)?,
         last_used_ms: row.get(4)?,
         revoked_ms: row.get(5)?,
         owner: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+/// The stored form of a token's roles: a JSON array of names.
+fn roles_json(roles: &[impl AsRef<str>]) -> String {
+    serde_json::Value::from(roles.iter().map(AsRef::as_ref).collect::<Vec<_>>()).to_string()
+}
+
+/// A stored roles value; one that doesn't parse holds no role.
+pub(super) fn parse_roles(stored: &str) -> Vec<String> {
+    serde_json::from_str(stored).unwrap_or_else(|_| {
+        tracing::warn!(target: "auth.token", "a token's roles don't parse; it holds none");
+        Vec::new()
     })
 }
 
@@ -919,7 +885,7 @@ mod tests {
     #[test]
     fn create_and_verify_roundtrip() {
         let store = TokenStore::new(fresh());
-        let issued = store.create("admin", b"{}").expect("create");
+        let issued = store.create("admin", &["admin"]).expect("create");
         assert!(issued.plaintext.starts_with("oxh_"));
         assert_eq!(store.count().unwrap(), 1);
 
@@ -933,7 +899,7 @@ mod tests {
     #[test]
     fn malformed_tokens_are_rejected() {
         let store = TokenStore::new(fresh());
-        store.create("admin", b"{}").unwrap();
+        store.create("admin", &["admin"]).unwrap();
         assert!(matches!(
             store.verify("not-a-token"),
             Err(TokenError::Malformed)
@@ -947,7 +913,7 @@ mod tests {
     #[test]
     fn unknown_token_yields_unknown_error() {
         let store = TokenStore::new(fresh());
-        store.create("admin", b"{}").unwrap();
+        store.create("admin", &["admin"]).unwrap();
         // Synthesize a 32-byte secret that won't match our row.
         let other = format_token(&[7u8; TOKEN_BYTES]);
         assert!(matches!(store.verify(&other), Err(TokenError::Unknown)));
@@ -956,7 +922,7 @@ mod tests {
     #[test]
     fn revoked_token_cannot_verify() {
         let store = TokenStore::new(fresh());
-        let issued = store.create("admin", b"{}").unwrap();
+        let issued = store.create("admin", &["admin"]).unwrap();
         assert!(store.revoke(&issued.id).expect("revoke"));
         assert!(matches!(
             store.verify(&issued.plaintext),
@@ -969,9 +935,9 @@ mod tests {
     #[test]
     fn list_orders_by_creation() {
         let store = TokenStore::new(fresh());
-        let a = store.create("a", b"{}").unwrap();
+        let a = store.create("a", &["admin"]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = store.create("b", b"{}").unwrap();
+        let b = store.create("b", &["admin"]).unwrap();
         let listed = store.list().unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, a.id);
@@ -1018,7 +984,7 @@ mod tests {
     fn create_if_empty_mints_once_then_is_noop() {
         let store = TokenStore::new(fresh());
         let first = store
-            .create_if_empty("admin", b"[\"*\"]")
+            .create_if_empty("admin", &["admin"])
             .expect("first call");
         assert!(first.is_some(), "first call should mint");
         assert_eq!(store.count().unwrap(), 1);
@@ -1026,7 +992,7 @@ mod tests {
         assert!(!store.list().unwrap()[0].owner);
 
         let second = store
-            .create_if_empty("admin", b"[\"*\"]")
+            .create_if_empty("admin", &["admin"])
             .expect("second call");
         assert!(second.is_none(), "second call must see the row and bail");
         assert_eq!(store.count().unwrap(), 1, "still exactly one row");
@@ -1035,16 +1001,11 @@ mod tests {
     #[test]
     fn insert_owner_and_revoke_is_atomic_rotation() {
         let store = TokenStore::new(fresh());
-        let old = store.create("admin", b"[\"*\"]").unwrap();
-        let other = store.create("ci", b"[]").unwrap();
+        let old = store.create("admin", &["admin"]).unwrap();
+        let other = store.create("ci", &["admin"]).unwrap();
         let new = TokenStore::generate();
         let revoked = store
-            .insert_owner_and_revoke(
-                &new,
-                "admin",
-                b"[\"*\"]",
-                &[old.id.clone(), "no-such-id".into()],
-            )
+            .insert_owner_and_revoke(&new, "admin", &[old.id.clone(), "no-such-id".into()])
             .unwrap();
         assert_eq!(revoked, vec![old.id.clone()]);
         assert!(matches!(
@@ -1075,7 +1036,7 @@ mod tests {
 
         reset();
         let first = TokenStore::generate();
-        assert!(store.insert_owner_if_empty(&first, "admin", b"[]").unwrap());
+        assert!(store.insert_owner_if_empty(&first, "admin").unwrap());
         assert_eq!(sync(), 1, "insert_owner_if_empty");
 
         reset();
@@ -1083,14 +1044,13 @@ mod tests {
             .insert_owner_and_revoke(
                 &TokenStore::generate(),
                 "admin",
-                b"[]",
                 std::slice::from_ref(&first.id),
             )
             .unwrap();
         assert_eq!(sync(), 1, "insert_owner_and_revoke");
 
         reset();
-        let unused = store.create("x", b"[]").unwrap();
+        let unused = store.create("x", &["admin"]).unwrap();
         reset();
         assert!(store.delete_undelivered(&unused.id).unwrap());
         assert_eq!(sync(), 1, "delete_undelivered");
@@ -1105,7 +1065,7 @@ mod tests {
         reset();
         assert!(
             store
-                .insert_owner_and_revoke(&TokenStore::generate(), "admin", b"[]", &[])
+                .insert_owner_and_revoke(&TokenStore::generate(), "admin", &[])
                 .is_err()
         );
         assert_eq!(sync(), 1, "error path");
@@ -1117,7 +1077,7 @@ mod tests {
         let mut forged = TokenStore::generate();
         forged.id = "not-the-derived-id".into();
         assert!(matches!(
-            store.insert_owner_if_empty(&forged, "admin", b"[]"),
+            store.insert_owner_if_empty(&forged, "admin"),
             Err(TokenError::Malformed)
         ));
         assert_eq!(store.count().unwrap(), 0);
@@ -1126,10 +1086,10 @@ mod tests {
     #[test]
     fn delete_undelivered_spares_used_or_revoked_tokens() {
         let store = TokenStore::new(fresh());
-        let fresh_tok = store.create("admin", b"[]").unwrap();
-        let used = store.create("used", b"[]").unwrap();
+        let fresh_tok = store.create("admin", &["admin"]).unwrap();
+        let used = store.create("used", &["admin"]).unwrap();
         store.verify(&used.plaintext).unwrap();
-        let revoked = store.create("revoked", b"[]").unwrap();
+        let revoked = store.create("revoked", &["admin"]).unwrap();
         store.revoke(&revoked.id).unwrap();
 
         assert!(store.delete_undelivered(&fresh_tok.id).unwrap());
@@ -1144,7 +1104,7 @@ mod tests {
     #[test]
     fn verify_bumps_last_used_ms_via_separate_write() {
         let store = TokenStore::new(fresh());
-        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let issued = store.create("admin", &["admin"]).unwrap();
         let pre = store.get(&issued.id).unwrap().unwrap();
         assert!(pre.last_used_ms.is_none());
         let rec = store.verify(&issued.plaintext).expect("verify");
@@ -1171,7 +1131,7 @@ mod tests {
     fn verify_coalesces_last_used_within_resolution() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
-        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let issued = store.create("admin", &["admin"]).unwrap();
         let recent = now_ms() - 1_000;
         set_last_used(&db, &issued.id, recent);
         let rec = store.verify(&issued.plaintext).unwrap();
@@ -1196,7 +1156,7 @@ mod tests {
     fn touch_last_used_coalesces_on_process_writes() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
-        let issued = store.create("mcp", b"[\"*\"]").unwrap();
+        let issued = store.create("mcp", &["admin"]).unwrap();
         let first = store.touch_last_used(&issued.id);
         let row = store.get(&issued.id).unwrap().unwrap();
         assert_eq!(row.last_used_ms, Some(first), "first touch writes");
@@ -1216,7 +1176,7 @@ mod tests {
     fn last_used_write_rechecks_under_the_writer() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
-        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let issued = store.create("admin", &["admin"]).unwrap();
         let newer = now_ms();
         set_last_used(&db, &issued.id, newer);
         let older = newer - 5_000;
@@ -1232,7 +1192,7 @@ mod tests {
     fn future_last_used_is_current() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
-        let issued = store.create("admin", b"[\"*\"]").unwrap();
+        let issued = store.create("admin", &["admin"]).unwrap();
         let future = now_ms() + 10 * LAST_USED_RESOLUTION_MS;
         set_last_used(&db, &issued.id, future);
         assert!(TokenStore::last_used_is_current(Some(future)));
@@ -1247,7 +1207,7 @@ mod tests {
     fn touch_last_used_from_coalesces_on_the_row() {
         let db = fresh();
         let store = TokenStore::new(Arc::clone(&db));
-        let issued = store.create("mcp", b"[\"*\"]").unwrap();
+        let issued = store.create("mcp", &["admin"]).unwrap();
         let recent = now_ms() - 1_000;
         set_last_used(&db, &issued.id, recent);
         let rec = store.verify_read_only(&issued.plaintext).unwrap();

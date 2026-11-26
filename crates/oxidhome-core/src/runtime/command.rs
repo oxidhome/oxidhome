@@ -198,7 +198,7 @@ pub struct CommandReport {
 
 impl CommandReport {
     /// M7: withhold `bytes-val` fields of a `completed` state readout
-    /// from a caller without `blobs:read`.
+    /// from a caller without `blob.read`.
     pub(crate) fn withhold_bytes(&mut self) {
         if let CommandOutcome::Completed { state: Some(kvs) } = &mut self.outcome {
             crate::redact::withhold_bytes_in_kvs(kvs);
@@ -1326,7 +1326,7 @@ mod tests {
         let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
         let table = Arc::new(PendingCommands::new(Some(Arc::clone(&audit))).unwrap());
         table.set_ttl(Duration::ZERO);
-        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let actor = Actor::api("tok-1", vec![crate::auth::role::builtin("admin").unwrap()]);
         let ctx =
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
         let id = mint_command_id();
@@ -1347,7 +1347,7 @@ mod tests {
     #[test]
     fn persisted_rows_are_redacted() {
         use crate::auth::{Actor, ActorKind, Principal, Transport};
-        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let actor = Actor::api("tok-1", vec![crate::auth::role::builtin("admin").unwrap()]);
         let ctx =
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
         let row = pending_row(

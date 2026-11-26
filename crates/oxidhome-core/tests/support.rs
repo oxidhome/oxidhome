@@ -190,3 +190,40 @@ fn build_once_per_run(example_dir: &Path, build: impl FnOnce()) {
         std::fs::write(&stamp, b"").expect("write build stamp");
     }
 }
+
+/// Mint test tokens from a list of action names.
+pub trait Mint {
+    /// A token labelled `label` allowed `actions` (`*` for every role
+    /// action, sensitive categories excluded): a fresh custom role
+    /// granting exactly those, or no role at all for `[]`.
+    ///
+    /// # Errors
+    ///
+    /// The store's.
+    fn mint(
+        &self,
+        label: &str,
+        actions: &[&str],
+    ) -> Result<oxidhome_core::state::IssuedToken, oxidhome_core::state::TokenError>;
+}
+
+impl Mint for oxidhome_core::state::TokenStore {
+    fn mint(
+        &self,
+        label: &str,
+        actions: &[&str],
+    ) -> Result<oxidhome_core::state::IssuedToken, oxidhome_core::state::TokenError> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if actions.is_empty() {
+            return self.create(label, &[] as &[&str]);
+        }
+        let name = format!(
+            "t{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let grants = serde_json::json!([{ "actions": actions }]).to_string();
+        self.create_role(&name, grants.as_bytes())
+            .expect("test role");
+        self.create(label, &[name])
+    }
+}

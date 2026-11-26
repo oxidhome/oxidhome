@@ -153,7 +153,7 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
     )
     .await;
 
-    // `plugins.list` requires `plugins:list`. Wildcard actor
+    // `plugins.list` requires `plugin.read`. Wildcard actor
     // satisfies it; the tool returns an empty list on a fresh
     // engine.
     send_line(
@@ -167,7 +167,7 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
     let call_resp = read_line(&mut client_reader).await;
     assert!(
         call_resp["error"].is_null(),
-        "wildcard actor must satisfy plugins:list; got {call_resp}",
+        "wildcard actor must satisfy plugin.read; got {call_resp}",
     );
     let plugins = call_resp["result"]["structuredContent"]["plugins"]
         .as_array()

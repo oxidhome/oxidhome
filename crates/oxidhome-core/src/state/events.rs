@@ -68,7 +68,7 @@ use crate::host_impl::plugin::oxidhome::plugin::types::SubscriptionId;
 /// a full clone per queue slot — with per-subscriber queues of
 /// 256 slots and unbounded custom-event payload size, cloning per
 /// slot would multiply retained memory by subscriber count and let
-/// an `events:tail` credential OOM the daemon (C2e review P1).
+/// an `event.subscribe` credential OOM the daemon (C2e review P1).
 #[derive(Debug, Clone)]
 pub enum SubscriberMessage {
     /// A published event routed to this subscriber's queue. When
@@ -108,7 +108,7 @@ pub enum SubscriberMessage {
 /// (GC pause, WebSocket flush blip) without dropping.
 const SUBSCRIBER_CAPACITY: usize = 256;
 
-/// Soft cap on concurrent subscribers. An `events:tail` credential
+/// Soft cap on concurrent subscribers. An `event.subscribe` credential
 /// could otherwise open arbitrarily many stalled streams and
 /// multiply retained queue memory (though the `Arc<Event>` fix in
 /// [`publish`] means the *payload* is shared; per-subscriber cost
@@ -531,7 +531,7 @@ impl EventBus {
         // per-subscriber fan-out is a ref-count bump, not a full
         // clone per queue slot. With unbounded custom-event
         // payloads and unbounded subscriber count, cloning per
-        // slot would let an `events:tail` credential amplify one
+        // slot would let an `event.subscribe` credential amplify one
         // event into O(subscribers × capacity × payload) retained
         // memory and OOM the daemon.
         let event = Arc::new(event);

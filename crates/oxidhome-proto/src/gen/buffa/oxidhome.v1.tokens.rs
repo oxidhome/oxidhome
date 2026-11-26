@@ -14,7 +14,8 @@ pub struct CreateTokenRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub label: ::buffa::alloc::string::String,
-    /// Names of owner-defined roles.
+    /// Names of the roles the token holds, built-in or custom. At least
+    /// one.
     ///
     /// Field 2: `roles`
     #[serde(
@@ -23,34 +24,6 @@ pub struct CreateTokenRequest {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub roles: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
-    ///
-    /// Field 3: `scopes`
-    #[serde(
-        rename = "scopes",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub scopes: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Sensitive categories (`lock`, `opener`, `alarm`, `camera`)
-    /// granted on every device.
-    ///
-    /// Field 4: `sensitive`
-    #[serde(
-        rename = "sensitive",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// The token's deny list.
-    ///
-    /// Field 5: `deny`
-    #[serde(
-        rename = "deny",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub deny: ::buffa::alloc::vec::Vec<Selector>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -60,9 +33,6 @@ impl ::core::fmt::Debug for CreateTokenRequest {
         f.debug_struct("CreateTokenRequest")
             .field("label", &self.label)
             .field("roles", &self.roles)
-            .field("scopes", &self.scopes)
-            .field("sensitive", &self.sensitive)
-            .field("deny", &self.deny)
             .finish()
     }
 }
@@ -89,7 +59,7 @@ impl ::buffa::Message for CreateTokenRequest {
     /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
     /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
-    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
@@ -99,26 +69,12 @@ impl ::buffa::Message for CreateTokenRequest {
         for v in &self.roles {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.scopes {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
-        __cache: &mut ::buffa::SizeCache,
+        _cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -128,20 +84,6 @@ impl ::buffa::Message for CreateTokenRequest {
         }
         for v in &self.roles {
             ::buffa::types::put_string_field(2u32, v, buf);
-        }
-        for v in &self.scopes {
-            ::buffa::types::put_string_field(3u32, v, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(4u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_len_delimited_header(
-                5u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -174,40 +116,6 @@ impl ::buffa::Message for CreateTokenRequest {
                 )?;
                 self.roles.push(__elem);
             }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.scopes.push(__elem);
-            }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.sensitive.push(__elem);
-            }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let mut elem = ::core::default::Default::default();
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&elem),
-                )?;
-                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
-                self.deny.push(elem);
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -218,9 +126,6 @@ impl ::buffa::Message for CreateTokenRequest {
     fn clear(&mut self) {
         self.label.clear();
         self.roles.clear();
-        self.scopes.clear();
-        self.sensitive.clear();
-        self.deny.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -253,12 +158,16 @@ pub const __CREATE_TOKEN_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry 
     from_json: ::buffa::type_registry::any_from_json::<CreateTokenRequest>,
     is_wkt: false,
 };
-/// One grant or deny entry: `actions`, optionally narrowed to devices.
+/// One grant of a role: `actions`, optionally narrowed to device
+/// categories and devices. A sensitive category (`lock`, `opener`,
+/// `alarm`, `camera`) is reached only by a grant whose `category`
+/// names it.
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
-pub struct Selector {
-    /// Action names (`device.command`) or `*`. Required.
+pub struct Grant {
+    /// Action names (`device.command`) or `*` for every action a role can
+    /// grant. Required.
     ///
     /// Field 1: `actions`
     #[serde(
@@ -267,7 +176,7 @@ pub struct Selector {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub actions: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Device categories the entry is narrowed to; empty for every
+    /// Device categories the grant is narrowed to; empty for every
     /// resource.
     ///
     /// Field 2: `category`
@@ -277,7 +186,7 @@ pub struct Selector {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub category: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Device ids or `prefix*` patterns the entry is narrowed to; empty
+    /// Device ids or `prefix*` patterns the grant is narrowed to; empty
     /// for every device.
     ///
     /// Field 3: `devices`
@@ -287,47 +196,34 @@ pub struct Selector {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub devices: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
-    /// literal or `prefix*`) the entry is narrowed to; empty for every
-    /// service. Narrows `service.call` only and excludes `category` and
-    /// `devices`.
-    ///
-    /// Field 4: `services`
-    #[serde(
-        rename = "services",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub services: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
-impl ::core::fmt::Debug for Selector {
+impl ::core::fmt::Debug for Grant {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("Selector")
+        f.debug_struct("Grant")
             .field("actions", &self.actions)
             .field("category", &self.category)
             .field("devices", &self.devices)
-            .field("services", &self.services)
             .finish()
     }
 }
-impl Selector {
+impl Grant {
     /// Protobuf type URL for this message, for use with `Any::pack` and
     /// `Any::unpack_if`.
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Selector";
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Grant";
 }
-::buffa::impl_default_instance!(Selector);
-impl ::buffa::MessageName for Selector {
+::buffa::impl_default_instance!(Grant);
+impl ::buffa::MessageName for Grant {
     const PACKAGE: &'static str = "oxidhome.v1";
-    const NAME: &'static str = "Selector";
-    const FULL_NAME: &'static str = "oxidhome.v1.Selector";
-    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Selector";
+    const NAME: &'static str = "Grant";
+    const FULL_NAME: &'static str = "oxidhome.v1.Grant";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Grant";
 }
-impl ::buffa::Message for Selector {
+impl ::buffa::Message for Grant {
     /// Returns the total encoded size in bytes.
     ///
     /// Accumulates in `u64` (which cannot overflow for in-memory
@@ -349,9 +245,6 @@ impl ::buffa::Message for Selector {
         for v in &self.devices {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.services {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -370,9 +263,6 @@ impl ::buffa::Message for Selector {
         }
         for v in &self.devices {
             ::buffa::types::put_string_field(3u32, v, buf);
-        }
-        for v in &self.services {
-            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -420,17 +310,6 @@ impl ::buffa::Message for Selector {
                 )?;
                 self.devices.push(__elem);
             }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.services.push(__elem);
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -442,12 +321,11 @@ impl ::buffa::Message for Selector {
         self.actions.clear();
         self.category.clear();
         self.devices.clear();
-        self.services.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
-impl ::buffa::ExtensionSet for Selector {
-    const PROTO_FQN: &'static str = "oxidhome.v1.Selector";
+impl ::buffa::ExtensionSet for Grant {
+    const PROTO_FQN: &'static str = "oxidhome.v1.Grant";
     fn unknown_fields(&self) -> &::buffa::UnknownFields {
         &self.__buffa_unknown_fields
     }
@@ -455,7 +333,7 @@ impl ::buffa::ExtensionSet for Selector {
         &mut self.__buffa_unknown_fields
     }
 }
-impl ::buffa::json_helpers::ProtoElemJson for Selector {
+impl ::buffa::json_helpers::ProtoElemJson for Grant {
     fn serialize_proto_json<S: ::serde::Serializer>(
         v: &Self,
         s: S,
@@ -469,10 +347,10 @@ impl ::buffa::json_helpers::ProtoElemJson for Selector {
     }
 }
 #[doc(hidden)]
-pub const __SELECTOR_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/oxidhome.v1.Selector",
-    to_json: ::buffa::type_registry::any_to_json::<Selector>,
-    from_json: ::buffa::type_registry::any_from_json::<Selector>,
+pub const __GRANT_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.Grant",
+    to_json: ::buffa::type_registry::any_to_json::<Grant>,
+    from_json: ::buffa::type_registry::any_from_json::<Grant>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]
@@ -902,7 +780,8 @@ pub struct Token {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub label: ::buffa::alloc::string::String,
-    /// `true` for the bootstrap / recovered owner token.
+    /// `true` for the bootstrap / recovered owner token, which may do
+    /// everything.
     ///
     /// Field 3: `owner`
     #[serde(
@@ -918,8 +797,7 @@ pub struct Token {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
     )]
     pub revoked: bool,
-    /// Role names (`<id> (deleted)` for a deleted role); `owner` for the
-    /// owner token.
+    /// Names of the roles the token holds.
     ///
     /// Field 5: `roles`
     #[serde(
@@ -928,36 +806,9 @@ pub struct Token {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub roles: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Field 6: `scopes`
-    #[serde(
-        rename = "scopes",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub scopes: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
-    ///
-    /// Field 7: `sensitive`
-    #[serde(
-        rename = "sensitive",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 8: `deny`
-    #[serde(
-        rename = "deny",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub deny: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     /// Unix ms.
     ///
-    /// Field 9: `created_ms`
+    /// Field 6: `created_ms`
     #[serde(
         rename = "createdMs",
         alias = "created_ms",
@@ -967,7 +818,7 @@ pub struct Token {
     pub created_ms: i64,
     /// Unix ms; unset when never used.
     ///
-    /// Field 10: `last_used_ms`
+    /// Field 7: `last_used_ms`
     #[serde(
         rename = "lastUsedMs",
         alias = "last_used_ms",
@@ -975,16 +826,6 @@ pub struct Token {
         skip_serializing_if = "::core::option::Option::is_none"
     )]
     pub last_used_ms: ::core::option::Option<i64>,
-    /// `false` when the stored policy doesn't parse (deny-all).
-    ///
-    /// Field 11: `policy_valid`
-    #[serde(
-        rename = "policyValid",
-        alias = "policy_valid",
-        with = "::buffa::json_helpers::proto_bool",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
-    )]
-    pub policy_valid: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -997,12 +838,8 @@ impl ::core::fmt::Debug for Token {
             .field("owner", &self.owner)
             .field("revoked", &self.revoked)
             .field("roles", &self.roles)
-            .field("scopes", &self.scopes)
-            .field("sensitive", &self.sensitive)
-            .field("deny", &self.deny)
             .field("created_ms", &self.created_ms)
             .field("last_used_ms", &self.last_used_ms)
-            .field("policy_valid", &self.policy_valid)
             .finish()
     }
 }
@@ -1057,23 +894,11 @@ impl ::buffa::Message for Token {
         for v in &self.roles {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.scopes {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
         if self.created_ms != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.created_ms) as u64;
         }
         if let Some(v) = self.last_used_ms {
             size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
-        }
-        if self.policy_valid {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -1100,23 +925,11 @@ impl ::buffa::Message for Token {
         for v in &self.roles {
             ::buffa::types::put_string_field(5u32, v, buf);
         }
-        for v in &self.scopes {
-            ::buffa::types::put_string_field(6u32, v, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(7u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_string_field(8u32, v, buf);
-        }
         if self.created_ms != 0i64 {
-            ::buffa::types::put_int64_field(9u32, self.created_ms, buf);
+            ::buffa::types::put_int64_field(6u32, self.created_ms, buf);
         }
         if let Some(v) = self.last_used_ms {
-            ::buffa::types::put_int64_field(10u32, v, buf);
-        }
-        if self.policy_valid {
-            ::buffa::types::put_bool_field(11u32, self.policy_valid, buf);
+            ::buffa::types::put_int64_field(7u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1173,44 +986,11 @@ impl ::buffa::Message for Token {
             6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.scopes.push(__elem);
-            }
-            7u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.sensitive.push(__elem);
-            }
-            8u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.deny.push(__elem);
-            }
-            9u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 self.created_ms = ::buffa::types::decode_int64(buf)?;
             }
-            10u32 => {
+            7u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::Varint,
@@ -1218,13 +998,6 @@ impl ::buffa::Message for Token {
                 self.last_used_ms = ::core::option::Option::Some(
                     ::buffa::types::decode_int64(buf)?,
                 );
-            }
-            11u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.policy_valid = ::buffa::types::decode_bool(buf)?;
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -1239,12 +1012,8 @@ impl ::buffa::Message for Token {
         self.owner = false;
         self.revoked = false;
         self.roles.clear();
-        self.scopes.clear();
-        self.sensitive.clear();
-        self.deny.clear();
         self.created_ms = 0i64;
         self.last_used_ms = ::core::option::Option::None;
-        self.policy_valid = false;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -1277,240 +1046,28 @@ pub const __TOKEN_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type
     from_json: ::buffa::type_registry::any_from_json::<Token>,
     is_wkt: false,
 };
-/// A role's definition.
-#[derive(Clone, PartialEq, Default)]
-#[derive(::serde::Serialize, ::serde::Deserialize)]
-#[serde(default)]
-pub struct RoleDefinition {
-    /// What the role grants: actions a scope can grant (`*` for all).
-    ///
-    /// Field 1: `grants`
-    #[serde(
-        rename = "grants",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub grants: ::buffa::alloc::vec::Vec<Selector>,
-    /// Sensitive categories the role grants, on every device.
-    ///
-    /// Field 2: `sensitive`
-    #[serde(
-        rename = "sensitive",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// What the role denies, whatever grants it.
-    ///
-    /// Field 3: `deny`
-    #[serde(
-        rename = "deny",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub deny: ::buffa::alloc::vec::Vec<Selector>,
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub __buffa_unknown_fields: ::buffa::UnknownFields,
-}
-impl ::core::fmt::Debug for RoleDefinition {
-    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("RoleDefinition")
-            .field("grants", &self.grants)
-            .field("sensitive", &self.sensitive)
-            .field("deny", &self.deny)
-            .finish()
-    }
-}
-impl RoleDefinition {
-    /// Protobuf type URL for this message, for use with `Any::pack` and
-    /// `Any::unpack_if`.
-    ///
-    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
-    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.RoleDefinition";
-}
-::buffa::impl_default_instance!(RoleDefinition);
-impl ::buffa::MessageName for RoleDefinition {
-    const PACKAGE: &'static str = "oxidhome.v1";
-    const NAME: &'static str = "RoleDefinition";
-    const FULL_NAME: &'static str = "oxidhome.v1.RoleDefinition";
-    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.RoleDefinition";
-}
-impl ::buffa::Message for RoleDefinition {
-    /// Returns the total encoded size in bytes.
-    ///
-    /// Accumulates in `u64` (which cannot overflow for in-memory
-    /// data) and saturates to `u32` at return, so a message whose
-    /// encoded size exceeds the 2 GiB protobuf limit yields a value
-    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
-    /// points reject, never a silently wrapped size.
-    #[allow(clippy::let_and_return)]
-    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        for v in &self.grants {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    fn write_to(
-        &self,
-        __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        for v in &self.grants {
-            ::buffa::types::put_len_delimited_header(
-                1u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(2u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_len_delimited_header(
-                3u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
-        }
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-    fn merge_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        buf: &mut impl ::buffa::bytes::Buf,
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::bytes::Buf as _;
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let mut elem = ::core::default::Default::default();
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&elem),
-                )?;
-                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
-                self.grants.push(elem);
-            }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.sensitive.push(__elem);
-            }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let mut elem = ::core::default::Default::default();
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&elem),
-                )?;
-                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
-                self.deny.push(elem);
-            }
-            _ => {
-                self.__buffa_unknown_fields
-                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
-            }
-        }
-        ::core::result::Result::Ok(())
-    }
-    fn clear(&mut self) {
-        self.grants.clear();
-        self.sensitive.clear();
-        self.deny.clear();
-        self.__buffa_unknown_fields.clear();
-    }
-}
-impl ::buffa::ExtensionSet for RoleDefinition {
-    const PROTO_FQN: &'static str = "oxidhome.v1.RoleDefinition";
-    fn unknown_fields(&self) -> &::buffa::UnknownFields {
-        &self.__buffa_unknown_fields
-    }
-    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
-        &mut self.__buffa_unknown_fields
-    }
-}
-impl ::buffa::json_helpers::ProtoElemJson for RoleDefinition {
-    fn serialize_proto_json<S: ::serde::Serializer>(
-        v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
-        ::serde::Serialize::serialize(v, s)
-    }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
-        <Self as ::serde::Deserialize>::deserialize(d)
-    }
-}
-#[doc(hidden)]
-pub const __ROLE_DEFINITION_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
-    type_url: "type.googleapis.com/oxidhome.v1.RoleDefinition",
-    to_json: ::buffa::type_registry::any_to_json::<RoleDefinition>,
-    from_json: ::buffa::type_registry::any_from_json::<RoleDefinition>,
-    is_wkt: false,
-};
 /// One role, as listed. Same fields as the JSON API's rows.
 #[derive(Clone, PartialEq, Default)]
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct Role {
-    /// Field 1: `role_id`
-    #[serde(
-        rename = "roleId",
-        alias = "role_id",
-        with = "::buffa::json_helpers::proto_string",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
-    )]
-    pub role_id: ::buffa::alloc::string::String,
-    /// Field 2: `name`
+    /// Field 1: `name`
     #[serde(
         rename = "name",
         with = "::buffa::json_helpers::proto_string",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
+    /// `true` for a built-in role.
+    ///
+    /// Field 2: `builtin`
+    #[serde(
+        rename = "builtin",
+        with = "::buffa::json_helpers::proto_bool",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
+    )]
+    pub builtin: bool,
+    /// Grants as `actions[@categories][ [devices]]`.
     ///
     /// Field 3: `grants`
     #[serde(
@@ -1519,61 +1076,33 @@ pub struct Role {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub grants: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Field 4: `sensitive`
-    #[serde(
-        rename = "sensitive",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub sensitive: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 5: `deny`
-    #[serde(
-        rename = "deny",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
-    )]
-    pub deny: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
     /// Ids of the live tokens holding the role.
     ///
-    /// Field 6: `tokens`
+    /// Field 4: `tokens`
     #[serde(
         rename = "tokens",
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub tokens: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Unix ms.
+    /// Unix ms; unset for a built-in role.
     ///
-    /// Field 7: `created_ms`
+    /// Field 5: `created_ms`
     #[serde(
         rename = "createdMs",
         alias = "created_ms",
-        with = "::buffa::json_helpers::int64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+        with = "::buffa::json_helpers::opt_int64",
+        skip_serializing_if = "::core::option::Option::is_none"
     )]
-    pub created_ms: i64,
-    /// Field 8: `updated_ms`
+    pub created_ms: ::core::option::Option<i64>,
+    /// Field 6: `updated_ms`
     #[serde(
         rename = "updatedMs",
         alias = "updated_ms",
-        with = "::buffa::json_helpers::int64",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_zero_i64"
+        with = "::buffa::json_helpers::opt_int64",
+        skip_serializing_if = "::core::option::Option::is_none"
     )]
-    pub updated_ms: i64,
-    /// `false` when the stored definition doesn't parse (grants nothing).
-    ///
-    /// Field 9: `definition_valid`
-    #[serde(
-        rename = "definitionValid",
-        alias = "definition_valid",
-        with = "::buffa::json_helpers::proto_bool",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
-    )]
-    pub definition_valid: bool,
+    pub updated_ms: ::core::option::Option<i64>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -1581,15 +1110,12 @@ pub struct Role {
 impl ::core::fmt::Debug for Role {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("Role")
-            .field("role_id", &self.role_id)
             .field("name", &self.name)
+            .field("builtin", &self.builtin)
             .field("grants", &self.grants)
-            .field("sensitive", &self.sensitive)
-            .field("deny", &self.deny)
             .field("tokens", &self.tokens)
             .field("created_ms", &self.created_ms)
             .field("updated_ms", &self.updated_ms)
-            .field("definition_valid", &self.definition_valid)
             .finish()
     }
 }
@@ -1599,6 +1125,22 @@ impl Role {
     ///
     /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
     pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Role";
+}
+impl Role {
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::created_ms`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_created_ms(mut self, value: i64) -> Self {
+        self.created_ms = Some(value);
+        self
+    }
+    #[must_use = "with_* setters return `self` by value; assign or chain the result"]
+    #[inline]
+    ///Sets [`Self::updated_ms`] to `Some(value)`, consuming and returning `self`.
+    pub fn with_updated_ms(mut self, value: i64) -> Self {
+        self.updated_ms = Some(value);
+        self
+    }
 }
 ::buffa::impl_default_instance!(Role);
 impl ::buffa::MessageName for Role {
@@ -1620,32 +1162,23 @@ impl ::buffa::Message for Role {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
-        if !self.role_id.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.role_id) as u64;
-        }
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
+        if self.builtin {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         for v in &self.grants {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         for v in &self.tokens {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        if self.created_ms != 0i64 {
-            size += 1u64 + ::buffa::types::int64_encoded_len(self.created_ms) as u64;
+        if let Some(v) = self.created_ms {
+            size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
         }
-        if self.updated_ms != 0i64 {
-            size += 1u64 + ::buffa::types::int64_encoded_len(self.updated_ms) as u64;
-        }
-        if self.definition_valid {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        if let Some(v) = self.updated_ms {
+            size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -1657,32 +1190,23 @@ impl ::buffa::Message for Role {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        if !self.role_id.is_empty() {
-            ::buffa::types::put_string_field(1u32, &self.role_id, buf);
-        }
         if !self.name.is_empty() {
-            ::buffa::types::put_string_field(2u32, &self.name, buf);
+            ::buffa::types::put_string_field(1u32, &self.name, buf);
+        }
+        if self.builtin {
+            ::buffa::types::put_bool_field(2u32, self.builtin, buf);
         }
         for v in &self.grants {
             ::buffa::types::put_string_field(3u32, v, buf);
         }
-        for v in &self.sensitive {
+        for v in &self.tokens {
             ::buffa::types::put_string_field(4u32, v, buf);
         }
-        for v in &self.deny {
-            ::buffa::types::put_string_field(5u32, v, buf);
+        if let Some(v) = self.created_ms {
+            ::buffa::types::put_int64_field(5u32, v, buf);
         }
-        for v in &self.tokens {
-            ::buffa::types::put_string_field(6u32, v, buf);
-        }
-        if self.created_ms != 0i64 {
-            ::buffa::types::put_int64_field(7u32, self.created_ms, buf);
-        }
-        if self.updated_ms != 0i64 {
-            ::buffa::types::put_int64_field(8u32, self.updated_ms, buf);
-        }
-        if self.definition_valid {
-            ::buffa::types::put_bool_field(9u32, self.definition_valid, buf);
+        if let Some(v) = self.updated_ms {
+            ::buffa::types::put_int64_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1702,14 +1226,14 @@ impl ::buffa::Message for Role {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                ::buffa::types::merge_string(&mut self.role_id, buf)?;
+                ::buffa::types::merge_string(&mut self.name, buf)?;
             }
             2u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
+                    ::buffa::encoding::WireType::Varint,
                 )?;
-                ::buffa::types::merge_string(&mut self.name, buf)?;
+                self.builtin = ::buffa::types::decode_bool(buf)?;
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -1731,50 +1255,25 @@ impl ::buffa::Message for Role {
                 ctx.register_element_memory(
                     ::buffa::__private::element_footprint(&__elem),
                 )?;
-                self.sensitive.push(__elem);
+                self.tokens.push(__elem);
             }
             5u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
+                    ::buffa::encoding::WireType::Varint,
                 )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.deny.push(__elem);
+                self.created_ms = ::core::option::Option::Some(
+                    ::buffa::types::decode_int64(buf)?,
+                );
             }
             6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                self.tokens.push(__elem);
-            }
-            7u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                self.created_ms = ::buffa::types::decode_int64(buf)?;
-            }
-            8u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.updated_ms = ::buffa::types::decode_int64(buf)?;
-            }
-            9u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.definition_valid = ::buffa::types::decode_bool(buf)?;
+                self.updated_ms = ::core::option::Option::Some(
+                    ::buffa::types::decode_int64(buf)?,
+                );
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -1784,15 +1283,12 @@ impl ::buffa::Message for Role {
         ::core::result::Result::Ok(())
     }
     fn clear(&mut self) {
-        self.role_id.clear();
         self.name.clear();
+        self.builtin = false;
         self.grants.clear();
-        self.sensitive.clear();
-        self.deny.clear();
         self.tokens.clear();
-        self.created_ms = 0i64;
-        self.updated_ms = 0i64;
-        self.definition_valid = false;
+        self.created_ms = ::core::option::Option::None;
+        self.updated_ms = ::core::option::Option::None;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2071,7 +1567,8 @@ pub const __LIST_ROLES_RESPONSE_JSON_ANY: ::buffa::type_registry::JsonAnyEntry =
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct CreateRoleRequest {
-    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner`.
+    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner` or a
+    /// built-in role's name.
     ///
     /// Field 1: `name`
     #[serde(
@@ -2080,15 +1577,13 @@ pub struct CreateRoleRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Field 2: `definition`
+    /// Field 2: `grants`
     #[serde(
-        rename = "definition",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+        rename = "grants",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
-    pub definition: ::buffa::MessageField<
-        RoleDefinition,
-        ::buffa::Inline<RoleDefinition>,
-    >,
+    pub grants: ::buffa::alloc::vec::Vec<Grant>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2097,7 +1592,7 @@ impl ::core::fmt::Debug for CreateRoleRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("CreateRoleRequest")
             .field("name", &self.name)
-            .field("definition", &self.definition)
+            .field("grants", &self.grants)
             .finish()
     }
 }
@@ -2131,9 +1626,9 @@ impl ::buffa::Message for CreateRoleRequest {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.definition.is_set() {
+        for v in &self.grants {
             let __slot = __cache.reserve();
-            let inner_size = self.definition.compute_size(__cache);
+            let inner_size = v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -2152,13 +1647,13 @@ impl ::buffa::Message for CreateRoleRequest {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        if self.definition.is_set() {
+        for v in &self.grants {
             ::buffa::types::put_len_delimited_header(
                 2u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.definition.write_to(__cache, buf);
+            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2185,11 +1680,12 @@ impl ::buffa::Message for CreateRoleRequest {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                ::buffa::Message::merge_length_delimited(
-                    self.definition.get_or_insert_default(),
-                    buf,
-                    ctx,
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
                 )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.grants.push(elem);
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -2200,7 +1696,7 @@ impl ::buffa::Message for CreateRoleRequest {
     }
     fn clear(&mut self) {
         self.name.clear();
-        self.definition = ::buffa::MessageField::none();
+        self.grants.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2381,15 +1877,13 @@ pub struct UpdateRoleRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Field 2: `definition`
+    /// Field 2: `grants`
     #[serde(
-        rename = "definition",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
+        rename = "grants",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
-    pub definition: ::buffa::MessageField<
-        RoleDefinition,
-        ::buffa::Inline<RoleDefinition>,
-    >,
+    pub grants: ::buffa::alloc::vec::Vec<Grant>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -2398,7 +1892,7 @@ impl ::core::fmt::Debug for UpdateRoleRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         f.debug_struct("UpdateRoleRequest")
             .field("name", &self.name)
-            .field("definition", &self.definition)
+            .field("grants", &self.grants)
             .finish()
     }
 }
@@ -2432,9 +1926,9 @@ impl ::buffa::Message for UpdateRoleRequest {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.definition.is_set() {
+        for v in &self.grants {
             let __slot = __cache.reserve();
-            let inner_size = self.definition.compute_size(__cache);
+            let inner_size = v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -2453,13 +1947,13 @@ impl ::buffa::Message for UpdateRoleRequest {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        if self.definition.is_set() {
+        for v in &self.grants {
             ::buffa::types::put_len_delimited_header(
                 2u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.definition.write_to(__cache, buf);
+            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2486,11 +1980,12 @@ impl ::buffa::Message for UpdateRoleRequest {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                ::buffa::Message::merge_length_delimited(
-                    self.definition.get_or_insert_default(),
-                    buf,
-                    ctx,
+                let mut elem = ::core::default::Default::default();
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&elem),
                 )?;
+                ::buffa::Message::merge_length_delimited(&mut elem, buf, ctx)?;
+                self.grants.push(elem);
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -2501,7 +1996,7 @@ impl ::buffa::Message for UpdateRoleRequest {
     }
     fn clear(&mut self) {
         self.name.clear();
-        self.definition = ::buffa::MessageField::none();
+        self.grants.clear();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2682,26 +2177,13 @@ pub struct DeleteRoleRequest {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_str"
     )]
     pub name: ::buffa::alloc::string::String,
-    /// Delete even while live tokens hold the role; their reference then
-    /// grants nothing.
-    ///
-    /// Field 2: `force`
-    #[serde(
-        rename = "force",
-        with = "::buffa::json_helpers::proto_bool",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
-    )]
-    pub force: bool,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
 }
 impl ::core::fmt::Debug for DeleteRoleRequest {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-        f.debug_struct("DeleteRoleRequest")
-            .field("name", &self.name)
-            .field("force", &self.force)
-            .finish()
+        f.debug_struct("DeleteRoleRequest").field("name", &self.name).finish()
     }
 }
 impl DeleteRoleRequest {
@@ -2734,9 +2216,6 @@ impl ::buffa::Message for DeleteRoleRequest {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.force {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -2749,9 +2228,6 @@ impl ::buffa::Message for DeleteRoleRequest {
         use ::buffa::Enumeration as _;
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
-        }
-        if self.force {
-            ::buffa::types::put_bool_field(2u32, self.force, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2773,13 +2249,6 @@ impl ::buffa::Message for DeleteRoleRequest {
                 )?;
                 ::buffa::types::merge_string(&mut self.name, buf)?;
             }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                self.force = ::buffa::types::decode_bool(buf)?;
-            }
             _ => {
                 self.__buffa_unknown_fields
                     .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
@@ -2789,7 +2258,6 @@ impl ::buffa::Message for DeleteRoleRequest {
     }
     fn clear(&mut self) {
         self.name.clear();
-        self.force = false;
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -2826,7 +2294,7 @@ pub const __DELETE_ROLE_REQUEST_JSON_ANY: ::buffa::type_registry::JsonAnyEntry =
 #[derive(::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct DeleteRoleResponse {
-    /// The deleted role, with the tokens that held it.
+    /// The deleted role.
     ///
     /// Field 1: `role`
     #[serde(

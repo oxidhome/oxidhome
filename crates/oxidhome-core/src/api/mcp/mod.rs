@@ -26,7 +26,8 @@
 //! - `stdio` — 14.5 subprocess transport (`oxidhome mcp-stdio`
 //!   binary mode). Serves the same handler over
 //!   `(stdin, stdout)` via `rmcp::transport::stdio()` under
-//!   an ambient wildcard actor (parent-process trust model).
+//!   an ambient actor holding one role, `agent` by default
+//!   (parent-process trust model).
 
 mod config;
 mod handler;

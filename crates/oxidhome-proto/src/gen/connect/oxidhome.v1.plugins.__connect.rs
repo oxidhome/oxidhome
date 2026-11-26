@@ -423,7 +423,7 @@ pub trait PluginsService: Send + Sync + 'static {
         >,
     > + Send;
     /// Install a plugin from a local source directory. Sensitive
-    /// (`plugins:install` scope) — copies operator-supplied code
+    /// (`plugin.install` permission) — copies operator-supplied code
     /// into `<state_dir>/plugins/<plugin_id>/`. Same shape as
     /// `POST /api/v1/plugins` on the JSON API.
     ///
@@ -449,7 +449,7 @@ pub trait PluginsService: Send + Sync + 'static {
         >,
     > + Send;
     /// Start a supervised instance of an installed plugin. Gated on
-    /// `plugins:start`. Same shape as
+    /// `instance.start`. Same shape as
     /// `POST /api/v1/plugins/{plugin_id}/start`; blocks until the
     /// instance reaches `Running` before returning.
     ///
@@ -475,7 +475,7 @@ pub trait PluginsService: Send + Sync + 'static {
         >,
     > + Send;
     /// Stop one or all running instances of a plugin. Gated on
-    /// `plugins:stop`. Idempotent — returns an empty `stopped_ids`
+    /// `instance.stop`. Idempotent — returns an empty `stopped_ids`
     /// when nothing was running.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
@@ -500,7 +500,7 @@ pub trait PluginsService: Send + Sync + 'static {
         >,
     > + Send;
     /// Uninstall a plugin — removes `<state_dir>/plugins/<plugin_id>/`.
-    /// Sensitive (`plugins:uninstall` scope). Refuses with FAILED_PRECONDITION
+    /// Sensitive (`plugin.uninstall` permission). Refuses with FAILED_PRECONDITION
     /// if any instance of the plugin is running.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).

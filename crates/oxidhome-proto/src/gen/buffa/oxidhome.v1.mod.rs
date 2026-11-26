@@ -116,12 +116,11 @@ pub mod __buffa {
         reg.register_json_any(super::__NETWORK_GRANT_CHANGE_JSON_ANY);
         reg.register_json_any(super::__NOT_RESTARTED_INSTANCE_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_REQUEST_JSON_ANY);
-        reg.register_json_any(super::__SELECTOR_JSON_ANY);
+        reg.register_json_any(super::__GRANT_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_TOKENS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_TOKENS_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__TOKEN_JSON_ANY);
-        reg.register_json_any(super::__ROLE_DEFINITION_JSON_ANY);
         reg.register_json_any(super::__ROLE_JSON_ANY);
         reg.register_json_any(super::__LIST_ROLES_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_ROLES_RESPONSE_JSON_ANY);
@@ -370,9 +369,9 @@ pub use self::__buffa::view::CreateTokenRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateTokenRequestOwnedView;
 #[doc(inline)]
-pub use self::__buffa::view::SelectorView;
+pub use self::__buffa::view::GrantView;
 #[doc(inline)]
-pub use self::__buffa::view::SelectorOwnedView;
+pub use self::__buffa::view::GrantOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateTokenResponseView;
 #[doc(inline)]
@@ -389,10 +388,6 @@ pub use self::__buffa::view::ListTokensResponseOwnedView;
 pub use self::__buffa::view::TokenView;
 #[doc(inline)]
 pub use self::__buffa::view::TokenOwnedView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleDefinitionView;
-#[doc(inline)]
-pub use self::__buffa::view::RoleDefinitionOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::RoleView;
 #[doc(inline)]

@@ -23,7 +23,10 @@ use oxidhome_core::{
 };
 
 fn api_root() -> InvocationContext {
-    let actor = Actor::api("tok-h5", vec!["*".into()]);
+    let actor = Actor::api(
+        "tok-h5",
+        vec![oxidhome_core::auth::role::builtin("admin").unwrap()],
+    );
     InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
 }
 

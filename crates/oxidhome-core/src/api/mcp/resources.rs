@@ -76,7 +76,7 @@ pub(super) const UNAUTHENTICATED_TOKEN_ID: &str = "anonymous";
 /// deliberately does NOT name the required scope — the
 /// audit row records that for forensic use — so a probing
 /// caller can't enumerate the scope map by trial-and-error
-/// (mirrors [`crate::api::scopes::ScopeDenied`]'s
+/// (mirrors [`crate::api::authz::Forbidden`]'s
 /// deliberate silence on the response body).
 pub(super) const SCOPE_DENIED_CODE: ErrorCode = ErrorCode(-32001);
 
@@ -105,11 +105,6 @@ pub(super) const RESOURCE_BUSY_CODE: ErrorCode = ErrorCode(-32004);
 /// `data` is `{"cursor_expired": {after_id, oldest_id, head_id}}`, the
 /// same body the REST history and the event tails return.
 pub(super) const CURSOR_EXPIRED_CODE: ErrorCode = ErrorCode(-32005);
-
-/// H6 slice 2: the principal has used up its allowance for a
-/// sensitive category (lock, opener, alarm, camera). Retriable after
-/// the delay in the message; audits as HTTP 429.
-pub(super) const SENSITIVE_RATE_LIMITED_CODE: ErrorCode = ErrorCode(-32006);
 
 /// [`AuditEntry::actor_kind`] value we stamp on every MCP row.
 /// Matches [`crate::auth::ActorKind::Mcp`]'s `as_str()` — kept
@@ -250,7 +245,7 @@ pub(super) fn list_resource_templates() -> Vec<ResourceTemplate> {
 /// audit row; `ctx` carries its authority. Round-2 F1: authorize
 /// the per-resource action up front through
 /// [`crate::auth::authorize()`] (the same decision the REST endpoints
-/// use), so a token holding e.g. `logs:read` can't enumerate
+/// use), so a token holding e.g. `host.logs` can't enumerate
 /// devices just by hitting the MCP mount.
 /// Result of dispatching a resource read.
 ///
@@ -466,10 +461,6 @@ enum ReadOutcome {
     Denied {
         required: &'static str,
     },
-    /// H6 slice 2: a camera blob read over the principal's camera
-    /// allowance. Reported as [`SENSITIVE_RATE_LIMITED_CODE`] and
-    /// audited as HTTP 429.
-    RateLimited(String),
     Internal(String),
 }
 
@@ -505,9 +496,6 @@ impl ReadOutcome {
                 "scope denied for MCP resource",
                 None,
             )),
-            Self::RateLimited(reason) => {
-                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
-            }
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
         }
     }
@@ -520,7 +508,6 @@ impl ReadOutcome {
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
             Self::CursorExpired(_) => 410,
-            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -546,8 +533,7 @@ impl ReadOutcome {
             | Self::Denied { .. }
             | Self::InvalidParams(_)
             | Self::TooLarge(_)
-            | Self::CursorExpired(_)
-            | Self::RateLimited(_) => "deny",
+            | Self::CursorExpired(_) => "deny",
             Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
@@ -597,7 +583,7 @@ impl Kind<'_> {
             Kind::DevicesDetail(id) => engine.devices().resource(id),
             // The detail read is checked against the plugin collection:
             // `plugin.read` on `oxidhome://plugins/{id}` has always been
-            // the flat `plugins:list` scope, and naming the plugin here
+            // the flat `plugin.read` permission, and naming the plugin here
             // would newly apply a token's `plugins.show` allowlist.
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
@@ -673,14 +659,14 @@ fn resolve_route(uri: &str) -> Route<'_> {
             // model, capabilities) — the same shape
             // `oxidhome://devices` returns per row,
             // just filtered to one id. It shares the
-            // `devices:list` scope with the collection
+            // `device.list` permission with the collection
             // read (round-2 F1 on PR #120 originally
-            // gated this under `devices:read`, which is
+            // gated this under `device.read`, which is
             // reserved for the H9 device-state
             // projection — `GET /api/v1/devices/{id}/state`
             // and `state/changes`. Handing metadata
-            // access to `devices:read` tokens while
-            // withholding it from `devices:list` tokens
+            // access to `device.read` tokens while
+            // withholding it from `device.list` tokens
             // was the opposite of the intended
             // boundary — round-3 F1 fix).
             action: Action::DeviceList,
@@ -713,7 +699,7 @@ fn resolve_route(uri: &str) -> Route<'_> {
         },
         // Host configuration: operational metadata next to
         // `status` (versions, paths, listen address, limits), no
-        // secrets, so it shares `status:read` rather than minting
+        // secrets, so it shares `host.status` rather than minting
         // a new scope.
         ("config", None) => Route::Dispatch {
             family: "config",
@@ -867,11 +853,10 @@ fn blob_resource(engine: &Engine, instance: &str, name: &str) -> AuthResource {
     )
 }
 
-/// H6 slice 2: hand back a blob read only under the instance's class
-/// as it is now. The instance may have registered a camera while the
-/// read ran, so the read is authorized again; an allowed camera read
-/// is then rate limited and leaves its `warn` row. Only a successful
-/// read is charged.
+/// Hand back a blob read only under the instance's class as it is
+/// now. The instance may have registered a camera while the read ran,
+/// so the read is authorized again; an allowed camera read then leaves
+/// its `warn` row, and isn't handed back if the row can't be written.
 async fn release_blob(
     engine: &Engine,
     ctx: &InvocationContext,
@@ -890,21 +875,23 @@ async fn release_blob(
         AuthResource::Blob(b) => format!("{}/{}", b.instance_id(), b.name()),
         _ => String::new(),
     };
-    match engine
-        .sensitive()
-        .discharge_blocking(ctx, action, &target, &decision)
-        .await
-    {
-        Ok(()) => outcome,
+    if decision.sensitive.is_empty() {
+        return outcome;
+    }
+    let (audit, ctx) = (engine.audit_log(), ctx.clone());
+    let written = tokio::task::spawn_blocking(move || {
+        crate::auth::sensitive::record(&audit, &ctx, action, &target, &decision)
+    })
+    .await;
+    match written {
+        Ok(Ok(_)) => outcome,
+        Ok(Err(e)) => {
+            tracing::error!(target: "auth.sensitive", error = %e, "camera blob read refused");
+            ReadOutcome::Internal("sensitive read refused".into())
+        }
         Err(e) => {
-            use crate::auth::sensitive::ObligationError;
-            match e {
-                ObligationError::RateLimited { .. } => ReadOutcome::RateLimited(e.to_string()),
-                ObligationError::Audit(_) | ObligationError::Join(_) => {
-                    tracing::error!(target: "auth.sensitive", error = %e, "camera blob read refused");
-                    ReadOutcome::Internal("sensitive read refused".into())
-                }
-            }
+            tracing::error!(target: "auth.sensitive", error = %e, "camera blob read refused");
+            ReadOutcome::Internal("sensitive read refused".into())
         }
     }
 }
@@ -2602,15 +2589,12 @@ mod redaction_tests {
 mod release_blob_tests {
     use super::{AuthResource, ReadOutcome, release_blob};
     use crate::Engine;
-    use crate::auth::policy::SensitiveGrant;
-    use crate::auth::{
-        Action, Actor, ActorKind, InvocationContext, Principal, SensitiveCategory, Transport,
-    };
+    use crate::auth::role::builtin;
+    use crate::auth::{Action, Actor, ActorKind, InvocationContext, Principal, Transport};
     use crate::state::AuditQuery;
 
     fn viewer() -> InvocationContext {
-        let actor = Actor::api("viewer", vec!["blobs:read".into()])
-            .with_sensitive(vec![SensitiveGrant::all(SensitiveCategory::Camera)]);
+        let actor = Actor::api("viewer", vec![builtin("member").unwrap()]);
         InvocationContext::external(Principal::token(ActorKind::Mcp, &actor, Transport::McpHttp))
     }
 
@@ -2627,11 +2611,11 @@ mod release_blob_tests {
             .unwrap()
     }
 
-    /// Only a successful camera read is charged and audited, under the
-    /// read's call id; a camera read without the grant is refused even
-    /// after the bytes were fetched.
+    /// Only a successful camera read is audited, under the read's call
+    /// id; a camera read without a camera grant is refused even after
+    /// the bytes were fetched.
     #[tokio::test]
-    async fn only_a_released_camera_blob_is_charged() {
+    async fn only_a_released_camera_blob_is_audited() {
         let engine = Engine::new().expect("engine");
         let ctx = viewer();
         let camera = || AuthResource::blob("cam", "snap.jpg", true);
@@ -2651,7 +2635,9 @@ mod release_blob_tests {
         assert_eq!(warn.len(), 1, "{warn:?}");
         assert_eq!(warn[0].call_id.as_deref(), Some(ctx.call_id()));
 
-        let reader = Actor::api("reader", vec!["blobs:read".into()]);
+        let blobs =
+            crate::auth::RoleDef::parse("blobs", br#"[{"actions":["blob.read"]}]"#).unwrap();
+        let reader = Actor::api("reader", vec![std::sync::Arc::new(blobs)]);
         let reader = InvocationContext::external(Principal::token(
             ActorKind::Mcp,
             &reader,

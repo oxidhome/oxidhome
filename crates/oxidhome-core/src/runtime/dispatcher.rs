@@ -93,7 +93,7 @@
 //! hop decision. [`crate::auth::authorize_hop`] combines it with the
 //! root's own authority: when the invocation is rooted at an external
 //! principal, the root must hold `service.call` on the target (the
-//! `services:call` scope, or a role grant whose `services` selector
+//! `service.call` permission, or a role grant whose `services` selector
 //! covers it) and none of its denies may match. A narrow token can't
 //! have a script call services on its behalf that the token itself
 //! wasn't given. Host-rooted work is decided by the grant alone.
@@ -107,7 +107,7 @@
 //! intent/finalize contract as API requests and fail closed if the
 //! intent cannot be written; refusals are single-shot `deny` rows
 //! whose `required_scope` names what was missing (`consumes_services`
-//! for the plugin's grant, `services:call` or `deny` for the root).
+//! for the plugin's grant, `service.call` or `deny` for the root).
 //! Other host-origin chains (`init`, `tick`, reactions to unattributed
 //! events) are traced but not audited.
 //!
@@ -411,10 +411,9 @@ pub(crate) async fn call_service(
         matches_requested && matches_granted,
     );
     if decision.allow {
-        // `service.call` targets carry no sensitive category yet, so
-        // an allowed hop has no obligations to meet. When services can
-        // be marked sensitive, the charge is made here, at dispatch.
-        debug_assert!(decision.obligations.sensitive.is_empty());
+        // `service.call` targets carry no sensitive category: an
+        // allowed hop has no `warn` row to write.
+        debug_assert!(decision.sensitive.is_empty());
     } else if matches_requested && matches_granted {
         // The plugin may make the call; the root may not have it made.
         // The reason stays in the audit row.
@@ -429,7 +428,7 @@ pub(crate) async fn call_service(
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: invocation `{}` was not granted \
              `service.call` on target `{target_plugin_id}` service `{target_local_id}` \
-             command `{}` by its root principal (a token needs `services:call` or a \
+             command `{}` by its root principal (a token needs `service.call` or a \
              role grant naming the service for every hop it causes)",
             callee_ctx.call_id(),
             audit_cap(&command),
@@ -1379,7 +1378,10 @@ mod tests {
     }
 
     fn api_root() -> InvocationContext {
-        let actor = crate::auth::Actor::api("tok-root", vec!["*".into()]);
+        let actor = crate::auth::Actor::api(
+            "tok-root",
+            vec![crate::auth::role::builtin("admin").unwrap()],
+        );
         InvocationContext::external(crate::auth::Principal::token(
             crate::auth::ActorKind::Api,
             &actor,
@@ -1509,15 +1511,12 @@ mod tests {
         assert_eq!(inv["chain"][0]["instance"], "beta");
     }
 
-    /// H6 slice 4: the root's permit is asked on every hop, not just
-    /// the first. A token that may call `ring` of `com.example.alpha`
-    /// (the first hop) can't have alpha's wasm call beta's `ring`,
-    /// although alpha's own grant allows it.
+    /// The root's permit is asked on every hop, not just the first: a
+    /// token without `service.call` can't have alpha's wasm call beta's
+    /// `ring`, although alpha's own grant allows it.
     #[tokio::test(flavor = "current_thread")]
     async fn inner_hop_needs_the_roots_permit_too() {
-        use crate::auth::{
-            Action, ActionSet, Actor, ActorKind, Principal, RoleDef, RoleGrant, Transport,
-        };
+        use crate::auth::{Actor, ActorKind, Principal, RoleDef, Transport};
         use crate::state::{AuditQuery, Db};
 
         let services = Arc::new(ServiceRegistry::new());
@@ -1531,18 +1530,8 @@ mod tests {
         let instances = Arc::new(InstanceRegistry::new());
         let audit = Arc::new(AuditLog::new(Arc::new(Db::open_in_memory().expect("db"))));
         let grants = [grant_any("com.example.beta", "ring", "kick")];
-        let actor = Actor::api("tok-scene", Vec::new()).with_roles(vec![Arc::new(RoleDef {
-            id: "role-0123456789abcdef".into(),
-            name: "scene".into(),
-            grants: vec![RoleGrant {
-                actions: ActionSet::of(&[Action::ServiceCall]),
-                categories: None,
-                devices: None,
-                services: Some(vec!["com.example.alpha/ring".into()]),
-            }],
-            sensitive: Vec::new(),
-            deny: Vec::new(),
-        })]);
+        let viewer = RoleDef::parse("viewer", br#"[{"actions":["device.read"]}]"#).unwrap();
+        let actor = Actor::api("tok-scene", vec![Arc::new(viewer)]);
         // The first hop (driver → alpha) is already on the chain.
         let ctx =
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
@@ -1584,7 +1573,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].required_scope.as_deref(), Some("no-permit"));
+        assert_eq!(rows[0].required_scope.as_deref(), Some("service.call"));
         assert_eq!(rows[0].token_id, "tok-scene");
 
         // A wildcard command grant lets an unchecked, oversized command

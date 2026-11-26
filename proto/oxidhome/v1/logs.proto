@@ -2,7 +2,7 @@
 //
 // Historical log query against the `LogStore` SQLite table:
 // mirrors `GET /api/v1/logs?…` on the JSON API. Gated on the
-// `logs:read` scope. Filter fields AND-combine; a nil field is
+// `host.logs` permission. Filter fields AND-combine; a nil field is
 // "no constraint on this axis." Returns rows newest-first (the
 // store's native order).
 syntax = "proto3";

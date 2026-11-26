@@ -12,16 +12,16 @@
 //!
 //! - `summarize_today` — walks the client through fetching
 //!   today's events + logs and producing a plain-language
-//!   summary. Gated on `events:read` + `logs:read`.
+//!   summary. Gated on `event.read` + `host.logs`.
 //! - `draft_automation` — walks the client through drafting an
 //!   automation rule given a trigger + action. Gated on
-//!   `devices:list` (both the collection `oxidhome://devices`
+//!   `device.list` (both the collection `oxidhome://devices`
 //!   and the per-id `oxidhome://devices/{id}` share this
 //!   scope) so the draft can reference real device ids +
 //!   capability names.
 //! - `explain_recent_errors` — walks the client through
 //!   fetching recent error-level logs and explaining what went
-//!   wrong. Gated on `logs:read` — event rows carry state
+//!   wrong. Gated on `host.logs` — event rows carry state
 //!   transitions, not command failures (those live in the audit
 //!   ledger, which the MCP surface does not yet expose), so
 //!   this prompt sticks to log evidence.
@@ -32,7 +32,7 @@
 //! catalogue regardless of scope. `prompts/get` authorizes the
 //! actions the prompt's resources need (through
 //! [`crate::auth::authorize()`]) and lands denials as
-//! `ScopeDenied` (`-32001`), matching the resource + tool
+//! `Forbidden` (`-32001`), matching the resource + tool
 //! surface's shape. The rationale: a prompt template is not
 //! itself sensitive (it's a documented pattern for using the
 //! server), but embedding it inside a session where the caller
@@ -151,7 +151,7 @@ pub(super) fn get(
         "draft_automation" => {
             let (trigger, action) = draft_automation_args(request.arguments.as_ref())?;
             (
-                // Round-2 P1 on PR #135: only `devices:list`
+                // Round-2 P1 on PR #135: only `device.list`
                 // is needed. Both `oxidhome://devices` (the
                 // collection) and `oxidhome://devices/{id}`
                 // (per-device detail — same registration
@@ -159,8 +159,8 @@ pub(super) fn get(
                 // one id) share this single scope by design
                 // (see resources.rs — round-2 F1 on PR #120
                 // deliberately unified them). The previous
-                // round-1 fix over-required `plugins:list` +
-                // `devices:read` on top of this, which
+                // round-1 fix over-required `plugin.read` +
+                // `device.read` on top of this, which
                 // rejected correctly-scoped least-privilege
                 // tokens.
                 &[DEVICES][..],
@@ -169,7 +169,7 @@ pub(super) fn get(
             )
         }
         "explain_recent_errors" => (
-            // Round-1 P1 on PR #135: dropped `events:read` —
+            // Round-1 P1 on PR #135: dropped `event.read` —
             // event rows are state transitions and don't carry
             // command failures. This prompt sticks to log
             // evidence; command-outcome failures would need the
@@ -190,7 +190,7 @@ pub(super) fn get(
     if let Some(scope) = first_denied(ctx, required_scopes) {
         return Err(McpError::new(
             SCOPE_DENIED_CODE,
-            format!("scope `{scope}` required for prompt `{name}`"),
+            format!("permission `{scope}` required for prompt `{name}`"),
             None,
         ));
     }
@@ -306,7 +306,7 @@ fn draft_automation_message(trigger: &str, action: &str) -> String {
             `device_id` and `capability`, plus an action verb (call out whether the verb is \
             from a well-known convention or needs operator confirmation).\n\
          4. Any preconditions or safety notes the operator should know before enabling it (e.g. \
-            `devices:command` scope, locks / alarms flagged destructive).\n\
+            `device.command` permission, locks / alarms flagged destructive).\n\
          \n\
          If a needed device or capability isn't in the fleet, say so and stop — do not draft \
          against one that isn't there."

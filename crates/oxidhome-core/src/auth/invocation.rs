@@ -106,8 +106,8 @@ impl Transport {
 /// subject is the token id; a future user model changes the subject
 /// without touching `credential_id`.
 ///
-/// It also carries the principal's resolved [`Authority`] (scopes and
-/// 14.4 constraints) that [`crate::auth::authorize()`] decides on. The
+/// It also carries the principal's resolved [`Authority`] (owner flag and
+/// roles) that [`crate::auth::authorize()`] decides on. The
 /// authority is host-only: [`InvocationContext::audit_json`] does not
 /// include it, and equality ignores it: two principals are equal when
 /// they name the same caller, as before the authority was added.
@@ -134,8 +134,8 @@ impl Eq for Principal {}
 impl Principal {
     /// Principal for a caller that authenticated with a bearer token.
     /// `kind` is the audit actor kind the transport records (`api` for
-    /// REST / Connect, `mcp` for MCP tool calls). The token's scopes and
-    /// constraints become the principal's [`Authority`].
+    /// REST / Connect, `mcp` for MCP tool calls). The token.s owner flag and
+    /// roles become the principal's [`Authority`].
     #[must_use]
     pub fn token(kind: ActorKind, actor: &Actor, transport: Transport) -> Self {
         Self {
@@ -209,7 +209,7 @@ impl Principal {
         self.transport
     }
 
-    /// Resolved scopes and constraints [`crate::auth::authorize()`]
+    /// Resolved owner flag and roles [`crate::auth::authorize()`]
     /// decides on. Empty for host-origin principals.
     #[must_use]
     pub fn authority(&self) -> &Authority {
@@ -536,8 +536,8 @@ mod tests {
 
     #[test]
     fn principal_equality_ignores_authority() {
-        let a = Actor::api("tok-1", vec!["devices:list".into(), "logs:read".into()]);
-        let b = Actor::api("tok-1", vec!["logs:read".into(), "devices:list".into()]);
+        let a = Actor::api("tok-1", vec![]);
+        let b = Actor::api("tok-1", crate::auth::role::builtins().to_vec());
         assert_eq!(
             Principal::token(ActorKind::Api, &a, Transport::Rest),
             Principal::token(ActorKind::Api, &b, Transport::Rest),
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn token_principal_separates_subject_credential_and_transport() {
-        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let actor = Actor::api("tok-1", vec![]);
         let p = Principal::token(ActorKind::Mcp, &actor, Transport::McpHttp);
         assert_eq!(p.kind(), ActorKind::Mcp);
         assert_eq!(p.subject(), "tok-1");

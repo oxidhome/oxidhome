@@ -2,8 +2,10 @@
 //! and Connect `TailEvents`). The handoff race itself is covered by
 //! `state::event_tail` unit tests; these check the wire protocol.
 
+mod support;
 use std::net::SocketAddr;
 use std::time::Duration;
+use support::Mint;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -134,7 +136,7 @@ async fn ws_tail_resumes_from_cursor_then_goes_live() {
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("resume", br#"["events:tail","events:read"]"#)
+        .mint("resume", &["event.subscribe", "event.read"])
         .expect("token");
     for n in 1..=3 {
         publish_recorded(&engine, n).await;
@@ -164,7 +166,7 @@ async fn ws_tail_reports_cursor_expired_and_closes() {
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("resume", br#"["events:tail","events:read"]"#)
+        .mint("resume", &["event.subscribe", "event.read"])
         .expect("token");
     for n in 1..=5 {
         publish_recorded(&engine, n).await;
@@ -191,14 +193,14 @@ async fn ws_tail_reports_cursor_expired_and_closes() {
     server.abort();
 }
 
-/// A cursor replays history, so it needs `events:read` on top of
-/// `events:tail`.
+/// A cursor replays history, so it needs `event.read` on top of
+/// `event.subscribe`.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_tail_cursor_requires_events_read() {
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("tail-only", br#"["events:tail"]"#)
+        .mint("tail-only", &["event.subscribe"])
         .expect("token");
     let (addr, server) = serve_engine(&engine).await;
     match ws_connect(addr, "?after_id=0", &token.plaintext).await {
@@ -213,13 +215,13 @@ async fn ws_tail_cursor_requires_events_read() {
 }
 
 /// The replay refusal on both tail transports lands in the audit
-/// ledger as a deny naming `events:read`, the scope the cursor needs.
+/// ledger as a deny naming `event.read`, the scope the cursor needs.
 #[tokio::test(flavor = "multi_thread")]
 async fn tail_cursor_denials_audit_events_read() {
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("tail-only", br#"["events:tail"]"#)
+        .mint("tail-only", &["event.subscribe"])
         .expect("token");
     let (addr, server) = serve_engine(&engine).await;
     assert!(
@@ -228,7 +230,7 @@ async fn tail_cursor_denials_audit_events_read() {
             .is_err()
     );
     server.abort();
-    let (_, body) = connect_tail(&engine, br#"["events:tail"]"#, br#"{"afterId":"0"}"#).await;
+    let (_, body) = connect_tail(&engine, &["event.subscribe"], br#"{"afterId":"0"}"#).await;
     let _ = connect_messages(body, 1).await;
 
     for path in [
@@ -249,7 +251,7 @@ async fn tail_cursor_denials_audit_events_read() {
         }
         let row = row.unwrap_or_else(|| panic!("no audit row for {path}"));
         assert_eq!(row.decision, "deny", "{path}: {row:?}");
-        assert_eq!(row.required_scope.as_deref(), Some("events:read"), "{path}");
+        assert_eq!(row.required_scope.as_deref(), Some("event.read"), "{path}");
     }
 }
 
@@ -298,10 +300,10 @@ async fn connect_messages(body: Body, n: usize) -> (Vec<Value>, Option<Value>) {
     .map_or_else(|_| panic!("connect messages within 5s"), |end| (out, end))
 }
 
-async fn connect_tail(engine: &Engine, scopes: &[u8], request: &[u8]) -> (Option<String>, Body) {
+async fn connect_tail(engine: &Engine, actions: &[&str], request: &[u8]) -> (Option<String>, Body) {
     let token = engine
         .auth_tokens()
-        .create("connect", scopes)
+        .mint("connect", actions)
         .expect("token");
     let response = build_router(engine.clone())
         .oneshot(
@@ -331,7 +333,7 @@ async fn connect_tail_resumes_from_cursor() {
     }
     let (resume, body) = connect_tail(
         &engine,
-        br#"["events:tail","events:read"]"#,
+        &["event.subscribe", "event.read"],
         br#"{"afterId":"1"}"#,
     )
     .await;
@@ -362,7 +364,7 @@ async fn connect_tail_reports_cursor_expired_then_ends() {
     engine.event_log().trim_older_than(4).expect("trim");
     let (resume, body) = connect_tail(
         &engine,
-        br#"["events:tail","events:read"]"#,
+        &["event.subscribe", "event.read"],
         br#"{"afterId":"2"}"#,
     )
     .await;
@@ -381,7 +383,7 @@ async fn connect_tail_reports_cursor_expired_then_ends() {
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_tail_cursor_requires_events_read() {
     let engine = Engine::new().expect("engine");
-    let (_, body) = connect_tail(&engine, br#"["events:tail"]"#, br#"{"afterId":"0"}"#).await;
+    let (_, body) = connect_tail(&engine, &["event.subscribe"], br#"{"afterId":"0"}"#).await;
     let (messages, end) = connect_messages(body, 1).await;
     assert_eq!(messages, Vec::<Value>::new());
     assert_eq!(
@@ -401,7 +403,7 @@ async fn history_query_reports_pruned_cursor_as_gone() {
     engine.event_log().trim_older_than(4).expect("trim");
     let token = engine
         .auth_tokens()
-        .create("history", br#"["events:read"]"#)
+        .mint("history", &["event.read"])
         .expect("token");
     let get = |query: &'static str| {
         Request::builder()
@@ -434,7 +436,7 @@ async fn history_query_reports_pruned_cursor_as_gone() {
 }
 
 /// M7 + H4: events replayed from history withhold `bytes-val`
-/// payloads from a token without `blobs:read`, like live ones.
+/// payloads from a token without `blob.read`, like live ones.
 #[tokio::test(flavor = "multi_thread")]
 async fn replayed_events_withhold_bytes_without_blobs_read() {
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::events::StateChange;
@@ -470,7 +472,7 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
     }
     let token = engine
         .auth_tokens()
-        .create("resume", br#"["events:tail","events:read"]"#)
+        .mint("resume", &["event.subscribe", "event.read"])
         .expect("token");
     let (addr, server) = serve_engine(&engine).await;
     let mut ws = ws_connect(addr, "?after_id=0", &token.plaintext)
@@ -480,7 +482,7 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
     assert_eq!(frame["id"], 1);
     let withheld = serde_json::json!({
         "t": "Json",
-        "v": r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blobs:read"}"#,
+        "v": r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blob.read"}"#,
     });
     assert_eq!(frame["payload"]["fields"][0]["value"], withheld, "{frame}");
     let _ = ws.close(None).await;
@@ -489,7 +491,7 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
     // Connect replay withholds the same way.
     let (_, body) = connect_tail(
         &engine,
-        br#"["events:tail","events:read"]"#,
+        &["event.subscribe", "event.read"],
         br#"{"afterId":"0"}"#,
     )
     .await;
@@ -497,14 +499,14 @@ async fn replayed_events_withhold_bytes_without_blobs_read() {
     let value = &messages[0]["event"]["stateChanged"]["fields"][0]["value"];
     assert!(value.get("bytesVal").is_none(), "bytes leaked: {value}");
     assert_eq!(
-        value["jsonVal"], r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blobs:read"}"#,
+        value["jsonVal"], r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blob.read"}"#,
         "{value}"
     );
 
-    // With `blobs:read` the bytes come through.
+    // With `blob.read` the bytes come through.
     let (_, body) = connect_tail(
         &engine,
-        br#"["events:tail","events:read","blobs:read"]"#,
+        &["event.subscribe", "event.read", "blob.read"],
         br#"{"afterId":"0"}"#,
     )
     .await;

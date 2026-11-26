@@ -41,9 +41,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::Engine;
-use crate::auth::SensitiveSet;
 use crate::auth::invocation::{self, InvocationContext};
-use crate::auth::sensitive::SensitiveCharge;
 use crate::clock::{Clock, Interval, Sleep};
 use crate::host_impl::plugin::oxidhome::plugin::devices::{Command, CommandResult};
 use crate::host_impl::plugin::oxidhome::plugin::types::{
@@ -199,14 +197,6 @@ enum ControlCommand {
         ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
-        /// H6 slice 2: the sensitive obligations the caller's decision
-        /// carried at admission: its categories (`None`: none) and the
-        /// rate-limit charge already taken. The supervisor
-        /// re-authorizes at dispatch and refuses a command whose
-        /// device has since gained a category outside them; it commits
-        /// the charge (the `warn` audit row) only when the command
-        /// starts. Dropped with an unstarted command, it is refunded.
-        charge: Option<SensitiveCharge>,
         ticket: DispatchTicket,
         reply: oneshot::Sender<CommandOutcome>,
     },
@@ -630,40 +620,20 @@ impl InstanceHandle {
     /// a lost supervisor is `outcome_unknown`. Dropping the returned
     /// future withdraws a still-queued command.
     ///
-    /// H6 slice 2: this entry point admits no sensitive category, so
-    /// an external caller's command to a lock, opener, alarm or
-    /// camera device is `rejected` at dispatch. Sensitive commands
-    /// go through the API surfaces, which reserve the rate-limit
-    /// charge and then call [`Self::execute_command_admitted`].
+    /// An external command is authorized again when the supervisor
+    /// dequeues it, against the device's class then: a caller no
+    /// longer allowed gets `rejected` without the plugin being entered.
+    /// A command on a sensitive device leaves its `warn` audit row
+    /// before it runs (and doesn't run if the row can't be written).
     pub async fn execute_command_in(
         &self,
         ctx: InvocationContext,
         device: DeviceId,
-        cmd: Command,
-    ) -> CommandReport {
-        self.execute_command_admitted(ctx, device, cmd, None).await
-    }
-
-    /// [`Self::execute_command_in`] for a caller whose authorization
-    /// decision covered the sensitive categories of `charge` (H6
-    /// slice 2), reserved by
-    /// [`crate::auth::sensitive::SensitiveGuard::reserve`]. An external
-    /// command is re-authorized when the supervisor dequeues it: if the
-    /// device's class now needs a category outside the charge's, or the
-    /// caller is no longer allowed at all, it is `rejected` without
-    /// running. The charge is committed (its `warn` audit row written)
-    /// only once the command starts; a command that never runs refunds
-    /// it.
-    pub async fn execute_command_admitted(
-        &self,
-        ctx: InvocationContext,
-        device: DeviceId,
         mut cmd: Command,
-        charge: Option<SensitiveCharge>,
     ) -> CommandReport {
         let command_id = mint_command_id();
         cmd.id.clone_from(&command_id);
-        let outcome = self.dispatch_command(ctx, device, cmd, charge).await;
+        let outcome = self.dispatch_command(ctx, device, cmd).await;
         CommandReport {
             command_id,
             outcome,
@@ -675,7 +645,6 @@ impl InstanceHandle {
         ctx: InvocationContext,
         device: DeviceId,
         cmd: Command,
-        charge: Option<SensitiveCharge>,
     ) -> CommandOutcome {
         let ticket = DispatchTicket::default();
         let (reply, rx) = oneshot::channel();
@@ -696,7 +665,6 @@ impl InstanceHandle {
             ctx,
             device,
             cmd,
-            charge,
             ticket: ticket.clone(),
             reply,
         });
@@ -2241,32 +2209,26 @@ fn record_refusal(
     }
 }
 
-/// Why an external command admitted for `admitted` may not run against
-/// `resource` as it is classed now; `None` when it may (or when the
-/// command is host-origin, which no grant governs).
-fn dispatch_refusal(
+/// Authorize an external command again against `resource` as it is
+/// classed now: `Err` with why it may not run, else the decision when
+/// it touches a sensitive category (its `warn` row is due). A
+/// host-origin command, which no grant governs, passes.
+fn dispatch_check(
     ctx: &InvocationContext,
     resource: &crate::auth::Resource,
-    admitted: SensitiveSet,
-) -> Option<String> {
+) -> Result<Option<crate::auth::Decision>, String> {
     if !ctx.root().is_external() {
-        return None;
+        return Ok(None);
     }
     let decision = crate::auth::authorize(ctx, crate::auth::Action::DeviceCommand, resource);
     if !decision.allow {
-        return Some(
+        return Err(
             "the caller may not command this device (its category may have changed \
-                     while the command was queued)"
+                    while the command was queued)"
                 .to_owned(),
         );
     }
-    (!decision.obligations.sensitive.is_subset(admitted)).then(|| {
-        format!(
-            "the device is sensitive ({}) and this command was not admitted for that; \
-             send it through an authorized API surface",
-            decision.obligations.sensitive.to_csv()
-        )
-    })
+    Ok((!decision.sensitive.is_empty()).then_some(decision))
 }
 
 /// Reply with the outcome of a command the plugin was entered for, and
@@ -2332,15 +2294,14 @@ fn record_late_service_result(
 
 /// After a sensitive command's `warn` row: refuse it if its device's
 /// class changed, or its deadline passed, during the write.
-fn recheck_after_commit(
+fn recheck_after_record(
     instance: &PluginInstance,
     ctx: &InvocationContext,
     device: &DeviceId,
-    admitted: SensitiveSet,
     instance_id: &str,
 ) -> Option<CommandOutcome> {
     let refusal = match instance.device_resource(device) {
-        Some(resource) => dispatch_refusal(ctx, &resource, admitted),
+        Some(resource) => dispatch_check(ctx, &resource).err(),
         None => Some("the device is no longer registered; the command did not run".to_owned()),
     };
     if let Some(why) = refusal {
@@ -2357,19 +2318,21 @@ fn recheck_after_commit(
     })
 }
 
-/// Commit a started command's sensitive charge (its `warn` row); the
+/// Write a started sensitive command's `warn` row, durably; the
 /// `rejected` outcome when that fails and the command must not run.
-async fn commit_charge(
-    charge: SensitiveCharge,
-    instance_id: &str,
+async fn record_sensitive(
+    audit: Option<Arc<crate::state::AuditLog>>,
+    ctx: &InvocationContext,
+    device: &DeviceId,
+    decision: crate::auth::Decision,
     command_id: &str,
 ) -> Result<(), CommandOutcome> {
-    charge.commit().await.map_err(|err| {
+    let failed = |error: String| {
         tracing::error!(
             target: "auth.sensitive",
-            instance_id = %instance_id,
+            call_id = %ctx.call_id(),
             command_id = %command_id,
-            error = %err,
+            error = %error,
             "recording the sensitive command failed; it did not run",
         );
         CommandOutcome::Rejected {
@@ -2377,7 +2340,24 @@ async fn commit_charge(
                 "recording the sensitive command failed; it did not run".to_owned(),
             ),
         }
+    };
+    let Some(audit) = audit else {
+        return Err(failed("no audit log".to_owned()));
+    };
+    let (ctx, target) = (ctx.clone(), device.clone());
+    tokio::task::spawn_blocking(move || {
+        crate::auth::sensitive::record(
+            &audit,
+            &ctx,
+            crate::auth::Action::DeviceCommand,
+            &target,
+            &decision,
+        )
     })
+    .await
+    .map_err(|e| failed(e.to_string()))?
+    .map(drop)
+    .map_err(|e| failed(e.to_string()))
 }
 
 /// `ControlCommand::Execute`: run one device command and reply with
@@ -2388,25 +2368,26 @@ async fn run_execute(
     stop: &mut watch::Receiver<bool>,
     instance_id: &str,
     ctx: InvocationContext,
-    (device, cmd, charge): (DeviceId, Command, Option<SensitiveCharge>),
+    (device, cmd): (DeviceId, Command),
     ticket: &DispatchTicket,
     reply: oneshot::Sender<CommandOutcome>,
 ) -> anyhow::Result<LoopAction> {
-    let admitted = charge
-        .as_ref()
-        .map_or_else(SensitiveSet::empty, SensitiveCharge::categories);
-    // H6 slice 2: the device's class may have changed while the
-    // command was queued (a plugin's `update-device`, an operator's
-    // category raise). Re-authorize against the class it has now; a
-    // command admitted for a switch must not actuate a lock.
-    let refusal = match instance.device_resource(&device) {
-        Some(resource) => dispatch_refusal(&ctx, &resource, admitted),
+    // The device's class may have changed while the command was queued
+    // (a plugin's `update-device`, an operator's category raise).
+    // Re-authorize against the class it has now; a command allowed on
+    // a switch must not actuate a lock.
+    let checked = match instance.device_resource(&device) {
+        Some(resource) => dispatch_check(&ctx, &resource),
         // Removed (or dropped by a refused re-registration) while the
         // command was queued: nothing classes it any more.
         None if ctx.root().is_external() => {
-            Some("the device is no longer registered; the command did not run".to_owned())
+            Err("the device is no longer registered; the command did not run".to_owned())
         }
-        None => None,
+        None => Ok(None),
+    };
+    let (sensitive, refusal) = match checked {
+        Ok(sensitive) => (sensitive, None),
+        Err(why) => (None, Some(why)),
     };
     if let Some(why) = refusal
         && let Some(caller_gone) = ticket.try_refuse()
@@ -2461,27 +2442,26 @@ async fn run_execute(
         }
         return Ok(LoopAction::Continue);
     }
-    // H6 slice 2: the command is dispatched; only now does it keep its
-    // rate-limit charge and leave its `warn` row (fail-closed: no row,
-    // no run). The write is awaited, so a stop request, the device's
-    // class and the deadline are checked again after it. The command was claimed as
-    // started: a caller whose deadline passes during the write reports
-    // `outcome_unknown` for a command that in fact never ran.
-    // A stop already requested refuses it before the write, so the
-    // charge is refunded and no row is left.
+    // The command is dispatched: a sensitive one leaves its `warn` row
+    // now (fail-closed: no row, no run). The write is awaited, so a
+    // stop request, the device's class and the deadline are checked
+    // again after it. The command was claimed as started: a caller
+    // whose deadline passes during the write reports `outcome_unknown`
+    // for a command that in fact never ran.
     let stopping = || CommandOutcome::Rejected {
         error: WitError::Unavailable(format!(
             "instance `{instance_id}` is stopping; the command did not run"
         )),
     };
-    if let Some(charge) = charge
-        && let Some(refused) = match charge {
-            _ if stop_is_requested(stop) => Some(stopping()),
-            charge => match commit_charge(charge, instance_id, &cmd.id).await {
+    if let Some(decision) = sensitive
+        && let Some(refused) = if stop_is_requested(stop) {
+            Some(stopping())
+        } else {
+            match record_sensitive(instance.audit_log(), &ctx, &device, decision, &cmd.id).await {
                 Err(refused) => Some(refused),
                 Ok(()) if stop_is_requested(stop) => Some(stopping()),
-                Ok(()) => recheck_after_commit(instance, &ctx, &device, admitted, instance_id),
-            },
+                Ok(()) => recheck_after_record(instance, &ctx, &device, instance_id),
+            }
         }
     {
         reply_command_outcome(reply, refused, |outcome| {
@@ -2573,7 +2553,6 @@ async fn handle_control(
             ctx,
             device,
             cmd,
-            charge,
             ticket,
             reply,
         }) => {
@@ -2582,7 +2561,7 @@ async fn handle_control(
                 stop,
                 instance_id,
                 ctx,
-                (device, cmd, charge),
+                (device, cmd),
                 &ticket,
                 reply,
             )
@@ -2710,44 +2689,37 @@ mod tests {
 
     fn api_ctx() -> InvocationContext {
         use crate::auth::{Actor, ActorKind, Principal, Transport};
-        let actor = Actor::api("tok-1", vec!["*".into()]);
+        let actor = Actor::api("tok-1", vec![crate::auth::role::builtin("guest").unwrap()]);
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
     }
 
-    /// H6 slice 2: a command admitted for a switch is refused at
-    /// dispatch once the device reads as a lock, unless the admission
-    /// already covered `lock`; host-origin commands are not checked.
+    /// A command allowed on a switch is refused at dispatch once the
+    /// device reads as a lock, unless a role grant names `lock`; then
+    /// its decision is returned for the `warn` row. Host-origin
+    /// commands are not checked.
     #[test]
     fn dispatch_rechecks_the_device_class() {
-        use crate::auth::policy::SensitiveGrant;
+        use crate::auth::role::builtin;
         use crate::auth::{
-            Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Resource, SensitiveCategory,
-            Transport,
+            Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Resource, Transport,
         };
         let switch = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Switch));
         let lock = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Lock));
-        let none = SensitiveSet::empty();
-        let locks: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
 
-        assert_eq!(dispatch_refusal(&api_ctx(), &switch, none), None);
+        assert_eq!(dispatch_check(&api_ctx(), &switch), Ok(None));
         assert!(
-            dispatch_refusal(&api_ctx(), &lock, none).is_some(),
-            "no grant"
+            dispatch_check(&api_ctx(), &lock).is_err(),
+            "guest has no lock"
         );
 
-        let granted = Actor::api("tok-2", vec!["*".into()])
-            .with_sensitive(vec![SensitiveGrant::all(SensitiveCategory::Lock)]);
-        let ctx = InvocationContext::external(Principal::token(
-            ActorKind::Api,
-            &granted,
-            Transport::Rest,
-        ));
-        let why = dispatch_refusal(&ctx, &lock, none).expect("grant, but not admitted");
-        assert!(why.contains("lock"), "{why}");
-        assert_eq!(dispatch_refusal(&ctx, &lock, locks), None);
+        let member = Actor::api("tok-2", vec![builtin("member").unwrap()]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &member, Transport::Rest));
+        let decision = dispatch_check(&ctx, &lock).unwrap().expect("sensitive");
+        assert_eq!(decision.sensitive.to_csv(), "lock");
 
         let host = InvocationContext::host_origin("inst");
-        assert_eq!(dispatch_refusal(&host, &lock, none), None);
+        assert_eq!(dispatch_check(&host, &lock), Ok(None));
     }
 
     /// The journal-backed table and ledger the ordering tests read.

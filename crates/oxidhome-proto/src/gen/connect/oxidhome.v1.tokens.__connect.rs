@@ -316,9 +316,9 @@ pub const TOKENS_SERVICE_LIST_TOKENS_SPEC: ::connectrpc::Spec = ::connectrpc::Sp
 #[allow(clippy::type_complexity)]
 pub trait TokensService: Send + Sync + 'static {
     /// Mint a token. The response carries its bearer secret, once; the
-    /// host keeps only the hash. Refuses an unknown role, scope,
-    /// category or action, `owner` (only the host assigns it) and the
-    /// reserved `admin` label with INVALID_ARGUMENT.
+    /// host keeps only the hash. Refuses an unknown role, `owner` (only
+    /// the host assigns it) and the reserved `admin` label with
+    /// INVALID_ARGUMENT.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -341,8 +341,8 @@ pub trait TokensService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// List every token with its roles, scopes, sensitive grants and
-    /// deny list. Never returns a secret or hash.
+    /// List every token with its owner flag and roles. Never returns a
+    /// secret or hash.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -823,9 +823,9 @@ pub const ROLES_SERVICE_DELETE_ROLE_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
         ::connectrpc::StreamType::Unary,
     )
     .with_idempotency_level(::connectrpc::IdempotencyLevel::Unknown);
-/// RolesService — owner-defined roles. A token references a role by
-/// id: an edit applies to every token holding it from its next request
-/// on, and a reference to a deleted role grants nothing.
+/// RolesService — the built-in roles (`admin`, `member`, `guest`,
+/// `agent`) and the owner's custom ones. A token holds roles by name:
+/// an edit applies to every token holding it from its next request on.
 ///
 /// # Implementing handlers
 ///
@@ -876,7 +876,7 @@ pub const ROLES_SERVICE_DELETE_ROLE_SPEC: ::connectrpc::Spec = ::connectrpc::Spe
 /// example` doc.
 #[allow(clippy::type_complexity)]
 pub trait RolesService: Send + Sync + 'static {
-    /// Every role, by name.
+    /// The built-in roles, then the custom ones by name.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -899,8 +899,8 @@ pub trait RolesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Define a role. ALREADY_EXISTS for a taken name; INVALID_ARGUMENT
-    /// for a bad name or definition.
+    /// Define a custom role. ALREADY_EXISTS for a taken name;
+    /// INVALID_ARGUMENT for a bad or built-in name or bad grants.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -923,7 +923,7 @@ pub trait RolesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Replace a role's definition. NOT_FOUND for an unknown name.
+    /// Replace a custom role's grants. NOT_FOUND for an unknown name.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -946,8 +946,8 @@ pub trait RolesService: Send + Sync + 'static {
             > + Send + use<'a, Self>,
         >,
     > + Send;
-    /// Delete a role. FAILED_PRECONDITION while live tokens hold it,
-    /// unless `force`.
+    /// Delete a custom role. FAILED_PRECONDITION while live tokens hold
+    /// it.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///

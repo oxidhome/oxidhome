@@ -27,6 +27,7 @@
 #[path = "support.rs"]
 mod _support;
 
+use _support::Mint;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -55,19 +56,16 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 /// Mints a wildcard-scope test bearer — satisfies every
 /// per-resource scope check (round-2 F1). Tests that need
 /// to exercise scope-denial paths call
-/// [`mint_bearer_with_scopes`] instead.
+/// [`mint_bearer_with_actions`] instead.
 fn mint_bearer(engine: &Engine) -> String {
-    mint_bearer_with_scopes(engine, "wildcard", &["*"])
+    mint_bearer_with_actions(engine, "wildcard", &["*"])
 }
 
-/// Mints a bearer with a specific scope list. Scopes are
-/// stored as a JSON array on the token record, so we render
-/// them here rather than in every caller.
-fn mint_bearer_with_scopes(engine: &Engine, id: &str, scopes: &[&str]) -> String {
-    let scope_json = serde_json::to_vec(scopes).expect("scopes serialize");
+/// Mints a bearer whose role grants exactly `actions`.
+fn mint_bearer_with_actions(engine: &Engine, id: &str, scopes: &[&str]) -> String {
     engine
         .auth_tokens()
-        .create(id, &scope_json)
+        .mint(id, scopes)
         .expect("mint bearer")
         .plaintext
 }
@@ -327,14 +325,14 @@ async fn read_logs_returns_empty_list_on_fresh_engine() {
     );
 }
 
-/// 14.2b — `oxidhome://events` requires `events:read`; a
+/// 14.2b — `oxidhome://events` requires `event.read`; a
 /// bearer with a wildcard-adjacent-but-wrong scope
-/// (`devices:list`) is refused. Mirrors the REST
+/// (`device.list`) is refused. Mirrors the REST
 /// `GET /api/v1/events` gate.
 #[tokio::test(flavor = "current_thread")]
 async fn events_resource_requires_events_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -348,7 +346,7 @@ async fn events_resource_requires_events_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy events:read; got {response}",
+        "device.list must not satisfy event.read; got {response}",
     );
 }
 
@@ -356,7 +354,7 @@ async fn events_resource_requires_events_read_scope() {
 #[tokio::test(flavor = "current_thread")]
 async fn logs_resource_requires_logs_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "events-only", &["events:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "events-only", &["event.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -370,7 +368,7 @@ async fn logs_resource_requires_logs_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "events:read must not satisfy logs:read; got {response}",
+        "event.read must not satisfy host.logs; got {response}",
     );
 }
 
@@ -652,7 +650,7 @@ async fn missing_bearer_is_401() {
 #[tokio::test(flavor = "current_thread")]
 async fn empty_scope_bearer_is_denied_on_resource_read() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "no-scopes", &[]);
+    let bearer = mint_bearer_with_actions(&engine, "no-scopes", &[]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -673,12 +671,12 @@ async fn empty_scope_bearer_is_denied_on_resource_read() {
 }
 
 /// Round-2 F1 on PR #120 regression: a token holding an
-/// unrelated scope (`logs:read`) MUST NOT enumerate devices
+/// unrelated scope (`host.logs`) MUST NOT enumerate devices
 /// or plugins.
 #[tokio::test(flavor = "current_thread")]
 async fn unrelated_scope_bearer_is_denied_on_resource_read() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "logs-only", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -694,7 +692,7 @@ async fn unrelated_scope_bearer_is_denied_on_resource_read() {
     let error = &response["error"];
     assert_eq!(
         error["code"], -32001,
-        "logs:read alone must not satisfy plugins:list; got {response}",
+        "host.logs alone must not satisfy plugin.read; got {response}",
     );
     // Response body must not name the required scope — the
     // audit row does, but leaking it here would let a
@@ -703,7 +701,7 @@ async fn unrelated_scope_bearer_is_denied_on_resource_read() {
         !error["message"]
             .as_str()
             .expect("error message")
-            .contains("plugins:list"),
+            .contains("plugin.read"),
         "scope-denied message must not name the required scope; got {}",
         error["message"],
     );
@@ -719,7 +717,7 @@ async fn scope_denied_row_records_required_scope() {
 
     let engine = Engine::new().expect("engine");
     let audit = engine.audit_log();
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "logs-only", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -743,20 +741,20 @@ async fn scope_denied_row_records_required_scope() {
     assert_eq!(denied.status, 403);
     assert_eq!(
         denied.required_scope.as_deref(),
-        Some("devices:list"),
+        Some("device.list"),
         "required_scope column must name the missing scope",
     );
 }
 
-/// Round-2 F1 companion: a bearer with only `devices:list`
+/// Round-2 F1 companion: a bearer with only `device.list`
 /// can read `oxidhome://devices` but is denied
-/// `oxidhome://plugins` (which requires `plugins:list`).
+/// `oxidhome://plugins` (which requires `plugin.read`).
 /// Proves scope enforcement is per-resource, not
 /// all-or-nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn per_resource_scopes_enforce_boundaries() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -770,7 +768,7 @@ async fn per_resource_scopes_enforce_boundaries() {
     .await;
     assert!(
         devices["result"]["contents"].is_array(),
-        "devices:list bearer must read the devices resource; got {devices}",
+        "device.list bearer must read the devices resource; got {devices}",
     );
 
     let plugins = call(
@@ -783,26 +781,26 @@ async fn per_resource_scopes_enforce_boundaries() {
     .await;
     assert_eq!(
         plugins["error"]["code"], -32001,
-        "devices:list bearer must be refused plugins:list; got {plugins}",
+        "device.list bearer must be refused plugin.read; got {plugins}",
     );
 }
 
 /// Round-3 F1 on PR #120 regression: the device-detail
 /// resource returns registration metadata (owner, name,
 /// manufacturer, model, capabilities). It shares the
-/// `devices:list` scope with the collection read — a bearer
+/// `device.list` permission with the collection read — a bearer
 /// that can list devices must be able to follow any listed id
-/// into its detail resource, and a `devices:read` bearer
+/// into its detail resource, and a `device.read` bearer
 /// (reserved for the H9 device-state projection) must NOT
 /// gain metadata access it wasn't granted.
 #[tokio::test(flavor = "current_thread")]
 async fn device_detail_uses_devices_list_scope_not_devices_read() {
-    // Bearer with ONLY `devices:list` must reach the detail
+    // Bearer with ONLY `device.list` must reach the detail
     // URI (unknown device id => 404, but scope check must
     // succeed first). If the detail were still gated on
-    // `devices:read`, this would return `-32001` instead.
+    // `device.read`, this would return `-32001` instead.
     let engine = Engine::new().expect("engine");
-    let list_bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let list_bearer = mint_bearer_with_actions(&engine, "devices-list-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &list_bearer).await;
 
@@ -816,15 +814,15 @@ async fn device_detail_uses_devices_list_scope_not_devices_read() {
     .await;
     assert_eq!(
         response["error"]["code"], -32002,
-        "devices:list bearer must reach device-detail dispatch (unknown id → -32002 \
+        "device.list bearer must reach device-detail dispatch (unknown id → -32002 \
          resource-not-found), NOT the scope-denied -32001; got {response}",
     );
 
-    // Companion: a bearer with only `devices:read` must be
+    // Companion: a bearer with only `device.read` must be
     // REFUSED metadata access — that scope is reserved for
     // the state projection, not registration data.
     let engine = Engine::new().expect("engine");
-    let read_bearer = mint_bearer_with_scopes(&engine, "devices-read-only", &["devices:read"]);
+    let read_bearer = mint_bearer_with_actions(&engine, "devices-read-only", &["device.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &read_bearer).await;
 
@@ -838,7 +836,7 @@ async fn device_detail_uses_devices_list_scope_not_devices_read() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:read alone must NOT satisfy the device-detail metadata scope; got {response}",
+        "device.read alone must NOT satisfy the device-detail metadata scope; got {response}",
     );
 }
 
@@ -1021,7 +1019,7 @@ async fn resource_reads_land_in_the_audit_log() {
 #[tokio::test(flavor = "current_thread")]
 async fn read_status_returns_json_snapshot_on_fresh_engine() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "status-only", &["host.status"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1066,13 +1064,13 @@ async fn read_status_returns_json_snapshot_on_fresh_engine() {
     );
 }
 
-/// A token without `status:read` cannot read the status
+/// A token without `host.status` cannot read the status
 /// resource. Same enforcement pattern as the other
 /// per-resource scopes in 14.2a/b.
 #[tokio::test(flavor = "current_thread")]
 async fn status_resource_requires_status_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1086,7 +1084,7 @@ async fn status_resource_requires_status_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy status:read; got {response}",
+        "device.list must not satisfy host.status; got {response}",
     );
 }
 
@@ -1154,7 +1152,7 @@ async fn read_config_returns_redacted_snapshot() {
     install_test_daemon_config();
     let engine = Engine::new().expect("engine");
     let audit = engine.audit_log();
-    let bearer = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "status-only", &["host.status"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1183,11 +1181,11 @@ async fn read_config_returns_redacted_snapshot() {
     );
 }
 
-/// `oxidhome://config` shares `status:read`; any other scope is denied.
+/// `oxidhome://config` shares `host.status`; any other scope is denied.
 #[tokio::test(flavor = "current_thread")]
 async fn config_resource_requires_status_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read", "plugins:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "logs-only", &["host.logs", "plugin.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1201,7 +1199,7 @@ async fn config_resource_requires_status_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "config must require status:read; got {response}",
+        "config must require host.status; got {response}",
     );
 }
 
@@ -1211,8 +1209,8 @@ async fn config_resource_requires_status_read_scope() {
 async fn rest_config_matches_mcp_gate_and_body() {
     install_test_daemon_config();
     let engine = Engine::new().expect("engine");
-    let allowed = mint_bearer_with_scopes(&engine, "status-only", &["status:read"]);
-    let denied = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let allowed = mint_bearer_with_actions(&engine, "status-only", &["host.status"]);
+    let denied = mint_bearer_with_actions(&engine, "logs-only", &["host.logs"]);
     let router = build_router(engine);
 
     let get = |bearer: &str| {
@@ -1271,11 +1269,11 @@ async fn blobs_uri_without_name_returns_not_found() {
 }
 
 /// A blob instance segment that doesn't percent-decode is a malformed
-/// URI for a caller holding `blobs:read`, not a missing camera grant.
+/// URI for a caller holding `blob.read`, not a missing camera grant.
 #[tokio::test(flavor = "current_thread")]
 async fn a_malformed_blob_instance_is_invalid_params() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "blobs-only", &["blobs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "blobs-only", &["blob.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
     let response = call(
@@ -1292,12 +1290,12 @@ async fn a_malformed_blob_instance_is_invalid_params() {
 /// A blobs URI for an instance that isn't running returns
 /// resource-not-found with a message naming the instance id.
 /// The scope check has already succeeded here (the token
-/// carries `blobs:read`), so this is the not-found path — not
+/// carries `blob.read`), so this is the not-found path — not
 /// the deny path.
 #[tokio::test(flavor = "current_thread")]
 async fn blobs_uri_for_unknown_instance_returns_not_found() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "blobs-only", &["blobs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "blobs-only", &["blob.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1322,7 +1320,7 @@ async fn blobs_uri_for_unknown_instance_returns_not_found() {
     );
 }
 
-/// A token without `blobs:read` cannot reach the blobs
+/// A token without `blob.read` cannot reach the blobs
 /// resource, even for an unknown instance — the scope check
 /// runs before the not-found dispatch so a probing caller
 /// can't enumerate live instances by the difference between
@@ -1330,7 +1328,7 @@ async fn blobs_uri_for_unknown_instance_returns_not_found() {
 #[tokio::test(flavor = "current_thread")]
 async fn blobs_resource_requires_blobs_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1344,7 +1342,7 @@ async fn blobs_resource_requires_blobs_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy blobs:read; got {response}",
+        "device.list must not satisfy blob.read; got {response}",
     );
 }
 
@@ -1405,14 +1403,11 @@ async fn events_resource_reports_pruned_cursor() {
     assert!(response["error"].is_null(), "{response}");
 }
 
-/// H6 slice 2: a camera instance's blobs are camera bytes. The
-/// wildcard scope (and plain `blobs:read`) doesn't reach them; a
-/// token with an explicit `camera` grant does, and the read leaves a
-/// `warn` audit row.
+/// A camera instance's blobs are camera bytes. `*` (and plain
+/// `blob.read`) doesn't reach them; a role grant naming `camera` does,
+/// and the read leaves a `warn` audit row.
 #[tokio::test(flavor = "current_thread")]
 async fn camera_blobs_need_the_camera_grant() {
-    use oxidhome_core::api::sensitive_admin::grant_sensitive;
-    use oxidhome_core::auth::SensitiveCategory;
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
 
@@ -1432,19 +1427,15 @@ async fn camera_blobs_need_the_camera_grant() {
         },
     );
     let wildcard = mint_bearer(&engine);
-    let reader = mint_bearer_with_scopes(&engine, "reader", &["blobs:read"]);
-    let viewer = engine
-        .auth_tokens()
-        .create("viewer", br#"["blobs:read"]"#)
+    let reader = mint_bearer_with_actions(&engine, "reader", &["blob.read"]);
+    let tokens = engine.auth_tokens();
+    tokens
+        .create_role(
+            "viewer",
+            br#"[{"actions":["blob.read"],"category":["camera"]}]"#,
+        )
         .unwrap();
-    grant_sensitive(
-        &engine.auth_tokens(),
-        &engine.audit_log(),
-        &viewer.id,
-        SensitiveCategory::Camera,
-        &[],
-    )
-    .unwrap();
+    let viewer = tokens.create("viewer", &["viewer"]).unwrap();
     let router = build_router(engine.clone());
     let uri = json!({"uri": "oxidhome://blobs/cam-inst/snap.jpg"});
 
@@ -1472,8 +1463,8 @@ async fn camera_blobs_need_the_camera_grant() {
     let (router, session) = handshake(router, &viewer.plaintext).await;
     let response = call(&router, &viewer.plaintext, &session, "resources/read", uri).await;
     assert_ne!(response["error"]["code"], -32001, "{response}");
-    // The blob doesn't exist: only a successful camera read is charged
-    // and audited at `warn` (`release_blob` unit tests cover that).
+    // The blob doesn't exist: only a successful camera read is audited
+    // at `warn` (`release_blob` unit tests cover that).
     let warn = engine
         .audit_log()
         .query(

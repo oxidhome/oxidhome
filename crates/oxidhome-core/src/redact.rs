@@ -17,7 +17,7 @@
 //!   credentials and `oxh_` API tokens inside free text.
 //! - **Raw bytes.** `bytes-val` payloads (camera snapshots, audio,
 //!   inference frames) are withheld from callers that lack the
-//!   `blobs:read` scope; see [`withhold_bytes_in_kvs`] and friends.
+//!   `blob.read` permission; see [`withhold_bytes_in_kvs`] and friends.
 //!
 //! Applied at: the `SQLite` log layer (message + structured fields,
 //! before the row is queued), the audit ledger (every text column on
@@ -606,7 +606,7 @@ pub fn masked_config_view(
 /// from "empty".
 fn withheld_marker(len: usize) -> Value {
     Value::JsonVal(format!(
-        "{{\"withheld\":\"bytes\",\"size_bytes\":{len},\"required_scope\":\"blobs:read\"}}"
+        "{{\"withheld\":\"bytes\",\"size_bytes\":{len},\"required_scope\":\"blob.read\"}}"
     ))
 }
 
@@ -984,7 +984,7 @@ default = 1883
         let marker: JsonValue = serde_json::from_str(marker).unwrap();
         assert_eq!(
             marker,
-            json!({"withheld": "bytes", "size_bytes": 3, "required_scope": "blobs:read"})
+            json!({"withheld": "bytes", "size_bytes": 3, "required_scope": "blob.read"})
         );
         assert!(matches!(kvs[1].value, Value::BoolVal(true)));
     }
