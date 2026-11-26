@@ -1711,17 +1711,14 @@ async fn blob_read(engine: Engine, instance_id_raw: &str, name_raw: &str) -> Rea
             // escape-inflation headroom baked in — base64 has
             // no JSON-escape-worthy characters) so a valid
             // 3-MiB-raw blob doesn't hit the text cap.
-            // Round-10 F1 on PR #122 moved the mime cap
-            // upstream: `BlobStore::write` refuses over-cap
-            // mimes, and `BlobStore::read_with_info`'s SQL
-            // projects NULL for legacy rows whose mime
-            // exceeds [`MAX_BLOB_MIME_BYTES`]. So by the
-            // time `info.mime` reaches us it's already
-            // known to fit — no per-read materialise-then-
-            // check pass. Belt-and-suspenders: still assert
-            // the invariant, so a future regression in the
-            // store's SQL trips this instead of pushing the
-            // response past `PermitBody`'s cap.
+            // The mime cap lives upstream: `BlobStore::write`
+            // refuses over-cap mimes and the `blob.mime`
+            // schema CHECK bounds the column at
+            // [`MAX_BLOB_MIME_BYTES`], so `info.mime` is
+            // already known to fit. Belt-and-suspenders: still
+            // assert the invariant, so a regression trips this
+            // instead of pushing the response past
+            // `PermitBody`'s cap.
             let mime = info.mime;
             debug_assert!(
                 mime.as_ref().is_none_or(|m| m.len() <= MAX_BLOB_MIME_BYTES),
