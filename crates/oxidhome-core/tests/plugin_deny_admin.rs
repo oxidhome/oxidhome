@@ -201,9 +201,14 @@ async fn the_owner_sets_and_resets_a_deny_list_over_rest() {
     let shown = api_json(&f.router, &f.owner, "GET", &uri, Body::empty()).await;
     assert_eq!(shown["deny"], lock_reads());
     // A positional body is refused, not read as an empty list.
-    let (status, got) = api_status(&f.router, &f.owner, "PUT", &uri, json!([[]])).await;
-    assert!(status.is_client_error(), "{status}: {got}");
-    assert_eq!(applied(&f.engine), lock_reads(), "kept");
+    for positional in [
+        json!([[]]),
+        json!({"deny": [[["state.read"], null, null, null]]}),
+    ] {
+        let (status, got) = api_status(&f.router, &f.owner, "PUT", &uri, positional).await;
+        assert!(status.is_client_error(), "{status}: {got}");
+        assert_eq!(applied(&f.engine), lock_reads(), "kept");
+    }
 
     // `*` means every plugin action.
     let all = json!({"deny": [{"actions": ["*"]}]});

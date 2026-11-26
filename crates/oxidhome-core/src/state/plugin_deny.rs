@@ -447,6 +447,8 @@ mod tests {
             .expect("set");
         let store = PluginDenyStore::open(db).expect("reopen");
         assert_eq!(store.get("com.example.d").as_deref(), Some(&widest[..]));
+        // A positional entry is malformed, not a narrower list.
+        assert!(decode_plugin_deny(br#"[[["state.read"],null,null,null]]"#).is_none());
         // Text, a list wider than an admin change takes, and a
         // non-text value all fail closed too.
         let many: Vec<String> = (0..=MAX_SELECTOR_LIST)

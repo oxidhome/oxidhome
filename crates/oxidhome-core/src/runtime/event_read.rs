@@ -403,6 +403,10 @@ impl PluginState {
                 return Err(WitError::Unavailable("event history read timed out".into()));
             }
         };
+        // A deny list set while the call waited for a slot or read
+        // refuses it whole (bounds and gap markers too), not just the
+        // rows it filters.
+        self.authorize_event_read(&ctx)?;
         let page = match read {
             Ok(None) => {
                 return Err(WitError::Unavailable(

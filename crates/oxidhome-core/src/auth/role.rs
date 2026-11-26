@@ -431,10 +431,20 @@ impl RoleDef {
 }
 
 /// Wire form of a grant or deny: `{actions, category?, devices?,
-/// services?}`.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// services?}`, a JSON object only (a positional array would bind its
+/// items to fields by order).
+#[derive(Debug)]
 pub(crate) struct SelectorWire {
+    actions: Vec<String>,
+    category: Option<Vec<String>>,
+    devices: Option<Vec<String>>,
+    services: Option<Vec<String>>,
+}
+
+/// [`SelectorWire`]'s object form.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorObject {
     actions: Vec<String>,
     #[serde(default)]
     category: Option<Vec<String>>,
@@ -442,6 +452,18 @@ pub(crate) struct SelectorWire {
     devices: Option<Vec<String>>,
     #[serde(default)]
     services: Option<Vec<String>>,
+}
+
+impl<'de> serde::Deserialize<'de> for SelectorWire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: SelectorObject = crate::api::token_admin::from_object(deserializer)?;
+        Ok(Self {
+            actions: o.actions,
+            category: o.category,
+            devices: o.devices,
+            services: o.services,
+        })
+    }
 }
 
 /// Parsed parts of a [`SelectorWire`]: actions, categories, device

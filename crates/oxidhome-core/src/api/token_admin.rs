@@ -74,23 +74,45 @@ pub struct MintRequest {
 }
 
 /// One grant or deny entry: the wire shape of a [`RoleGrant`] or a
-/// [`DenyRule`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// [`DenyRule`]. A JSON object only: a positional array would bind
+/// its items to fields by order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectorSpec {
     /// Action names (`device.command`) or `*`.
     pub actions: Vec<String>,
     /// Device categories; absent for every resource.
-    #[serde(default)]
     pub category: Option<Vec<String>>,
     /// Device ids or `prefix*` patterns; absent for every device.
-    #[serde(default)]
     pub devices: Option<Vec<String>>,
     /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
     /// literal or `prefix*`) for `service.call`; not combined with
     /// `category` or `devices`.
-    #[serde(default)]
     pub services: Option<Vec<String>>,
+}
+
+/// [`SelectorSpec`]'s object form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectorSpecObject {
+    actions: Vec<String>,
+    #[serde(default)]
+    category: Option<Vec<String>>,
+    #[serde(default)]
+    devices: Option<Vec<String>>,
+    #[serde(default)]
+    services: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for SelectorSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let o: SelectorSpecObject = from_object(deserializer)?;
+        Ok(Self {
+            actions: o.actions,
+            category: o.category,
+            devices: o.devices,
+            services: o.services,
+        })
+    }
 }
 
 /// Why a mint was refused.
