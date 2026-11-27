@@ -103,7 +103,7 @@ message Role {
   string name = 1;
   // `true` for a built-in role.
   bool builtin = 2;
-  // Grants as `actions[@categories][ [devices]]`.
+  // Grants as `actions[@categories][[devices]]`.
   repeated string grants = 3;
   // Ids of the live tokens holding the role.
   repeated string tokens = 4;

@@ -564,8 +564,9 @@ fn run_token() -> anyhow::Result<()> {
          oxidhome token create <label> --role <name> [--role <name>]...\n       \
          oxidhome token revoke <token-id>";
     let args: Vec<String> = std::env::args().skip(2).collect();
+    let help = args.is_empty() || args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"));
     match args.first().map(String::as_str) {
-        Some("-h" | "--help") | None => {
+        _ if help => {
             println!("{USAGE}");
             println!(
                 "Roles are built in (admin, member, guest, agent) or the owner's \
@@ -658,8 +659,9 @@ fn run_role() -> anyhow::Result<()> {
         serde_json::from_str(json).map_err(|e| anyhow::anyhow!("invalid grants: {e}\n{USAGE}"))
     };
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let help = words.is_empty() || words.iter().any(|w| matches!(*w, "-h" | "--help"));
     let op: Box<RoleOp> = match words.as_slice() {
-        ["-h" | "--help"] | [] => {
+        _ if help => {
             println!("{USAGE}");
             return Ok(());
         }

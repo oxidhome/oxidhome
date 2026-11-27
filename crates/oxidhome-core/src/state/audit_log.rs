@@ -122,10 +122,12 @@ pub struct AuditEntry {
     /// succeeded — and populates [`Self::execution_outcome`] with
     /// `"failed"` to surface the domain-level failure.
     pub decision: String,
-    /// The action the handler required, populated only on permission
-    /// 403s finalized from a `DeniedAction` extension (or the missing
-    /// grant's name on a plugin hop). `None` for every allow and for
-    /// other denies.
+    /// On a permission deny, the refused action (finalized from a
+    /// `DeniedAction` extension), or the missing grant's name on a
+    /// plugin hop. On an allowed sensitive action's `AUTHZ` `warn` row,
+    /// the categories it reached: `sensitive:<categories>`, or
+    /// `owner:<categories>` for the owner token. `None` for every other
+    /// row.
     pub required_scope: Option<String>,
     /// **Execution** outcome — independent of [`Self::decision`]
     /// (architecture-review F4 follow-up).

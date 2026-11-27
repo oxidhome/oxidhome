@@ -1214,7 +1214,7 @@ pub struct Role {
         skip_serializing_if = "::buffa::json_helpers::skip_if::is_false"
     )]
     pub builtin: bool,
-    /// Grants as `actions[@categories][ [devices]]`.
+    /// Grants as `actions[@categories][[devices]]`.
     ///
     /// Field 3: `grants`
     #[serde(

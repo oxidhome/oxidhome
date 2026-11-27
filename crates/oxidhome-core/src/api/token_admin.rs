@@ -21,8 +21,9 @@
 //! The built-in roles can't be created, edited or deleted. A minted
 //! token is never the owner: `owner` is not a role, and only the
 //! first-run bootstrap and `recover-admin-token` mint the owner. Every
-//! mint and role write leaves a two-phase audit row:
+//! mint, revoke and role write leaves a two-phase audit row:
 //! `<surface>.auth.mint:<roles>` with the new token's id,
+//! `<surface>.auth.revoke:<token id>` with the revoked token's,
 //! `<surface>.auth.role.<create|update|delete>:<name>` with the role's.
 
 use serde::{Deserialize, Serialize};
@@ -320,7 +321,7 @@ pub struct RoleSummary {
     pub name: String,
     /// `true` for a built-in role.
     pub builtin: bool,
-    /// Grants, as `actions[@categories][ [devices]]`.
+    /// Grants, as `actions[@categories][[devices]]`.
     pub grants: Vec<String>,
     /// Ids of the live tokens holding the role.
     pub tokens: Vec<String>,
@@ -356,16 +357,11 @@ fn describe(def: Option<&RoleDef>) -> Vec<String> {
 ///
 /// [`AdminError::Store`] on a read failure.
 pub fn role_summaries(tokens: &TokenStore) -> Result<Vec<RoleSummary>, AdminError> {
-    let live: Vec<TokenRecord> = tokens
-        .list()
-        .map_err(|e| AdminError::Store(e.to_string()))?
-        .into_iter()
-        .filter(|t| t.revoked_ms.is_none())
-        .collect();
+    let (custom, live) = tokens.roles_and_live_holders()?;
     let held = |name: &str| -> Vec<String> {
         live.iter()
-            .filter(|t| t.roles.iter().any(|r| r == name))
-            .map(|t| t.id.clone())
+            .filter(|(_, roles)| roles.iter().any(|r| r == name))
+            .map(|(id, _)| id.clone())
             .collect()
     };
     let mut out: Vec<RoleSummary> = builtins()
@@ -379,8 +375,8 @@ pub fn role_summaries(tokens: &TokenStore) -> Result<Vec<RoleSummary>, AdminErro
             updated_ms: None,
         })
         .collect();
-    for r in tokens.roles()? {
-        out.push(RoleSummary::of(&r, held(&r.name)));
+    for r in &custom {
+        out.push(RoleSummary::of(r, held(&r.name)));
     }
     Ok(out)
 }

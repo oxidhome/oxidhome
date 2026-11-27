@@ -67,15 +67,15 @@ use crate::state::{EventQuery, LogLevel, LogQuery, TopicMatch};
 /// a real token id was resolved.
 pub(super) const UNAUTHENTICATED_TOKEN_ID: &str = "anonymous";
 
-/// JSON-RPC error code for "the token doesn't hold the scope
+/// JSON-RPC error code for "the token doesn't hold the permission
 /// this resource requires." MCP has no canonical
 /// permission-denied code, so we pick from the
 /// `-32000..=-32099` implementation-defined server-error
 /// range (matches how OAuth's `403 Forbidden` maps into
 /// JSON-RPC error surfaces elsewhere). The response message
-/// deliberately does NOT name the required scope — the
+/// deliberately does NOT name the required action — the
 /// audit row records that for forensic use — so a probing
-/// caller can't enumerate the scope map by trial-and-error
+/// caller can't enumerate the permission map by trial-and-error
 /// (mirrors [`crate::api::authz::Forbidden`]'s
 /// deliberate silence on the response body).
 pub(super) const SCOPE_DENIED_CODE: ErrorCode = ErrorCode(-32001);

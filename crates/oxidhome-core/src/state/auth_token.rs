@@ -1026,6 +1026,16 @@ mod tests {
         assert!(store.revoke(&held.id).unwrap());
         assert_eq!(sync(), 1, "revoke");
 
+        reset();
+        store.create_role("r", b"[]").unwrap();
+        assert_eq!(sync(), 1, "create_role");
+        reset();
+        store.update_role("r", b"[]").unwrap();
+        assert_eq!(sync(), 1, "update_role");
+        reset();
+        store.delete_role("r").unwrap();
+        assert_eq!(sync(), 1, "delete_role");
+
         db.write(|c| {
             c.execute_batch(
                 "CREATE TRIGGER boom BEFORE INSERT ON auth_token \

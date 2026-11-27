@@ -221,7 +221,7 @@ impl RoleGrant {
         serde_json::Value::Object(obj)
     }
 
-    /// One-line form for listings: `actions[@categories][ [devices]]`.
+    /// One-line form for listings: `actions[@categories][[devices]]`.
     #[must_use]
     pub fn describe(&self) -> String {
         let mut s = self.action_names().join(",");
@@ -253,12 +253,27 @@ pub struct RoleDef {
 pub struct GrantWire {
     /// Action names, or `*`.
     pub actions: Vec<String>,
-    /// Device categories.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Device categories. Omitted for no narrowing; `null` is refused,
+    /// so it can't be mistaken for a narrowing that was dropped.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_list"
+    )]
     pub category: Option<Vec<String>>,
-    /// Device id patterns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Device id patterns. Omitted for no narrowing; `null` is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_list"
+    )]
     pub devices: Option<Vec<String>>,
+}
+
+/// A selector key that is present must hold a list: `null` doesn't
+/// read as "absent".
+fn present_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    <Vec<String> as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// Why a grant was refused.
@@ -520,6 +535,10 @@ mod tests {
         assert!(!g.actions.contains(Action::TokenManage));
         let g = grant(serde_json::json!({"actions": ["*"], "category": ["light"]})).unwrap();
         assert_eq!(g.actions, NARROWABLE);
+        assert_eq!(g.to_json()["actions"], serde_json::json!(["*"]));
+        let narrowable: Vec<&str> = NARROWABLE.names();
+        let g = grant(serde_json::json!({"actions": narrowable, "category": ["light"]})).unwrap();
+        assert_eq!(g.to_json()["actions"], serde_json::json!(narrowable));
     }
 
     #[test]
@@ -543,6 +562,15 @@ mod tests {
             serde_json::from_value::<GrantWire>(serde_json::json!({"actions": ["*"], "deny": []}))
                 .is_err()
         );
+        for null in [
+            serde_json::json!({"actions": ["device.command"], "devices": null}),
+            serde_json::json!({"actions": ["*"], "category": null}),
+        ] {
+            assert!(
+                serde_json::from_value::<GrantWire>(null.clone()).is_err(),
+                "{null}"
+            );
+        }
     }
 
     #[test]

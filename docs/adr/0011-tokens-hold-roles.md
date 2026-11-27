@@ -46,6 +46,6 @@ calling plugin's `consumes_services` grant and the root's `service.call`.
 
 ## Consequences
 
-REST, Connect, MCP and the CLI mint tokens by role name and edit roles as grant lists. `mcp-stdio` runs as one role
+REST, Connect and the offline CLI mint tokens by role name and edit roles as grant lists; MCP only lists tokens (owner only), since a secret must not reach an LLM's context. `mcp-stdio` runs as one role
 (`--role`, `agent` by default). Tokens are revoked one by one offline (`oxidhome token revoke`). Owner narrowing of
 plugin grants other than `network` is an open question.

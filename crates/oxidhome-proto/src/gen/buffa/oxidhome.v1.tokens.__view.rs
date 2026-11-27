@@ -2144,7 +2144,7 @@ pub struct RoleView<'a> {
     ///
     /// Field 2: `builtin`
     pub builtin: bool,
-    /// Grants as `actions[@categories][ [devices]]`.
+    /// Grants as `actions[@categories][[devices]]`.
     ///
     /// Field 3: `grants`
     pub grants: ::buffa::RepeatedView<'a, &'a str>,
@@ -2462,7 +2462,7 @@ impl RoleOwnedView {
     pub fn builtin(&self) -> bool {
         self.0.reborrow().builtin
     }
-    /// Grants as `actions[@categories][ [devices]]`.
+    /// Grants as `actions[@categories][[devices]]`.
     ///
     /// Field 3: `grants`
     #[must_use]

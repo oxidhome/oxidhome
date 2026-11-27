@@ -103,17 +103,32 @@ fn holders(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<Vec<Stri
 }
 
 impl TokenStore {
-    /// Every custom role, by name.
+    /// Every custom role, by name, and each live token's id and roles,
+    /// read in one snapshot so a listing never pairs a role's grants
+    /// with holders from another moment.
     ///
     /// # Errors
     ///
     /// On database failure.
-    pub fn roles(&self) -> Result<Vec<RoleRecord>, RoleError> {
-        self.db.read(|conn| -> Result<Vec<RoleRecord>, RoleError> {
-            let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY name"))?;
-            let rows = stmt.query_map([], row_to_role)?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
-        })
+    #[allow(clippy::type_complexity)]
+    pub fn roles_and_live_holders(
+        &self,
+    ) -> Result<(Vec<RoleRecord>, Vec<(String, Vec<String>)>), RoleError> {
+        self.db.read(
+            |conn| -> Result<(Vec<RoleRecord>, Vec<(String, Vec<String>)>), RoleError> {
+                let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY name"))?;
+                let roles = stmt
+                    .query_map([], row_to_role)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut stmt =
+                    conn.prepare("SELECT id, roles FROM auth_token WHERE revoked_ms IS NULL")?;
+                let live = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .map(|row| row.map(|(id, roles)| (id, parse_roles(&roles))))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((roles, live))
+            },
+        )
     }
 
     /// The custom roles among `names` that exist, in `names` order.

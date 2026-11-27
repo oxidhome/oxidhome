@@ -17,7 +17,7 @@
 //!   automation rule given a trigger + action. Gated on
 //!   `device.list` (both the collection `oxidhome://devices`
 //!   and the per-id `oxidhome://devices/{id}` share this
-//!   scope) so the draft can reference real device ids +
+//!   permission) so the draft can reference real device ids +
 //!   capability names.
 //! - `explain_recent_errors` — walks the client through
 //!   fetching recent error-level logs and explaining what went
@@ -29,7 +29,7 @@
 //! # Permission gating
 //!
 //! `prompts/list` is public — every session sees the full
-//! catalogue regardless of scope. `prompts/get` authorizes the
+//! catalogue regardless of permissions. `prompts/get` authorizes the
 //! actions the prompt's resources need (through
 //! [`crate::auth::authorize()`]) and lands denials as
 //! `Forbidden` (`-32001`), matching the resource + tool
@@ -51,9 +51,9 @@ use crate::auth::{Action, InvocationContext, Resource, authorize};
 use super::resources::SCOPE_DENIED_CODE;
 
 /// Publicly-visible catalogue of prompts this handler exposes.
-/// Every MCP session sees the full list regardless of scope —
-/// see the module-level comment on why `get` is where scope is
-/// enforced.
+/// Every MCP session sees the full list regardless of
+/// permissions — see the module-level comment on why `get` is where
+/// they are enforced.
 pub(super) fn list_prompts() -> Vec<Prompt> {
     vec![
         Prompt::new(

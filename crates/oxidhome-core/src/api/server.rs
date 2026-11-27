@@ -1017,7 +1017,7 @@ impl IntoResponse for TlsPinError {
 ///
 /// # Errors
 /// - `400` a host without an instance, or a port without a host.
-/// - `403` missing scope.
+/// - `403` missing permission.
 async fn list_tls_pins(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
@@ -3108,7 +3108,7 @@ fn js_string_escape(input: &str) -> String {
 /// information-leak property: a probing caller without
 /// `event.subscribe` and without a proper WS handshake gets the same
 /// 426 a wrong-method probe would, so they can't distinguish
-/// "scope missing" from "wrong shape". Real WS handshakes (the
+/// "permission missing" from "wrong shape". Real WS handshakes (the
 /// only ones operators actually send) reach the handler body and
 /// get the 403 they should.
 ///

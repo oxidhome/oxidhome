@@ -243,6 +243,28 @@ async fn lock_commands_need_a_grant_naming_lock() {
     let (status, _) = send(&router, "POST", &command_uri, &wildcard.plaintext, TOGGLE).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
+    // No `warn` row, no run: with `AUTHZ` inserts failing, the granted
+    // command is refused and the switch doesn't move.
+    let db = rusqlite::Connection::open(state.path().join("oxidhome.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_authz BEFORE INSERT ON audit_event \
+         WHEN NEW.method = 'AUTHZ' BEGIN SELECT RAISE(ABORT, 'no'); END;",
+    )
+    .unwrap();
+    let state_uri = format!("/api/v1/devices/{device}/state");
+    let (_, before) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    let rows_before = warn_rows(&engine).len();
+    let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    let (_, after) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(
+        before["state"], after["state"],
+        "the plugin was not entered"
+    );
+    assert_eq!(warn_rows(&engine).len(), rows_before);
+    db.execute_batch("DROP TRIGGER no_authz;").unwrap();
+    drop(db);
+
     // Clearing the raise puts the switch back in reach.
     let (status, _) = send(
         &router,

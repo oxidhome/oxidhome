@@ -197,11 +197,11 @@ mod tests {
         let options = StdioOptions { role: role.into() };
         let actor = stdio_actor(engine, &options).expect("role");
         assert!(!actor.is_owner());
-        let ctx = InvocationContext::external(Principal::token(
-            ActorKind::Api,
-            &actor,
-            Transport::McpStdio,
-        ));
+        // As the stdio handler builds it: a local process, never the owner.
+        let ctx = InvocationContext::external(
+            Principal::local_process(ActorKind::Mcp, actor.id(), Transport::McpStdio)
+                .with_authority(crate::auth::Authority::of_local_process(&actor)),
+        );
         let resource = Resource::device("dev-0000000000000001", DeviceClass::of(category));
         authorize(&ctx, action, &resource).allow
     }
