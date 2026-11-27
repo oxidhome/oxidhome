@@ -5,10 +5,12 @@
 //!   Connect `ListInstances`, and the MCP `oxidhome://plugins/{id}`
 //!   resource.
 //! - `bytes-val` event fields are withheld from a token without
-//!   `blobs:read` and delivered to one with it (REST + MCP).
+//!   `blob.read` and delivered to one with it (REST + MCP).
 
 #[path = "support.rs"]
 mod support;
+
+use support::Mint;
 
 use std::time::Duration;
 
@@ -60,7 +62,7 @@ required = false
 fn mint(engine: &Engine, id: &str, scopes: &[&str]) -> String {
     engine
         .auth_tokens()
-        .create(id, &serde_json::to_vec(scopes).unwrap())
+        .mint(id, scopes)
         .expect("mint token")
         .plaintext
 }
@@ -228,7 +230,7 @@ async fn secret_config_is_masked_on_every_read_surface() {
         "optional_token": {"secret": true, "set": false, "value": null},
     });
 
-    let bearer = mint(&engine, "lister", &["instances:list", "plugins:list"]);
+    let bearer = mint(&engine, "lister", &["instance.read", "plugin.read"]);
     let router = build_router(engine.clone());
 
     // REST
@@ -350,13 +352,13 @@ async fn bytes_need_blobs_read_on_rest_and_mcp() {
     let engine = Engine::new().expect("engine");
     record_snapshot_event(&engine);
     let router = build_router(engine.clone());
-    let narrow = mint(&engine, "narrow", &["events:read"]);
-    let with_blobs = mint(&engine, "blobs", &["events:read", "blobs:read"]);
+    let narrow = mint(&engine, "narrow", &["event.read"]);
+    let with_blobs = mint(&engine, "blobs", &["event.read", "blob.read"]);
     let admin = mint(&engine, "admin", &["*"]);
 
     let withheld = json!({
         "t": "Json",
-        "v": r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blobs:read"}"#,
+        "v": r#"{"withheld":"bytes","size_bytes":3,"required_scope":"blob.read"}"#,
     });
     let raw = json!({"t": "Bytes", "v": [255, 216, 255]});
 

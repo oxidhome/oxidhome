@@ -34,8 +34,8 @@ use crate::state::{
 };
 
 use super::auth::{AuthState, require_token};
+use super::authz::{Forbidden, require};
 use super::bytes::BytesGate;
-use super::scopes::{ScopeDenied, require};
 use super::ui_ticket;
 
 /// Listener configuration. Defaults to `127.0.0.1:0` (random
@@ -69,12 +69,6 @@ pub fn build_router(engine: Engine) -> Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // H6: `POST /api/v1/devices/{id}/command` applies the
-        // `device.send_command` per-device allowlist through the
-        // shared `crate::auth::authorize` decision, same as Connect
-        // and MCP. Every other constraint key is still refused here.
-        // See [`AuthState::enforced_constraints`] docs.
-        enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
         transport: crate::auth::Transport::Rest,
     };
     let connect_service = super::connect_rpc::axum_service(engine.clone());
@@ -125,7 +119,7 @@ pub fn build_router(engine: Engine) -> Router {
         // and `[ui]` section (Phase 13 slice 1) so the
         // shell can render config forms and load declared
         // UI assets without a custom panel per plugin.
-        // Gated on `plugins:list` — same read-only role
+        // Gated on `plugin.read` — same read-only role
         // that lists installed plugins can see their
         // schemas.
         .route("/api/v1/plugins/{plugin_id}/schema", get(get_plugin_schema))
@@ -155,7 +149,7 @@ pub fn build_router(engine: Engine) -> Router {
         // `Authorization` header to a subresource nav or a
         // top-level document nav, so requiring bearer on
         // the wrapper would 401 every legitimate browser
-        // flow. Gated on `plugins:ui`.
+        // flow. Gated on `plugin.ui`.
         .route(
             "/api/v1/plugins/{plugin_id}/ui-session",
             post(post_plugin_ui_session),
@@ -183,7 +177,7 @@ pub fn build_router(engine: Engine) -> Router {
     // ticket in `?tk=…` (verified inside each handler).
     // Physical separation from `authenticated` means an
     // accidental route add on this router can't inherit
-    // bearer-gated scopes, and ticket verification is the
+    // bearer-gated permissions, and ticket verification is the
     // only auth check that can grant access to plugin UI
     // content. `POST /ui-session` above (bearer-gated)
     // is the only path that mints these tickets.
@@ -197,9 +191,7 @@ pub fn build_router(engine: Engine) -> Router {
     // Phase 14.1 — mount the MCP streamable-HTTP endpoint on the
     // same listener as REST/Connect. `rmcp`'s
     // `StreamableHttpService` is a `tower::Service` nested at
-    // [`super::mcp::MCP_ENDPOINT`]; auth (14.4) will wrap the
-    // nested router in our bearer layer once the token-scope
-    // policy shape is stable.
+    // [`super::mcp::MCP_ENDPOINT`] behind our bearer layer.
     let mcp = super::mcp::mount_routes(&engine);
 
     public
@@ -212,11 +204,11 @@ pub fn build_router(engine: Engine) -> Router {
 
 /// `GET /api/v1/config` — the daemon's effective configuration, the
 /// same redacted body as the MCP `oxidhome://config` resource. Gated on
-/// `status:read`: operational metadata next to the status surface, no
+/// `host.status`: operational metadata next to the status surface, no
 /// secrets.
 async fn get_config(
     Extension(ctx): Extension<InvocationContext>,
-) -> Result<Json<serde_json::Value>, ScopeDenied> {
+) -> Result<Json<serde_json::Value>, Forbidden> {
     require(&ctx, Action::HostStatus, &Resource::Host)?;
     Ok(Json(super::mcp::config_json()))
 }
@@ -403,12 +395,11 @@ struct InstanceSummary {
 
 /// Authenticated `GET /api/v1/instances`. Returns every supervised
 /// instance under the engine with its current lifecycle state. Gated
-/// on the `instances:list` scope; the admin / wildcard token
-/// satisfies it via [`crate::api::scopes::WILDCARD`].
+/// on the `instance.read` permission.
 async fn list_instances(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
-) -> Result<Json<InstancesBody>, ScopeDenied> {
+) -> Result<Json<InstancesBody>, Forbidden> {
     require(&ctx, Action::InstanceRead, &Resource::instances())?;
     let mut instances = Vec::new();
     for handle in state.engine.instances().list() {
@@ -441,7 +432,7 @@ struct DeviceSummary {
     /// `other`), after any operator raise.
     category: &'static str,
     /// Sensitive categories the device falls under (`lock`, `opener`,
-    /// `alarm`, `camera`); a token needs an explicit grant for each.
+    /// `alarm`, `camera`); one role grant must name them all.
     sensitive: Vec<&'static str>,
 }
 
@@ -467,7 +458,7 @@ impl From<crate::auth::DeviceClass> for WireDeviceClass {
 
 /// Authenticated `GET /api/v1/devices`. Lists every device any
 /// supervised instance has registered with the host. Gated on the
-/// `devices:list` scope.
+/// `device.list` permission.
 ///
 /// Returns a flat snapshot suitable for the CLI's `device list`
 /// table — `device_id`, `owner_instance`, `name`. Capability /
@@ -476,10 +467,9 @@ impl From<crate::auth::DeviceClass> for WireDeviceClass {
 async fn list_devices(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
-) -> Result<Json<DevicesBody>, ScopeDenied> {
+) -> Result<Json<DevicesBody>, Forbidden> {
     // Pre-check, then one decision per device: a role narrowed to
-    // device categories (H6 slice 3) lists only its devices, and a
-    // deny list hides the devices it names.
+    // device categories or ids lists only its devices.
     require(
         &ctx,
         Action::DeviceList,
@@ -540,7 +530,7 @@ struct CategoryResponse {
 }
 
 enum CategoryError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     BadRequest(String),
     Internal,
 }
@@ -548,7 +538,7 @@ enum CategoryError {
 impl IntoResponse for CategoryError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
@@ -562,8 +552,7 @@ impl IntoResponse for CategoryError {
 /// the host has seen for the device stay. The device need not be
 /// registered right now (an override survives restarts).
 ///
-/// `policy.manage`: the owner token only; no scope, the wildcard
-/// included, grants it.
+/// `policy.manage`: the owner token only; no role grants it.
 ///
 /// # Errors
 /// - `400` malformed device id or unknown category.
@@ -580,7 +569,7 @@ async fn set_device_category(
         Action::PolicyManage,
         &state.engine.devices().resource(&device_id),
     )
-    .map_err(CategoryError::Scope)?;
+    .map_err(CategoryError::Denied)?;
     if !crate::state::is_device_id(&device_id) {
         return Err(CategoryError::BadRequest("malformed device id".into()));
     }
@@ -622,11 +611,11 @@ async fn set_device_category(
     }))
 }
 
-// ── Tokens (H6 slice 3) ──────────────────────────────────────────
+// ── Tokens and roles ──────────────────────────────────────────
 
 /// Errors of the `/api/v1/tokens` and `/api/v1/roles` handlers.
 enum TokensError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     BadRequest(String),
     NotFound(String),
     Conflict(String),
@@ -636,7 +625,7 @@ enum TokensError {
 impl IntoResponse for TokensError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
@@ -685,17 +674,16 @@ struct TokensBody {
     tokens: Vec<super::token_admin::TokenSummary>,
 }
 
-/// H6 slice 3: `POST /api/v1/tokens` — mint a token holding
-/// owner-defined roles, scopes, sensitive categories and a deny list
-/// (`{"label": "tablet", "roles": ["dashboard"]}`, see
+/// `POST /api/v1/tokens` — mint a token holding roles (`{"label":
+/// "tablet", "roles": ["guest"]}`, see
 /// [`super::token_admin::MintRequest`]). Returns `201` with the secret,
-/// once. `token.manage`: the owner token only; no scope or role, the
-/// wildcard included, grants it. The body is read after the check, so
-/// a refused caller learns nothing about its shape.
+/// once. `token.manage`: the owner token only; no role grants it. The
+/// body is read after the check, so a refused caller learns nothing
+/// about its shape.
 ///
 /// # Errors
-/// - `400` malformed body or an invalid request (unknown role, scope,
-///   category or action; `owner`; the reserved `admin` label).
+/// - `400` malformed body or an invalid request (unknown role,
+///   `owner`, the reserved `admin` label).
 /// - `403` not the owner.
 /// - `500` the token couldn't be stored.
 async fn create_token(
@@ -703,7 +691,7 @@ async fn create_token(
     State(state): State<ApiState>,
     body: Result<Json<super::token_admin::MintRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, TokensError> {
-    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Denied)?;
     let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let tokens = state.engine.auth_tokens();
     let audit = state.engine.audit_log();
@@ -722,8 +710,8 @@ async fn create_token(
     ))
 }
 
-/// H6 slice 3: `GET /api/v1/tokens` — every token with its roles,
-/// scopes, sensitive grants and deny list; never a secret or hash.
+/// `GET /api/v1/tokens` — every token with its owner flag and roles;
+/// never a secret or hash.
 /// `token.manage`: the owner token only.
 ///
 /// # Errors
@@ -733,7 +721,7 @@ async fn list_tokens(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<TokensBody>, TokensError> {
-    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Denied)?;
     let tokens = state.engine.auth_tokens();
     let list = admin_blocking(move || super::token_admin::summaries(&tokens)).await?;
     Ok(Json(TokensBody { tokens: list }))
@@ -745,17 +733,8 @@ struct RolesBody {
     roles: Vec<super::token_admin::RoleSummary>,
 }
 
-/// `?force=true` on `DELETE /api/v1/roles/{name}`.
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct DeleteRoleQuery {
-    #[serde(default)]
-    force: bool,
-}
-
-/// H6 slice 3: `GET /api/v1/roles` — every owner-defined role with
-/// its grants, sensitive categories, denies and the live tokens
-/// holding it. `policy.manage`: the owner token only.
+/// `GET /api/v1/roles` — the built-in roles and the owner's custom
+/// ones, with their grants and the live tokens holding them. `policy.manage`: the owner token only.
 ///
 /// # Errors
 /// - `403` not the owner.
@@ -764,19 +743,19 @@ async fn list_roles(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<RolesBody>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let tokens = state.engine.auth_tokens();
     let roles = admin_blocking(move || super::token_admin::role_summaries(&tokens)).await?;
     Ok(Json(RolesBody { roles }))
 }
 
-/// H6 slice 3: `POST /api/v1/roles` — define a role
-/// (`{"name": "tablet", "grants": [{"actions": ["device.list",
-/// "device.read", "device.command"], "category": ["light"]}]}`, see
+/// `POST /api/v1/roles` — define a role (`{"name": "tablet",
+/// "grants": [{"actions": ["device.list", "device.read",
+/// "device.command"], "category": ["light", "lock"]}]}`, see
 /// [`super::token_admin::NewRole`]). `policy.manage`: the owner only.
 ///
 /// # Errors
-/// - `400` malformed body or definition.
+/// - `400` malformed body or grants, or a built-in role's name.
 /// - `403` not the owner.
 /// - `409` the name is taken (or the role limit is reached).
 async fn create_role(
@@ -784,7 +763,7 @@ async fn create_role(
     State(state): State<ApiState>,
     body: Result<Json<super::token_admin::NewRole>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
@@ -795,9 +774,9 @@ async fn create_role(
     Ok((StatusCode::CREATED, Json(role)))
 }
 
-/// H6 slice 3: `PUT /api/v1/roles/{name}` — replace a role's
-/// definition (body: [`super::token_admin::RoleSpec`]). Every token
-/// holding it sees the new definition from its next request on.
+/// `PUT /api/v1/roles/{name}` — replace a custom role's grants (body:
+/// [`super::token_admin::RoleUpdate`]). Every token holding it sees
+/// them from its next request on.
 /// `policy.manage`: the owner only.
 ///
 /// # Errors
@@ -808,42 +787,37 @@ async fn update_role(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(name): Path<String>,
-    body: Result<Json<super::token_admin::RoleSpec>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<super::token_admin::RoleUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
-    let Json(spec) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
+    let Json(body) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
     let role = admin_blocking(move || {
-        super::token_admin::update_role(&tokens, &audit, rest_admin(&call_id), &name, &spec)
+        super::token_admin::update_role(&tokens, &audit, rest_admin(&call_id), &name, &body.grants)
     })
     .await?;
     Ok(Json(role))
 }
 
-/// H6 slice 3: `DELETE /api/v1/roles/{name}[?force=true]` — delete a
-/// role. Refused with `409` while live tokens hold it, unless forced;
-/// a forced delete leaves them a reference that grants nothing. The
-/// response lists the tokens that held it. `policy.manage`: the owner
-/// only.
+/// `DELETE /api/v1/roles/{name}` — delete a custom role. Refused with
+/// `409` while live tokens hold it. `policy.manage`: the owner only.
 ///
 /// # Errors
-/// - `400` a bad query.
+/// - `400` a built-in role.
 /// - `403` not the owner.
 /// - `404` no such role.
-/// - `409` held by live tokens, not forced.
+/// - `409` held by live tokens.
 async fn delete_role(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(name): Path<String>,
-    query: Result<Query<DeleteRoleQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
-    let Query(q) = query.map_err(|e| TokensError::BadRequest(format!("invalid query: {e}")))?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
     let role = admin_blocking(move || {
-        super::token_admin::delete_role(&tokens, &audit, rest_admin(&call_id), &name, q.force)
+        super::token_admin::delete_role(&tokens, &audit, rest_admin(&call_id), &name)
     })
     .await?;
     Ok(Json(role))
@@ -870,7 +844,7 @@ struct NetworkGrantBody {
 
 /// Why a grant change failed, as REST answers it.
 enum NetworkGrantApiError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     BadRequest(String),
     Grant(super::network_admin::NetworkGrantError),
 }
@@ -886,7 +860,7 @@ impl IntoResponse for NetworkGrantApiError {
                 .into_response()
         };
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(reason) => bad("bad_request", reason),
             Self::Grant(e @ E::NotInstalled(_)) => (
                 StatusCode::NOT_FOUND,
@@ -927,7 +901,7 @@ async fn set_network_grant(
         Action::PolicyManage,
         &Resource::plugin(plugin_id.as_str()),
     )
-    .map_err(NetworkGrantApiError::Scope)?;
+    .map_err(NetworkGrantApiError::Denied)?;
     let Json(body) =
         body.map_err(|e| NetworkGrantApiError::BadRequest(format!("invalid body: {e}")))?;
     let rules = super::network_admin::parse_grant_rules(&body.rules)
@@ -960,7 +934,7 @@ async fn reset_network_grant(
         Action::PolicyManage,
         &Resource::plugin(plugin_id.as_str()),
     )
-    .map_err(NetworkGrantApiError::Scope)?;
+    .map_err(NetworkGrantApiError::Denied)?;
     let view = super::network_admin::change_network_grant(
         state.engine.clone(),
         super::network_admin::GrantActor::of("api", &ctx),
@@ -1022,7 +996,7 @@ struct TlsPinsRemovedBody {
 }
 
 enum TlsPinError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     BadRequest(String),
     Internal,
 }
@@ -1030,7 +1004,7 @@ enum TlsPinError {
 impl IntoResponse for TlsPinError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
@@ -1039,17 +1013,17 @@ impl IntoResponse for TlsPinError {
 
 /// `GET /api/v1/network/tls-pins[?instance_id=…[&host=…[&port=…]]]` —
 /// the certificates streaming instances pinned on first use for LAN
-/// devices, ordered by instance, host and port. `instances:list`.
+/// devices, ordered by instance, host and port. `instance.read`.
 ///
 /// # Errors
 /// - `400` a host without an instance, or a port without a host.
-/// - `403` missing scope.
+/// - `403` missing permission.
 async fn list_tls_pins(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<TlsPinParams>,
 ) -> Result<Json<TlsPinsBody>, TlsPinError> {
-    require(&ctx, Action::InstanceRead, &Resource::instances()).map_err(TlsPinError::Scope)?;
+    require(&ctx, Action::InstanceRead, &Resource::instances()).map_err(TlsPinError::Denied)?;
     let filter = params.filter()?;
     let pins = state.engine.tls_pins().list(&filter);
     Ok(Json(TlsPinsBody {
@@ -1062,8 +1036,8 @@ async fn list_tls_pins(
 /// pins) whatever certificate the device presents. Returns the removed
 /// pins.
 ///
-/// `policy.manage`: the owner token only; no scope, the wildcard
-/// included, grants it (a reset decides what the host will trust).
+/// `policy.manage`: the owner token only; no role grants it (a reset
+/// decides what the host will trust).
 ///
 /// # Errors
 /// - `400` a host without an instance, a port without a host, neither an
@@ -1075,7 +1049,7 @@ async fn reset_tls_pins(
     State(state): State<ApiState>,
     Query(params): Query<TlsPinParams>,
 ) -> Result<Json<TlsPinsRemovedBody>, TlsPinError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Denied)?;
     let filter = params.reset_filter()?;
     let scope = filter.scope();
     let pins = state.engine.tls_pins();
@@ -1222,15 +1196,15 @@ impl DeviceStateEntry {
 ///
 /// **Not owner-scoped** — the state projection is a host-owned
 /// aggregate meant for API / UI / MCP consumers, not the plugin
-/// world. Gated on `devices:read`.
+/// world. Gated on `device.read`.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 async fn get_device_state(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Path(device_id): Path<String>,
-) -> Result<Json<DeviceStateSnapshot>, ScopeDenied> {
+) -> Result<Json<DeviceStateSnapshot>, Forbidden> {
     require(
         &ctx,
         Action::DeviceRead,
@@ -1390,10 +1364,10 @@ struct AllDevicesStateSnapshot {
     truncated: bool,
 }
 
-/// Handler-local error type covering scope denial, malformed
+/// Handler-local error type covering permission denial, malformed
 /// cursor, and epoch drift. See [`get_all_device_state`].
 enum AllDevicesStateError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     BadCursor,
     EpochChanged,
 }
@@ -1401,7 +1375,7 @@ enum AllDevicesStateError {
 impl IntoResponse for AllDevicesStateError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadCursor => (
                 StatusCode::BAD_REQUEST,
                 "invalid `cursor` — expected the opaque value returned as \
@@ -1418,9 +1392,9 @@ impl IntoResponse for AllDevicesStateError {
     }
 }
 
-impl From<ScopeDenied> for AllDevicesStateError {
-    fn from(value: ScopeDenied) -> Self {
-        Self::Scope(value)
+impl From<Forbidden> for AllDevicesStateError {
+    fn from(value: Forbidden) -> Self {
+        Self::Denied(value)
     }
 }
 
@@ -1431,17 +1405,17 @@ impl From<ScopeDenied> for AllDevicesStateError {
 /// beyond current revision after a daemon restart, or below
 /// the store's stale-eviction watermark), the caller has no
 /// way to know which per-device snapshots to fetch — device
-/// enumeration lives behind the separate `devices:list` scope
+/// enumeration lives behind the separate `device.list` permission
 /// and the reset itself may have dropped device IDs from the
 /// client's cache. This endpoint is the resync path, gated on
-/// `devices:read`, read under one lock so `revision` + entries
+/// `device.read`, read under one lock so `revision` + entries
 /// within one page are consistent, and paginated with a
 /// server-issued opaque cursor so cross-page consistency
 /// (the pin protocol) is enforced instead of documented.
 ///
 /// # Errors
 /// - `400` cursor is malformed.
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `409` cursor's epoch no longer matches the store's
 ///   current epoch — restart the resync from an unpinned
 ///   request.
@@ -1606,12 +1580,12 @@ pub(crate) const MAX_STATE_CHANGES_LIMIT: usize = 1024;
 /// paging rule.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 async fn query_device_state_changes(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<StateChangesParams>,
-) -> Result<Json<StateChangesBody>, ScopeDenied> {
+) -> Result<Json<StateChangesBody>, Forbidden> {
     require(&ctx, Action::DeviceRead, &Resource::devices())?;
     let gate = BytesGate::new(&ctx, &state.engine);
     let blobs = gate.general();
@@ -1831,12 +1805,13 @@ impl From<WitError> for WireWitError {
 /// through the owning plugin instance's `execute-command` export
 /// and return the result.
 ///
-/// **Sensitive.** Gated on the `devices:command` scope: this is
-/// the write-side device endpoint that can physically actuate
-/// locks, garage doors, alarms, etc. The dedicated C3 audit
-/// ledger records every authenticated request; `GET /api/v1/audit`
-/// (scoped on `audit:read`) surfaces the trail — filter by
-/// `path=/api/v1/devices/.../command` for command-dispatch rows.
+/// **Sensitive.** Gated on `device.command` for the device: this is
+/// the write-side device endpoint that can physically actuate locks,
+/// garage doors, alarms, etc. (those need a role grant naming the
+/// category). The dedicated C3 audit ledger records every
+/// authenticated request; `GET /api/v1/audit` (`host.audit`) surfaces
+/// the trail — filter by `path=/api/v1/devices/.../command` for
+/// command-dispatch rows.
 ///
 /// **Response shape (H5).** Every command the host routed to the
 /// owning instance gets a host-minted `command_id` and an explicit
@@ -1847,9 +1822,8 @@ impl From<WitError> for WireWitError {
 /// - `404 not_found` — no device with that id, or its owning
 ///   instance isn't currently running. Indistinguishable from
 ///   "wrong id" so a probing caller can't enumerate device ids.
-/// - `403` — scope check failed, or the token's `device.send_command`
-///   allowlist does not cover `device_id` (audited with
-///   `required_scope = "constraint:device.send_command:devices"`).
+/// - `403` — no role grant covers `device.command` on this device
+///   (audited with `required_scope = "device.command"`).
 ///
 /// The plugin runs under the request's [`InvocationContext`] (H6), so
 /// any `call-service` it makes is audited against this token. The
@@ -1861,16 +1835,14 @@ async fn send_command(
     Path(device_id): Path<String>,
     Json(body): Json<CommandBody>,
 ) -> Result<axum::response::Response, CommandError> {
-    // H6: `device.command` on the addressed device — the scope, the
-    // token's per-device allowlist and (slice 2) the sensitive-category
-    // grant, shared with Connect and MCP. Before the lookup so a
-    // refused token can't probe device ids.
-    let decision = require(
+    // `device.command` on the addressed device, shared with Connect and
+    // MCP. Before the lookup so a refused token can't probe device ids.
+    require(
         &invocation,
         Action::DeviceCommand,
         &state.engine.devices().resource(&device_id),
     )
-    .map_err(CommandError::Scope)?;
+    .map_err(CommandError::Denied)?;
 
     // Resolve device → owning instance via the registry's
     // cross-instance owner-only lookup (mirrors the dispatcher's
@@ -1887,16 +1859,6 @@ async fn send_command(
         .instances()
         .get(&owner)
         .ok_or(CommandError::NotFound)?;
-
-    // H6 slice 2: an allowed sensitive command takes its rate-limit
-    // charge now (a refusal is an immediate 429); its `warn` audit row
-    // is written when the supervisor dispatches it, and a command that
-    // never runs refunds the charge.
-    let charge = state
-        .engine
-        .sensitive()
-        .reserve(&invocation, Action::DeviceCommand, &device_id, &decision)
-        .map_err(CommandError::Obligation)?;
 
     // Build the WIT command. JSON `value` shapes map to typed
     // `Value` variants via the `From<WireValue>` impl. The supervisor
@@ -1917,7 +1879,7 @@ async fn send_command(
 
     let gate = BytesGate::new(&invocation, &state.engine);
     let report = handle
-        .execute_command_admitted(invocation, device_id.clone(), cmd, charge)
+        .execute_command_in(invocation, device_id.clone(), cmd)
         .await;
     let blobs = gate.release_report(&device_id, &owner, &report);
 
@@ -1933,51 +1895,15 @@ async fn send_command(
 }
 
 enum CommandError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     NotFound,
-    Obligation(crate::auth::sensitive::ObligationError),
 }
 
 impl IntoResponse for CommandError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            CommandError::Scope(s) => s.into_response(),
+            CommandError::Denied(s) => s.into_response(),
             CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
-            CommandError::Obligation(e) => obligation_response(&e),
-        }
-    }
-}
-
-/// H6 slice 2: the response for a sensitive action whose obligations
-/// weren't met — `429` with `Retry-After` when rate limited, `500` when
-/// the `warn` audit row couldn't be written (the action didn't run).
-pub(crate) fn obligation_response(
-    err: &crate::auth::sensitive::ObligationError,
-) -> axum::response::Response {
-    use crate::auth::sensitive::ObligationError;
-    match err {
-        ObligationError::RateLimited {
-            category,
-            retry_after_secs,
-        } => {
-            let mut resp = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "rate_limited",
-                    "category": category.as_str(),
-                    "retry_after_secs": retry_after_secs,
-                })),
-            )
-                .into_response();
-            resp.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from(*retry_after_secs),
-            );
-            resp
-        }
-        ObligationError::Audit(_) | ObligationError::Join(_) => {
-            tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
-            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
         }
     }
 }
@@ -2019,11 +1945,11 @@ struct PluginSummary {
 /// running-but-uninstalled instances (the dev-time argv path).
 /// `instance_count` is aggregated from
 /// [`InstanceRegistry::list`] by `plugin_id`. Gated on
-/// `plugins:list`. Sorted by plugin id for stable CLI output.
+/// `plugin.read`. Sorted by plugin id for stable CLI output.
 async fn list_plugins(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
-) -> Result<Json<PluginsBody>, ScopeDenied> {
+) -> Result<Json<PluginsBody>, Forbidden> {
     require(&ctx, Action::PluginRead, &Resource::plugins())?;
     // First, count running instances by plugin id.
     let mut by_plugin: HashMap<String, u32> = HashMap::new();
@@ -2097,7 +2023,7 @@ struct PluginSchemaBody {
 /// per render.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `404` no such installed plugin (dev-only in-memory
 ///   plugins aren't reachable — they have no on-disk
 ///   manifest).
@@ -2182,7 +2108,7 @@ async fn get_plugin_schema(
 /// install" apart from generic 500s and act on it
 /// (reinstall via the API).
 enum PluginSchemaError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     NotFound,
     DigestMismatch {
         plugin_id: String,
@@ -2192,16 +2118,16 @@ enum PluginSchemaError {
     Internal(anyhow::Error),
 }
 
-impl From<ScopeDenied> for PluginSchemaError {
-    fn from(value: ScopeDenied) -> Self {
-        Self::Scope(value)
+impl From<Forbidden> for PluginSchemaError {
+    fn from(value: Forbidden) -> Self {
+        Self::Denied(value)
     }
 }
 
 impl IntoResponse for PluginSchemaError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::DigestMismatch {
                 plugin_id,
@@ -2251,7 +2177,7 @@ struct InstalledRow {
 /// `POST /api/v1/plugins` — install. Reads
 /// `<source_dir>/manifest.toml` to extract the canonical plugin id,
 /// then recursively copies `source_dir` into
-/// `<state_dir>/plugins/<plugin_id>/`. Gated on `plugins:install`
+/// `<state_dir>/plugins/<plugin_id>/`. Gated on `plugin.install`
 /// (sensitive — installs new code on the host).
 ///
 /// Does **not** start the plugin: the operator follows up with
@@ -2303,7 +2229,7 @@ struct StartedRow {
 
 /// `POST /api/v1/plugins/{plugin_id}/start` — start a supervised
 /// instance of an installed plugin. Returns once the instance
-/// reaches `Running` (or fails to). Gated on `plugins:start`.
+/// reaches `Running` (or fails to). Gated on `instance.start`.
 async fn start_plugin_instance(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
@@ -2392,7 +2318,7 @@ struct StoppedRow {
 }
 
 /// `POST /api/v1/plugins/{plugin_id}/stop` — stop one or all
-/// running instances of `plugin_id`. Gated on `plugins:stop`.
+/// running instances of `plugin_id`. Gated on `instance.stop`.
 /// Returns the list of `instance_id`s actually stopped (empty
 /// if none were running, which is success — idempotent).
 ///
@@ -2454,7 +2380,7 @@ struct UninstalledRow {
 /// plugin's directory recursively. Refuses if any supervised
 /// instance of the plugin is still running (`409 Conflict`); the
 /// operator must `POST .../stop` first. Gated on
-/// `plugins:uninstall` (sensitive).
+/// `plugin.uninstall` (sensitive).
 async fn uninstall_plugin(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
@@ -2516,7 +2442,7 @@ async fn uninstall_plugin(
 /// status so a caller can tell "plugin not installed" from
 /// "instances still running" from "transient IO error".
 enum PluginLifecycleError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     /// Plugin not installed (start, uninstall) or — for install —
     /// the source dir doesn't exist.
     NotFound,
@@ -2550,9 +2476,9 @@ enum PluginLifecycleError {
     },
 }
 
-impl From<ScopeDenied> for PluginLifecycleError {
-    fn from(s: ScopeDenied) -> Self {
-        Self::Scope(s)
+impl From<Forbidden> for PluginLifecycleError {
+    fn from(s: Forbidden) -> Self {
+        Self::Denied(s)
     }
 }
 
@@ -2593,7 +2519,7 @@ impl From<UninstallError> for PluginLifecycleError {
 impl IntoResponse for PluginLifecycleError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::AlreadyInstalled(id) => (
                 StatusCode::CONFLICT,
@@ -2679,7 +2605,7 @@ impl IntoResponse for PluginLifecycleError {
 ///    the plugin's UI assets.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `404` no such installed plugin.
 async fn post_plugin_ui_session(
     Extension(ctx): Extension<InvocationContext>,
@@ -3018,31 +2944,31 @@ where
 
 /// C6: handler-local error type for the two UI endpoints.
 enum PluginUiError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     NotFound,
     TicketBad,
     TicketExpired,
 }
 
-impl From<ScopeDenied> for PluginUiError {
-    fn from(value: ScopeDenied) -> Self {
-        Self::Scope(value)
+impl From<Forbidden> for PluginUiError {
+    fn from(value: Forbidden) -> Self {
+        Self::Denied(value)
     }
 }
 
 impl IntoResponse for PluginUiError {
     fn into_response(self) -> Response {
         let mut response = match self {
-            // Round-3 finding 2: scope-denied responses go
+            // Round-3 finding 2: permission-denied responses go
             // through the shared 403 shape without our
             // Cache-Control stamp — they aren't
             // ticket-authenticated and don't leak
             // anything cacheable-across-request either.
-            Self::Scope(s) => return s.into_response(),
+            Self::Denied(s) => return s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             // Round-3 finding 3: recovery is `POST
             // /api/v1/plugins/{id}/ui-session` (bearer + the
-            // `plugins:ui` scope) — `/ui` no longer mints
+            // `plugin.ui` permission) — `/ui` no longer mints
             // tickets, it consumes them.
             Self::TicketBad => (
                 StatusCode::BAD_REQUEST,
@@ -3150,7 +3076,7 @@ fn js_string_escape(input: &str) -> String {
 
 /// `GET /api/v1/events/tail[?after_id=N]` — WebSocket upgrade that
 /// streams every bus event to the client as a JSON text frame. Gated
-/// on `events:tail`; `after_id` also needs `events:read`, since it
+/// on `event.subscribe`; `after_id` also needs `event.read`, since it
 /// replays history. Filter parameters (`--filter device=…`, topic
 /// prefix) are a follow-up; v1 streams everything and lets the
 /// client filter.
@@ -3178,18 +3104,18 @@ fn js_string_escape(input: &str) -> String {
 /// **Ordering note.** Axum runs extractors in declaration order; a
 /// non-WS request rejects at `WebSocketUpgrade` with **426
 /// Upgrade Required** (no `OnUpgrade` in request extensions)
-/// *before* the scope check runs. That's a deliberate
+/// *before* the permission check runs. That's a deliberate
 /// information-leak property: a probing caller without
-/// `events:tail` and without a proper WS handshake gets the same
+/// `event.subscribe` and without a proper WS handshake gets the same
 /// 426 a wrong-method probe would, so they can't distinguish
-/// "scope missing" from "wrong shape". Real WS handshakes (the
+/// "permission missing" from "wrong shape". Real WS handshakes (the
 /// only ones operators actually send) reach the handler body and
 /// get the 403 they should.
 ///
 /// **Audit consequence.** A non-WS probe (426) never reaches the
 /// handler body, so `emit_audit` doesn't run — non-WS requests to
 /// this path leave no audit row. Real WS handshakes (success or
-/// scope-deny) are audited normally. This is the same shape as
+/// permission-deny) are audited normally. This is the same shape as
 /// the `WWW-Authenticate: Bearer` 401 from `require_token`: failed
 /// extractor → no audit because there's no authenticated request
 /// to record. Documenting so a future audit-completeness audit
@@ -3199,7 +3125,7 @@ async fn tail_events(
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
     Query(params): Query<TailParams>,
-) -> Result<axum::response::Response, ScopeDenied> {
+) -> Result<axum::response::Response, Forbidden> {
     require(&ctx, Action::EventSubscribe, &Resource::events())?;
     if params.after_id.is_some() {
         require(&ctx, Action::EventRead, &Resource::events())?;
@@ -3227,7 +3153,7 @@ async fn tail_events(
     };
     let resume_after_id = tail.resume_after_id();
     // M7: live and replayed events alike withhold `bytes-val`
-    // payloads unless the caller holds `blobs:read`.
+    // payloads unless the caller holds `blob.read`.
     let gate = BytesGate::new(&ctx, &state.engine);
     let mut response = upgrade.on_upgrade(move |socket| tail_events_loop(socket, tail, gate));
     if let Some(id) = resume_after_id {
@@ -3549,14 +3475,14 @@ const LOGS_QUERY_DEFAULT_LIMIT: u32 = 100;
 const LOGS_QUERY_MAX_LIMIT: u32 = 1_000;
 
 /// `GET /api/v1/logs?…` — historical log query against the
-/// `LogStore` `SQLite` table. Gated on `logs:read`. Returns rows
+/// `LogStore` `SQLite` table. Gated on `host.logs`. Returns rows
 /// newest-first (the store's native order).
 async fn query_logs(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
     Query(params): Query<LogsParams>,
 ) -> Result<Json<LogsBody>, LogsError> {
-    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Scope)?;
+    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(LOGS_QUERY_DEFAULT_LIMIT)
@@ -3591,18 +3517,18 @@ fn run_logs_query(
     store.query(query, limit)
 }
 
-/// Composite error for `query_logs` so a 403 (scope) and a 500
+/// Composite error for `query_logs` so a 403 (permission) and a 500
 /// (storage) flow through the same `?` chain without a custom
 /// trait juggling.
 enum LogsError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     Storage(crate::state::LogStoreError),
 }
 
 impl IntoResponse for LogsError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            LogsError::Scope(s) => s.into_response(),
+            LogsError::Denied(s) => s.into_response(),
             LogsError::Storage(err) => {
                 tracing::error!(target: "api.logs", error = %err, "logs query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -3699,7 +3625,7 @@ static EVENTS_QUERY_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(EVENTS_QUERY_INFLIGHT)));
 
 /// `GET /api/v1/events?…` — historical event query against the
-/// `EventLog` `SQLite` table. Gated on `events:read`. Returns rows
+/// `EventLog` `SQLite` table. Gated on `event.read`. Returns rows
 /// in descending `id` order (highest first). Under normal
 /// operation this is "newest first" since id is a monotonic
 /// AUTOINCREMENT; under wall-clock skew id
@@ -3712,7 +3638,7 @@ async fn query_events(
     State(state): State<ApiState>,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<EventsBody>, EventsError> {
-    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Scope)?;
+    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
@@ -3777,7 +3703,7 @@ async fn query_events(
 }
 
 enum EventsError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     Storage(EventLogError),
     Join,
     Busy,
@@ -3787,7 +3713,7 @@ enum EventsError {
 impl IntoResponse for EventsError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            EventsError::Scope(s) => s.into_response(),
+            EventsError::Denied(s) => s.into_response(),
             EventsError::Storage(err) => {
                 tracing::error!(target: "api.events", error = %err, "events query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -3919,7 +3845,7 @@ const AUDIT_QUERY_MAX_LIMIT: u32 = 1_000;
 
 /// `GET /api/v1/audit?…` — historical audit query against the
 /// dedicated C3 `audit_event` `SQLite` table. Gated on
-/// `audit:read`. Returns rows newest-first with a `next_cursor`
+/// `host.audit`. Returns rows newest-first with a `next_cursor`
 /// for lossless pagination.
 async fn query_audit(
     Extension(ctx): Extension<InvocationContext>,
@@ -3927,7 +3853,7 @@ async fn query_audit(
     State(state): State<ApiState>,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditBody>, AuditError> {
-    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Scope)?;
+    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(AUDIT_QUERY_DEFAULT_LIMIT)
@@ -4004,7 +3930,7 @@ fn parse_audit_cursor(s: &str) -> Result<(i64, u64), &'static str> {
 }
 
 enum AuditError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     Storage(crate::state::AuditLogError),
     BadCursor(&'static str),
 }
@@ -4012,7 +3938,7 @@ enum AuditError {
 impl IntoResponse for AuditError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            AuditError::Scope(s) => s.into_response(),
+            AuditError::Denied(s) => s.into_response(),
             AuditError::Storage(err) => {
                 tracing::error!(target: "api.audit", error = %err, "audit query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -4208,7 +4134,7 @@ struct DashboardsBody {
 /// via `GET /dashboards/{id}` when they need it.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 async fn list_dashboards(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
@@ -4233,7 +4159,7 @@ async fn list_dashboards(
 /// # Errors
 /// - `400` request body isn't valid JSON, or `name` /
 ///   `layout` exceeds the per-row cap.
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `409` the owner is already at `MAX_DASHBOARDS_PER_OWNER`.
 async fn create_dashboard(
     Extension(ctx): Extension<InvocationContext>,
@@ -4260,7 +4186,7 @@ async fn create_dashboard(
 /// the SELECT statement; cross-owner reads return 404.
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn get_dashboard(
@@ -4290,7 +4216,7 @@ async fn get_dashboard(
 ///
 /// # Errors
 /// - `400` `name` / `layout` exceeds the per-row cap.
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn update_dashboard(
@@ -4326,7 +4252,7 @@ async fn update_dashboard(
 /// the caller already deleted returns 404).
 ///
 /// # Errors
-/// - `403` scope check failed.
+/// - `403` permission check failed.
 /// - `404` dashboard doesn't exist OR is owned by a
 ///   different user.
 async fn delete_dashboard(
@@ -4353,7 +4279,7 @@ async fn delete_dashboard(
 /// Handler-local error type. Errors from the store fold
 /// into this via `?`.
 enum DashboardsError {
-    Scope(ScopeDenied),
+    Denied(Forbidden),
     NotFound,
     /// Round-2 finding 3: input violated the per-row cap
     /// or per-owner quota. Wired distinctly from
@@ -4376,9 +4302,9 @@ enum DashboardsError {
     Internal(anyhow::Error),
 }
 
-impl From<ScopeDenied> for DashboardsError {
-    fn from(value: ScopeDenied) -> Self {
-        Self::Scope(value)
+impl From<Forbidden> for DashboardsError {
+    fn from(value: Forbidden) -> Self {
+        Self::Denied(value)
     }
 }
 
@@ -4400,7 +4326,7 @@ impl From<crate::state::DashboardError> for DashboardsError {
 impl IntoResponse for DashboardsError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::TooLarge { field, size, max } => (
                 StatusCode::BAD_REQUEST,
@@ -4502,7 +4428,7 @@ mod tests {
     }
 
     /// M7 + H5: a `completed` report's `bytes-val` state is withheld
-    /// from a caller without `blobs:read` (REST and MCP share this
+    /// from a caller without `blob.read` (REST and MCP share this
     /// encoder) and passed through for one with it.
     #[test]
     fn command_report_withholds_bytes_without_blobs_read() {

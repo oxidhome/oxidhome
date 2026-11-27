@@ -2,7 +2,7 @@
 //
 // Read side of the device catalogue: mirrors
 // `GET /api/v1/devices` on the JSON API. Gated on the
-// `devices:list` scope. Write-side (`Devices.Command`) lands in
+// `device.list` permission. Write-side (`Devices.Command`) lands in
 // the next slice.
 syntax = "proto3";
 
@@ -18,7 +18,7 @@ service DevicesService {
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
 
   // Execute a capability command against a device. Sensitive
-  // (`devices:command` scope) — controls physical actuation
+  // (`device.command` permission) — controls physical actuation
   // (switches, dimmers, locks). Same routing as the JSON
   // `POST /api/v1/devices/{id}/command`: the host looks up the
   // device's owning instance and forwards `execute-command` to
@@ -29,20 +29,20 @@ service DevicesService {
   rpc ExecuteCommand(ExecuteCommandRequest) returns (ExecuteCommandResponse);
 
   // H2: current state of one device from the host-owned projection.
-  // Mirrors `GET /api/v1/devices/{id}/state`; `devices:read`. An
+  // Mirrors `GET /api/v1/devices/{id}/state`; `device.read`. An
   // unknown device returns an empty `capabilities` list, not an
-  // error. `bytes_val` fields are withheld without `blobs:read` (M7).
+  // error. `bytes_val` fields are withheld without `blob.read` (M7).
   rpc GetDeviceState(GetDeviceStateRequest) returns (GetDeviceStateResponse);
 
   // H2: one page of the full-store snapshot, the resync primitive.
-  // Mirrors `GET /api/v1/devices/state`; `devices:read`. A malformed
+  // Mirrors `GET /api/v1/devices/state`; `device.read`. A malformed
   // `cursor` is `invalid_argument`; a cursor from an earlier daemon
   // process or another store epoch is `aborted` (restart the resync
   // without a cursor).
   rpc ListDeviceState(ListDeviceStateRequest) returns (ListDeviceStateResponse);
 
   // H2: cursor catch-up over the projection. Mirrors
-  // `GET /api/v1/devices/state/changes`; `devices:read`.
+  // `GET /api/v1/devices/state/changes`; `device.read`.
   rpc ListDeviceStateChanges(ListDeviceStateChangesRequest) returns (ListDeviceStateChangesResponse);
 }
 
@@ -66,9 +66,9 @@ message Device {
   // any operator raise.
   string category = 4;
   // Sensitive categories the device falls under (`lock`, `opener`,
-  // `alarm`, `camera`). A token needs an explicit grant for each: no
-  // scope, the wildcard included, reaches a command on a lock, opener
-  // or alarm, or a camera's bytes.
+  // `alarm`, `camera`). A command on a lock, opener or alarm, or a
+  // camera's bytes, needs a role grant whose `category` names it; `*`
+  // doesn't reach them.
   repeated string sensitive = 5;
 }
 

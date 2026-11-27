@@ -153,7 +153,10 @@ async fn load(engine: &Engine, id: &str, source: &str) -> String {
 }
 
 fn api_root() -> InvocationContext {
-    let actor = Actor::api("tok-h1", vec!["*".into()]);
+    let actor = Actor::api(
+        "tok-h1",
+        vec![oxidhome_core::auth::role::builtin("admin").unwrap()],
+    );
     InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
 }
 

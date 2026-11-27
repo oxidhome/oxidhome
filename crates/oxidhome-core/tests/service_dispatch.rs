@@ -15,6 +15,8 @@ mod support;
 
 use std::time::{Duration, Instant};
 
+use oxidhome_core::auth::role::builtin;
+
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::Value;
 use oxidhome_core::{Engine, InstanceState};
 
@@ -485,7 +487,7 @@ async fn delegated_chain_is_audited_against_external_root() {
     );
 
     // API-rooted.
-    let actor = Actor::api("tok-h6", vec!["*".into()]);
+    let actor = Actor::api("tok-h6", vec![builtin("admin").unwrap()]);
     let root =
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
     let call_id = root.call_id().to_owned();
@@ -638,7 +640,7 @@ async fn call_service_args_are_checked_against_the_declared_schema() {
     // H6 × M2: under an external root, a schema refusal is not an
     // authorization decision and the callee never runs, so it writes
     // no hop row (only grant refusals become `deny` rows).
-    let actor = Actor::api("tok-m2", vec!["*".into()]);
+    let actor = Actor::api("tok-m2", vec![builtin("admin").unwrap()]);
     let root =
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
     let call_id = root.call_id().to_owned();

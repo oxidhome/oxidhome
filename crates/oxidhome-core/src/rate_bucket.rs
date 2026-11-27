@@ -1,6 +1,5 @@
-//! A leaky token bucket: the refill-and-take step shared by the MCP
-//! per-token rate limit (14.7b) and the per-principal, per-category
-//! limit on sensitive actions (H6 slice 2).
+//! A leaky token bucket: the refill-and-take step of the MCP per-token
+//! rate limit (14.7b).
 
 use std::time::Instant;
 

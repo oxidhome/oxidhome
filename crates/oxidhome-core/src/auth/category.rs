@@ -1,5 +1,5 @@
-//! Host-derived device categories and the sensitive categories that a
-//! wildcard never covers (H6 slice 2).
+//! Host-derived device categories and the sensitive categories that
+//! only a grant naming them reaches.
 //!
 //! A device's [`DeviceClass`] is derived by the host from the
 //! capabilities the plugin registered, never set by the plugin:
@@ -19,12 +19,12 @@
 //! A device's category is the highest-precedence category any of its
 //! capabilities implies ([`DeviceCategory::ALL`] is in precedence
 //! order). Its sensitive set is every sensitive category any of them
-//! implies, so a lock with a camera needs the `lock` grant to command
-//! it and the `camera` grant for its bytes.
+//! implies, so a lock with a camera needs a grant naming `lock` to
+//! command it and one naming `camera` for its bytes.
 //!
 //! There are no known extension ids yet, so every `extension(...)`
 //! capability is `other`: a device that only has unknown extensions
-//! is usable by wildcard tokens and not protected. The operator can
+//! is usable by any role and not protected. The operator can
 //! raise it (`climate` has no capability today and is reachable only
 //! that way).
 //!
@@ -138,8 +138,8 @@ impl FromStr for DeviceCategory {
     }
 }
 
-/// A category that a wildcard scope never covers. Only a token that
-/// names it in its sensitive grants (or the owner token) reaches it.
+/// A category that only a role grant naming it (or the owner token)
+/// reaches; `*` never does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SensitiveCategory {
     /// Commands to lock devices.
@@ -169,18 +169,6 @@ impl SensitiveCategory {
             SensitiveCategory::Opener => "opener",
             SensitiveCategory::Alarm => "alarm",
             SensitiveCategory::Camera => "camera",
-        }
-    }
-
-    /// The audit label of a deny for want of this grant
-    /// (`required_scope` = `sensitive:<category>`).
-    #[must_use]
-    pub const fn deny_label(self) -> &'static str {
-        match self {
-            SensitiveCategory::Lock => "sensitive:lock",
-            SensitiveCategory::Opener => "sensitive:opener",
-            SensitiveCategory::Alarm => "sensitive:alarm",
-            SensitiveCategory::Camera => "sensitive:camera",
         }
     }
 
@@ -285,22 +273,6 @@ impl SensitiveSet {
             .collect::<Vec<_>>()
             .join(",")
     }
-
-    /// Parse [`Self::to_csv`]'s form. Unknown names are returned in
-    /// the error so the caller can decide; an empty string is the
-    /// empty set.
-    ///
-    /// # Errors
-    ///
-    /// [`UnknownCategory`] for the first name that isn't a sensitive
-    /// category.
-    pub fn from_csv(s: &str) -> Result<Self, UnknownCategory> {
-        let mut set = Self::empty();
-        for name in s.split(',').filter(|n| !n.is_empty()) {
-            set.insert(name.parse()?);
-        }
-        Ok(set)
-    }
 }
 
 impl FromIterator<SensitiveCategory> for SensitiveSet {
@@ -320,7 +292,8 @@ pub struct DeviceClass {
     category: DeviceCategory,
     sensitive: SensitiveSet,
     /// `false` for a device that isn't registered right now: its
-    /// display category is unknown (a category deny then matches it).
+    /// display category is unknown (a display-category grant doesn't
+    /// match it; its sensitive floor still does).
     registered: bool,
 }
 
@@ -577,7 +550,6 @@ mod tests {
         for s in SensitiveCategory::ALL {
             assert_eq!(s.as_str().parse::<SensitiveCategory>(), Ok(s));
             assert_eq!(s.category().sensitive(), Some(s));
-            assert_eq!(s.deny_label(), format!("sensitive:{s}"));
         }
         assert!("door".parse::<DeviceCategory>().is_err());
         assert!("light".parse::<SensitiveCategory>().is_err());
@@ -585,8 +557,5 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(set.to_csv(), "lock,camera");
-        assert_eq!(SensitiveSet::from_csv("lock,camera"), Ok(set));
-        assert_eq!(SensitiveSet::from_csv(""), Ok(SensitiveSet::empty()));
-        assert!(SensitiveSet::from_csv("lock,door").is_err());
     }
 }

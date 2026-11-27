@@ -139,8 +139,8 @@ pub fn is_device_id(id: &str) -> bool {
 }
 
 /// `true` when `pattern` is a device id or a `prefix*` of one (a
-/// non-empty prefix shorter than an id): the device patterns a grant
-/// or deny may name. Anything else would match no host-minted id.
+/// non-empty prefix shorter than an id): the device patterns a role
+/// grant may name. Anything else would match no host-minted id.
 #[must_use]
 pub fn is_device_pattern(pattern: &str) -> bool {
     match pattern.strip_suffix('*') {

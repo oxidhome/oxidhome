@@ -1,4 +1,4 @@
-//! Who may see raw `bytes-val` payloads (M7, H6 slice 2).
+//! Who may see raw `bytes-val` payloads (M7).
 //!
 //! Camera snapshots, audio clips and inference frames ride device
 //! state, events and command results as `bytes-val`. Every read
@@ -7,23 +7,17 @@
 //! stream and asks it per value's source. A value the gate refuses is
 //! replaced by the withheld marker ([`crate::redact::withhold_bytes`]).
 //!
-//! The decision is [`authorize()`] of `blob.read` on the source:
-//!
-//! - the root must hold `blob.read` (the `blobs:read` scope or the
-//!   wildcard), as before;
-//! - bytes from a **camera source** are sensitive: the source device is
-//!   a camera, or its owning instance has ever registered a camera
-//!   (blobs and bytes carry no provenance of their own, so everything a
-//!   camera plugin emits is treated as camera bytes). These need an
-//!   explicit `camera` grant; a wildcard scope doesn't reach them.
+//! The decision is [`authorize()`] of `blob.read` on the source. Bytes
+//! from a **camera source** are sensitive: the source device is a
+//! camera, or its owning instance has ever registered a camera (blobs
+//! and bytes carry no provenance of their own, so everything a camera
+//! plugin emits is treated as camera bytes). They need a role grant
+//! naming `camera`.
 //!
 //! The decision is taken per value against the current device
-//! registry, so a long-lived stream follows reclassification. The
-//! obligations of a camera release (rate limit, `warn` audit row) are
-//! met once per gate: on the first camera value the gate would
-//! release. If the principal's camera allowance is used up, the gate
-//! withholds every camera value for the rest of the request or
-//! stream. The `warn` row is written off the request path and
+//! registry, so a long-lived stream follows reclassification. A camera
+//! release is recorded once per gate, on the first camera value it
+//! releases, with a `warn` audit row written off the request path and
 //! best-effort: a read releases no physical effect, and failing the
 //! whole stream on an audit hiccup would be worse than a missed row
 //! (the failure is logged at error).
@@ -31,52 +25,40 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::Engine;
-use crate::auth::sensitive::{ObligationError, SensitiveGuard};
-use crate::auth::{Action, InvocationContext, Resource, SensitiveCategory, authorize};
+use crate::auth::{Action, Decision, InvocationContext, Resource, SensitiveCategory, authorize};
 use crate::host_impl::plugin::oxidhome::plugin::events::{Event, EventPayload};
 use crate::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
 use crate::runtime::{CommandOutcome, CommandReport};
-use crate::state::DeviceRegistry;
+use crate::state::{AuditLog, DeviceRegistry};
 
-/// Per-request (or per-stream) byte-release decision.
+/// Per-request (or per-stream) byte-release decisions.
 pub(crate) struct BytesGate {
     ctx: InvocationContext,
     devices: Arc<DeviceRegistry>,
-    guard: Arc<SensitiveGuard>,
-    /// The root holds `blob.read` at all (the pre-check).
+    audit: Arc<AuditLog>,
+    /// The pre-check: may the root read any bytes at all?
     general: bool,
-    /// Hold the camera release's `warn` row until [`Self::settle`]
-    /// (a response that may still be refused, e.g. for size).
+    /// Record the camera release only once [`Self::settle`] says the
+    /// response was delivered.
     deferred: bool,
     state: Mutex<GateState>,
 }
 
 #[derive(Default)]
 struct GateState {
-    camera: CameraRelease,
-    /// A deferred gate's charged-but-unrecorded release.
-    pending: Option<(crate::auth::Decision, String)>,
-}
-
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
-enum CameraRelease {
-    /// No camera value released yet: the next one meets the
-    /// obligations.
-    #[default]
-    NotYet,
-    /// Obligations met; release camera values the decision allows.
-    Released,
-    /// Rate limited: withhold every camera value.
-    Refused,
+    /// A camera value was released (and recorded, or pending).
+    camera_released: bool,
+    /// A deferred gate's release, recorded on [`BytesGate::settle`].
+    pending: Option<(Decision, String)>,
 }
 
 impl BytesGate {
-    /// A gate for `ctx`'s root against `engine`'s registry.
+    /// A gate for `ctx`'s root.
     pub(crate) fn new(ctx: &InvocationContext, engine: &Engine) -> Self {
         Self {
             ctx: ctx.clone(),
             devices: engine.devices(),
-            guard: engine.sensitive(),
+            audit: engine.audit_log(),
             // A pre-check: every value is decided per source below.
             general: authorize(
                 ctx,
@@ -89,20 +71,18 @@ impl BytesGate {
         }
     }
 
-    /// A gate for a single response that can still be refused after
-    /// its values are released (MCP event reads, refused when the
-    /// encoded body is too large). A camera release is charged when
-    /// it happens but recorded only by [`Self::settle`]`(true)`;
-    /// settled `false` (or dropped unsettled) it is refunded.
+    /// A gate whose camera release is recorded only once
+    /// [`Self::settle`] reports the response delivered: for a
+    /// response that may still be refused after it is built (an MCP
+    /// body over its size cap).
     pub(crate) fn deferred(ctx: &InvocationContext, engine: &Engine) -> Self {
         let mut gate = Self::new(ctx, engine);
         gate.deferred = true;
         gate
     }
 
-    /// Finish a [`Self::deferred`] gate: `delivered` records the
-    /// camera release's `warn` row, otherwise its charge is refunded.
-    /// A no-op for other gates or when nothing was released.
+    /// Settle a deferred gate: record its camera release if the
+    /// response was `delivered`, else forget it.
     pub(crate) fn settle(&self, delivered: bool) {
         let pending = self
             .state
@@ -110,40 +90,28 @@ impl BytesGate {
             .unwrap_or_else(PoisonError::into_inner)
             .pending
             .take();
-        let Some((decision, target)) = pending else {
-            return;
-        };
-        if delivered {
+        if let Some((decision, target)) = pending
+            && delivered
+        {
             self.record_release(decision, target);
-        } else if decision.obligations.rate_limit.is_some() {
-            self.guard.refund(
-                self.ctx.root().audit_token_id(),
-                decision.obligations.sensitive,
-            );
         }
     }
 
-    /// A gate that releases nothing (no invocation context).
+    /// A gate that releases nothing.
     pub(crate) fn deny_all(engine: &Engine) -> Self {
-        let ctx = InvocationContext::external(crate::auth::Principal::token(
-            crate::auth::ActorKind::Api,
-            &crate::auth::Actor::api("", Vec::new()),
-            crate::auth::Transport::Rest,
-        ));
-        let mut gate = Self::new(&ctx, engine);
+        let mut gate = Self::new(&InvocationContext::host_origin(""), engine);
         gate.general = false;
         gate
     }
 
-    /// `true` when the root holds `blob.read` at all. Only for sizing
-    /// pages (an upper bound); never to release a value.
+    /// `true` when the root may read bytes from some source: the
+    /// pre-check.
     pub(crate) fn general(&self) -> bool {
         self.general
     }
 
-    /// May bytes from `device` (registered by `owner_instance`) be
-    /// released? Either may be unknown: a custom event names no device,
-    /// a historical row may name an instance that's gone.
+    /// Whether bytes from `device` (or, for a blob, from
+    /// `owner_instance`) are released.
     pub(crate) fn allows(&self, device: Option<&str>, owner_instance: Option<&str>) -> bool {
         if !self.general {
             return false;
@@ -166,10 +134,10 @@ impl BytesGate {
         if !decision.allow {
             return false;
         }
-        if decision.obligations.sensitive.is_empty() {
-            return true;
+        if !decision.sensitive.is_empty() {
+            self.camera_release(decision, device.or(owner.as_deref()).unwrap_or(""));
         }
-        self.camera_release(&decision, device.or(owner.as_deref()).unwrap_or(""))
+        true
     }
 
     /// May `kvs` from `device` / `owner_instance` go out with their
@@ -229,39 +197,28 @@ impl BytesGate {
         self.devices.instance_is_camera(instance)
     }
 
-    fn camera_release(&self, decision: &crate::auth::Decision, target: &str) -> bool {
+    /// Record the first camera release of this gate.
+    fn camera_release(&self, decision: Decision, target: &str) {
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match st.camera {
-            CameraRelease::Released => return true,
-            CameraRelease::Refused => return false,
-            CameraRelease::NotYet => {}
+        if std::mem::replace(&mut st.camera_released, true) {
+            return;
         }
-        if decision.obligations.rate_limit.is_some() {
-            let principal = self.ctx.root().audit_token_id().to_owned();
-            if let Err(ObligationError::RateLimited { .. }) = self
-                .guard
-                .charge(&principal, decision.obligations.sensitive)
-            {
-                st.camera = CameraRelease::Refused;
-                return false;
-            }
-        }
-        st.camera = CameraRelease::Released;
         if self.deferred {
-            st.pending = Some((decision.clone(), target.to_owned()));
-            return true;
+            st.pending = Some((decision, target.to_owned()));
+            return;
         }
         drop(st);
-        self.record_release(decision.clone(), target.to_owned());
-        true
+        self.record_release(decision, target.to_owned());
     }
 
-    /// Write the `warn` row for a camera release, off the request path.
-    fn record_release(&self, decision: crate::auth::Decision, target: String) {
-        let guard = Arc::clone(&self.guard);
+    /// Write the `warn` row of a camera release, off the request path.
+    fn record_release(&self, decision: Decision, target: String) {
+        let audit = Arc::clone(&self.audit);
         let ctx = self.ctx.clone();
         let write = move || {
-            if let Err(err) = guard.record(&ctx, Action::BlobRead, &target, &decision) {
+            if let Err(err) =
+                crate::auth::sensitive::record(&audit, &ctx, Action::BlobRead, &target, &decision)
+            {
                 tracing::error!(
                     target: "auth.sensitive",
                     error = %err,
@@ -279,19 +236,13 @@ impl BytesGate {
     }
 }
 
-impl Drop for BytesGate {
-    /// An unsettled deferred release was never delivered: refund it.
-    fn drop(&mut self) {
-        self.settle(false);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{Actor, ActorKind, Principal, SensitiveGrant, TokenPolicy, Transport};
+    use crate::auth::{Actor, ActorKind, Principal, RoleDef, Transport};
     use crate::host_impl::plugin::oxidhome::plugin::capabilities::CapabilitySpec;
     use crate::host_impl::plugin::oxidhome::plugin::devices::DeviceInfo;
+    use std::sync::Arc;
 
     fn info(local: &str, caps: Vec<CapabilitySpec>) -> DeviceInfo {
         DeviceInfo {
@@ -306,21 +257,17 @@ mod tests {
         }
     }
 
-    fn ctx(scopes: &[&str], sensitive: Vec<SensitiveGrant>) -> InvocationContext {
-        let actor = Actor::from_token_policy(
-            "tok",
-            TokenPolicy {
-                scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
-                sensitive,
-                ..TokenPolicy::default()
-            },
-            false,
-        );
+    fn ctx(grants: &str) -> InvocationContext {
+        let role = RoleDef::parse("r", grants.as_bytes()).expect("role");
+        let actor = Actor::api("tok", vec![Arc::new(role)]);
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
     }
 
+    const ALL: &str = r#"[{"actions":["*"]}]"#;
+    const CAMERA: &str = r#"[{"actions":["blob.read"],"category":["camera"]}]"#;
+
     /// A deferred gate records a camera release only once settled as
-    /// delivered; an undelivered one is refunded.
+    /// delivered.
     #[test]
     fn a_deferred_release_counts_only_when_delivered() {
         use crate::state::AuditQuery;
@@ -330,10 +277,7 @@ mod tests {
             "cam-inst".into(),
             info("c", vec![CapabilitySpec::VideoStream]),
         );
-        let viewer = ctx(
-            &["blobs:read"],
-            vec![SensitiveGrant::all(SensitiveCategory::Camera)],
-        );
+        let viewer = ctx(CAMERA);
         let warn = || {
             engine
                 .audit_log()
@@ -347,9 +291,7 @@ mod tests {
                 .unwrap()
                 .len()
         };
-        // Far more refused pages than the camera allowance: each is
-        // refunded, so the allowance is intact afterwards.
-        for _ in 0..300 {
+        for _ in 0..3 {
             let gate = BytesGate::deferred(&viewer, &engine);
             assert!(gate.allows(Some(&cam), None));
             gate.settle(false);
@@ -370,7 +312,7 @@ mod tests {
             engine
                 .devices()
                 .register("u", "inst".into(), info("b", vec![CapabilitySpec::Button]));
-        let gate = BytesGate::new(&ctx(&["*"], vec![]), &engine);
+        let gate = BytesGate::new(&ctx(ALL), &engine);
         assert!(gate.allows(Some(&bell), None));
         engine.devices().register(
             "u",
@@ -400,40 +342,30 @@ mod tests {
             info("l", vec![CapabilitySpec::Switch]),
         );
 
-        // Wildcard: lamp bytes yes, camera (and the camera plugin's
-        // other devices) no.
-        let gate = BytesGate::new(&ctx(&["*"], vec![]), &engine);
+        // `*`: lamp bytes yes, camera (and the camera plugin's other
+        // devices) no.
+        let gate = BytesGate::new(&ctx(ALL), &engine);
         assert!(gate.allows(Some(&lamp), None));
         assert!(!gate.allows(Some(&cam), None));
         assert!(!gate.allows(Some(&bell), None));
         assert!(!gate.allows(None, Some("cam-inst")));
         assert!(gate.allows(None, Some("lamp-inst")));
 
-        // No blobs:read at all: nothing.
-        let gate = BytesGate::new(&ctx(&["devices:read"], vec![]), &engine);
+        // No blob.read at all: nothing.
+        let gate = BytesGate::new(&ctx(r#"[{"actions":["device.read"]}]"#), &engine);
         assert!(!gate.allows(Some(&lamp), None));
 
-        // Explicit camera grant: released.
-        let gate = BytesGate::new(
-            &ctx(
-                &["blobs:read"],
-                vec![SensitiveGrant::all(SensitiveCategory::Camera)],
-            ),
-            &engine,
-        );
+        // A grant naming camera: released.
+        let gate = BytesGate::new(&ctx(CAMERA), &engine);
         assert!(gate.allows(Some(&cam), None));
         assert!(gate.allows(Some(&bell), None));
         assert!(gate.allows(None, Some("cam-inst")));
 
         // A grant narrowed to the camera device covers it, not the bell.
         let gate = BytesGate::new(
-            &ctx(
-                &["blobs:read"],
-                vec![SensitiveGrant {
-                    category: SensitiveCategory::Camera,
-                    devices: Some(vec![cam.clone()]),
-                }],
-            ),
+            &ctx(&format!(
+                r#"[{{"actions":["blob.read"],"category":["camera"],"devices":["{cam}"]}}]"#
+            )),
             &engine,
         );
         assert!(gate.allows(Some(&cam), None));

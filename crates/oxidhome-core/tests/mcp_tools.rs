@@ -14,13 +14,14 @@
 //!      (`is_error: true`) with a message but not a JSON-RPC
 //!      protocol error.
 //!    - an unknown tool name returns `-32601` method-not-found.
-//!    - a token missing `devices:command` gets `-32001`.
+//!    - a token missing `device.command` gets `-32001`.
 //! 5. Every call lands in the audit ledger under a
 //!    `mcp.tool.<name>` path.
 
 #[path = "support.rs"]
 mod _support;
 
+use _support::Mint;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -48,14 +49,13 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 }
 
 fn mint_bearer(engine: &Engine) -> String {
-    mint_bearer_with_scopes(engine, "wildcard", &["*"])
+    mint_bearer_with_actions(engine, "wildcard", &["*"])
 }
 
-fn mint_bearer_with_scopes(engine: &Engine, id: &str, scopes: &[&str]) -> String {
-    let scope_json = serde_json::to_vec(scopes).expect("scopes serialize");
+fn mint_bearer_with_actions(engine: &Engine, id: &str, scopes: &[&str]) -> String {
     engine
         .auth_tokens()
-        .create(id, &scope_json)
+        .mint(id, scopes)
         .expect("mint bearer")
         .plaintext
 }
@@ -253,13 +253,13 @@ async fn call_tool_unknown_name_returns_method_not_found() {
     );
 }
 
-/// A token without `devices:command` cannot invoke
+/// A token without `device.command` cannot invoke
 /// `device.send_command` — mirrors the REST endpoint's
-/// scope gate. `-32001` is our per-mount `SCOPE_DENIED_CODE`.
+/// permission gate. `-32001` is our per-mount `SCOPE_DENIED_CODE`.
 #[tokio::test(flavor = "current_thread")]
 async fn device_send_command_requires_devices_command_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-list-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -280,7 +280,7 @@ async fn device_send_command_requires_devices_command_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy devices:command; got {response}",
+        "device.list must not satisfy device.command; got {response}",
     );
 }
 
@@ -467,13 +467,13 @@ async fn device_send_command_end_to_end_toggles_a_switch() {
 /// audit row under `mcp.tool.<family>` with `actor_kind =
 /// "mcp"`. Drives one success (unknown-device: audit path
 /// = `mcp.tool.device.send_command`, status 200 because the
-/// dispatch ran, decision "allow") and one scope-denied
+/// dispatch ran, decision "allow") and one permission-denied
 /// call, and verifies both lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_calls_land_in_the_audit_log() {
     let engine = Engine::new().expect("engine");
     let bearer = mint_bearer(&engine);
-    let bearer_denied = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let bearer_denied = mint_bearer_with_actions(&engine, "devices-list-only", &["device.list"]);
     let router = build_router(engine.clone());
     let (router, session) = handshake(router, &bearer).await;
 
@@ -494,7 +494,7 @@ async fn tool_calls_land_in_the_audit_log() {
     )
     .await;
 
-    // Fire a scope-denied call from a different session (a
+    // Fire a permission-denied call from a different session (a
     // fresh bearer needs its own initialize handshake).
     let (router, session2) = handshake(router, &bearer_denied).await;
     let _ = call(
@@ -541,7 +541,7 @@ async fn tool_calls_land_in_the_audit_log() {
     );
     assert!(
         paths_statuses.contains(&("mcp.tool.device.send_command", 403, "deny")),
-        "missing scope-denied row; got {paths_statuses:?}",
+        "missing permission-denied row; got {paths_statuses:?}",
     );
     for row in &tool_rows {
         assert_eq!(row.actor_kind, "mcp");
@@ -786,13 +786,13 @@ async fn list_tools_advertises_logs_query() {
     }
 }
 
-/// A token without `logs:read` cannot invoke `logs.query`.
-/// Mirrors the resource-side scope check on
+/// A token without `host.logs` cannot invoke `logs.query`.
+/// Mirrors the resource-side permission check on
 /// `oxidhome://logs`.
 #[tokio::test(flavor = "current_thread")]
 async fn logs_query_requires_logs_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-list-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -806,7 +806,7 @@ async fn logs_query_requires_logs_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy logs:read; got {response}",
+        "device.list must not satisfy host.logs; got {response}",
     );
 }
 
@@ -1106,13 +1106,13 @@ async fn events_history_advertises_read_only_annotations() {
     assert_eq!(annotations["openWorldHint"], false);
 }
 
-/// 14.3c: a token without `events:read` cannot invoke
+/// 14.3c: a token without `event.read` cannot invoke
 /// `events.history`. Parallels
 /// [`logs_query_requires_logs_read_scope`].
 #[tokio::test(flavor = "current_thread")]
 async fn events_history_requires_events_read_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-list-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-list-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1126,7 +1126,7 @@ async fn events_history_requires_events_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy events:read; got {response}",
+        "device.list must not satisfy event.read; got {response}",
     );
 }
 
@@ -1373,12 +1373,12 @@ async fn list_tools_advertises_plugins_list_and_show() {
     );
 }
 
-/// 14.3d: a token without `plugins:list` cannot invoke either
+/// 14.3d: a token without `plugin.read` cannot invoke either
 /// tool.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_tools_require_plugins_list_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1398,7 +1398,7 @@ async fn plugins_tools_require_plugins_list_scope() {
         .await;
         assert_eq!(
             response["error"]["code"], -32001,
-            "{name}: devices:list must not satisfy plugins:list; got {response}",
+            "{name}: device.list must not satisfy plugin.read; got {response}",
         );
     }
 }
@@ -1708,12 +1708,12 @@ async fn list_tools_advertises_plugins_stop_and_uninstall_with_destructive_annot
     }
 }
 
-/// 14.3e: `plugins.stop` requires `plugins:stop`; devices:list
-/// alone (or even plugins:list) does not satisfy it.
+/// 14.3e: `plugins.stop` requires `instance.stop`; device.list
+/// alone (or even plugin.read) does not satisfy it.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_stop_requires_plugins_stop_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "list-only", &["plugins:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "list-only", &["plugin.read"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1727,15 +1727,15 @@ async fn plugins_stop_requires_plugins_stop_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "plugins:list must not satisfy plugins:stop; got {response}",
+        "plugin.read must not satisfy instance.stop; got {response}",
     );
 }
 
-/// 14.3e: `plugins.uninstall` requires `plugins:uninstall`.
+/// 14.3e: `plugins.uninstall` requires `plugin.uninstall`.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_uninstall_requires_plugins_uninstall_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "stop-only", &["plugins:stop"]);
+    let bearer = mint_bearer_with_actions(&engine, "stop-only", &["instance.stop"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -1749,7 +1749,7 @@ async fn plugins_uninstall_requires_plugins_uninstall_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "plugins:stop must not satisfy plugins:uninstall; got {response}",
+        "instance.stop must not satisfy plugin.uninstall; got {response}",
     );
 }
 
@@ -2128,11 +2128,11 @@ async fn list_tools_advertises_plugins_start_with_destructive_annotations() {
     );
 }
 
-/// 14.3f: `plugins.start` requires `plugins:start`.
+/// 14.3f: `plugins.start` requires `instance.start`.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_start_requires_plugins_start_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "stop-only", &["plugins:stop"]);
+    let bearer = mint_bearer_with_actions(&engine, "stop-only", &["instance.stop"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -2146,7 +2146,7 @@ async fn plugins_start_requires_plugins_start_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "plugins:stop must not satisfy plugins:start; got {response}",
+        "instance.stop must not satisfy instance.start; got {response}",
     );
 }
 
@@ -2423,20 +2423,20 @@ async fn list_tools_advertises_plugins_install_with_destructive_annotations() {
     );
 }
 
-/// 14.3g: `plugins.install` requires `plugins:install` — even
+/// 14.3g: `plugins.install` requires `plugin.install` — even
 /// a token with every other admin scope short of install is
 /// denied.
 #[tokio::test(flavor = "current_thread")]
 async fn plugins_install_requires_plugins_install_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(
+    let bearer = mint_bearer_with_actions(
         &engine,
         "no-install",
         &[
-            "plugins:list",
-            "plugins:start",
-            "plugins:stop",
-            "plugins:uninstall",
+            "plugin.read",
+            "instance.start",
+            "instance.stop",
+            "plugin.uninstall",
         ],
     );
     let router = build_router(engine);
@@ -2452,7 +2452,7 @@ async fn plugins_install_requires_plugins_install_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "other admin scopes must not satisfy plugins:install; got {response}",
+        "other admin scopes must not satisfy plugin.install; got {response}",
     );
 }
 
@@ -2746,390 +2746,6 @@ async fn plugins_install_audit_taxonomy_stays_clean() {
     assert!(row.domain_error.is_none());
 }
 
-// ── 14.4b: device.send_command constraint enforcement ────────────
-
-/// Mint a bearer carrying an extended `TokenPolicy` envelope
-/// with the constraint blob under test. `scope_json` in the
-/// store accepts either shape (bare scope array or the
-/// `{scopes, constraints}` object) — this helper always
-/// writes the extended shape so 14.4a's parse path runs.
-fn mint_bearer_with_constraint(engine: &Engine, id: &str, constraints_json: &str) -> String {
-    let scope_json = format!(r#"{{"scopes":["*"],"constraints":{constraints_json}}}"#);
-    engine
-        .auth_tokens()
-        .create(id, scope_json.as_bytes())
-        .expect("mint bearer with constraint")
-        .plaintext
-}
-
-/// Round-1 14.4b: a token whose
-/// `constraints.device.send_command.devices` allowlist
-/// doesn't cover the requested id must be refused with
-/// -32001 `SCOPE_DENIED` before the device lookup runs — the
-/// deny is the operator's policy, not registry state.
-///
-/// The mount now enforces the `device.send_command` /
-/// `devices` constraint entry, so this token verifies at
-/// bearer time; the refusal happens inside `tools::call`.
-#[tokio::test(flavor = "current_thread")]
-async fn device_send_command_constraint_refuses_disallowed_device_id() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "restricted",
-        r#"{"device.send_command":{"devices":["dev-a1b2c3d4*"]}}"#,
-    );
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({
-            "name": "device.send_command",
-            "arguments": {
-                "device_id": "dev-ffffffffffffffff",
-                "capability": "switch",
-                "action": "toggle",
-            }
-        }),
-    )
-    .await;
-    assert_eq!(
-        response["error"]["code"], -32001,
-        "constraint refusal must land as SCOPE_DENIED; got {response}",
-    );
-}
-
-/// Round-1 14.4b: a token whose allowlist covers the id
-/// clears the constraint check — it then falls through to
-/// the same "unknown device" path any other authorized
-/// caller sees for a nonexistent id. Verifies constraint
-/// enforcement is a **pure filter** on the caller-supplied
-/// string, not a rewrite / lookup / side effect.
-#[tokio::test(flavor = "current_thread")]
-async fn device_send_command_constraint_admits_allowed_id() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "restricted-allow",
-        r#"{"device.send_command":{"devices":["dev-a1b2c3d4*"]}}"#,
-    );
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({
-            "name": "device.send_command",
-            "arguments": {
-                "device_id": "dev-a1b2c3d400000001",
-                "capability": "switch",
-                "action": "toggle",
-            }
-        }),
-    )
-    .await;
-    // Constraint cleared → unknown-device tool-level
-    // ExecErr, NOT a protocol-level SCOPE_DENIED.
-    assert!(
-        response["error"].is_null(),
-        "allowed id must clear constraint gate; got {response}",
-    );
-    assert_eq!(
-        response["result"]["isError"], true,
-        "unknown device is a tool-level error; got {response}",
-    );
-}
-
-/// Round-1 14.4b: an empty `devices` allowlist means
-/// *deny-all* (14.4a's `Option<Vec<String>>` contract:
-/// `Some(vec![])` != `None`). Any id must refuse.
-#[tokio::test(flavor = "current_thread")]
-async fn device_send_command_empty_allowlist_refuses_every_id() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "deny-all",
-        r#"{"device.send_command":{"devices":[]}}"#,
-    );
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({
-            "name": "device.send_command",
-            "arguments": {
-                "device_id": "dev-a1b2c3d4e5f60718",
-                "capability": "switch",
-                "action": "toggle",
-            }
-        }),
-    )
-    .await;
-    assert_eq!(
-        response["error"]["code"], -32001,
-        "empty allowlist must deny every id; got {response}",
-    );
-}
-
-/// Round-1 14.4b: bearer-time gate still refuses a
-/// constraint carrying `plugins` on `device.send_command`
-/// (round-6 P1 protection from 14.4a). The device dispatch
-/// site doesn't read `plugins`, so the field would sit inert
-/// and the actor would have unrestricted device access. The
-/// mount's `enforce_plugins: false` on this entry catches it
-/// at bearer time — before the router even hands the request
-/// to the handler.
-#[tokio::test(flavor = "current_thread")]
-async fn device_send_command_field_mismatch_refused_at_bearer() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode, header};
-    use tower::ServiceExt;
-
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "wrong-field",
-        r#"{"device.send_command":{"plugins":["acme.*"]}}"#,
-    );
-    let router = build_router(engine);
-
-    // Bearer-refuse happens on the first request against the
-    // mount, not via the MCP JSON-RPC error channel — the
-    // middleware returns 403 before rmcp sees anything. Send
-    // a plain POST to the mount and assert 403.
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(oxidhome_core::api::MCP_ENDPOINT)
-                .header(header::HOST, MCP_HOST)
-                .header(header::CONTENT_TYPE, MCP_CONTENT_TYPE)
-                .header(header::ACCEPT, MCP_ACCEPT)
-                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-                .body(Body::from(initialize_body()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "constraint carrying `plugins` on device.send_command must refuse at bearer time",
-    );
-}
-
-// ── 14.4c: plugins.* constraint enforcement ─────────────────────
-
-/// A token whose `plugins` allowlist on a given `plugins.*`
-/// tool doesn't cover the requested `plugin_id` must be
-/// refused as `SCOPE_DENIED` before any state check runs —
-/// same pattern as 14.4b's `device.send_command`. Parameterised
-/// over the four tools that take a `plugin_id` directly.
-async fn assert_plugins_tool_refuses_disallowed(
-    tool: &str,
-    args_for: impl Fn() -> serde_json::Value,
-) {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        &format!("restricted-{tool}"),
-        &format!(r#"{{"{tool}":{{"plugins":["acme.*"]}}}}"#),
-    );
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({"name": tool, "arguments": args_for()}),
-    )
-    .await;
-    assert_eq!(
-        response["error"]["code"], -32001,
-        "{tool} constraint refusal must land as `SCOPE_DENIED`; got {response}",
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_show_constraint_refuses_disallowed_plugin_id() {
-    assert_plugins_tool_refuses_disallowed(
-        "plugins.show",
-        || json!({"plugin_id": "outside.thermostat"}),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_stop_constraint_refuses_disallowed_plugin_id() {
-    assert_plugins_tool_refuses_disallowed(
-        "plugins.stop",
-        || json!({"plugin_id": "outside.thermostat"}),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_uninstall_constraint_refuses_disallowed_plugin_id() {
-    assert_plugins_tool_refuses_disallowed(
-        "plugins.uninstall",
-        || json!({"plugin_id": "outside.thermostat"}),
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_start_constraint_refuses_disallowed_plugin_id() {
-    assert_plugins_tool_refuses_disallowed(
-        "plugins.start",
-        || json!({"plugin_id": "outside.thermostat"}),
-    )
-    .await;
-}
-
-/// An allowed `plugin_id` clears the constraint gate — the
-/// tool then reports whatever it would for a nonexistent
-/// plugin (tool-level `ExecErr`, not a protocol scope denial).
-/// One test covers all four; the branches share the check.
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_show_constraint_admits_matching_plugin_id() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "restricted-show-allow",
-        r#"{"plugins.show":{"plugins":["acme.*"]}}"#,
-    );
-    let router = build_router(engine);
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({"name": "plugins.show", "arguments": {"plugin_id": "acme.thermostat"}}),
-    )
-    .await;
-    assert!(
-        response["error"].is_null(),
-        "allowed plugin_id must clear the constraint gate; got {response}",
-    );
-    assert_eq!(
-        response["result"]["isError"], true,
-        "unknown plugin is a tool-level error; got {response}",
-    );
-}
-
-// ── 14.4d: plugins.install constraint against manifest-derived id ─
-
-/// A token whose `plugins.install` allowlist doesn't cover
-/// the manifest-derived `plugin_id` must be refused as
-/// `SCOPE_DENIED`. The refusal fires inside
-/// `installed_plugins::install_gated` AFTER the manifest is
-/// parsed but BEFORE any FS or SQL side effect — so no
-/// orphan `<state_dir>/plugins/<id>/` dir, no orphan
-/// `plugin_installation` row, no in-memory registration.
-#[tokio::test(flavor = "multi_thread")]
-async fn plugins_install_constraint_refuses_disallowed_manifest_id() {
-    let plugin_id = "example.install-constraint-deny";
-    let source = stage_install_source("mcp-install-constraint-deny-src", plugin_id);
-    let state_dir = _support::tempdir("mcp-install-constraint-deny-state");
-
-    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "install-restricted-deny",
-        r#"{"plugins.install":{"plugins":["acme.*"]}}"#,
-    );
-    let router = build_router(engine.clone());
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({"name": "plugins.install", "arguments": {
-            "source_dir": source.path().display().to_string(),
-        }}),
-    )
-    .await;
-    assert_eq!(
-        response["error"]["code"], -32001,
-        "constraint refusal must land as `SCOPE_DENIED`; got {response}",
-    );
-
-    // Registry must not carry an entry — no orphan state.
-    assert!(
-        engine.installed_plugins().get(plugin_id).is_none(),
-        "refused install must not register the plugin",
-    );
-    // Dest dir must not exist.
-    let dest = state_dir.path().join("plugins").join(plugin_id);
-    assert!(
-        !dest.exists(),
-        "refused install must not create the on-disk layout; found {}",
-        dest.display(),
-    );
-}
-
-/// A token whose `plugins.install` allowlist covers the
-/// manifest-derived `plugin_id` completes the install
-/// normally — proof that the gate is a pure filter on the
-/// manifest id, not a state-mutating rewrite.
-#[tokio::test(flavor = "multi_thread")]
-async fn plugins_install_constraint_admits_matching_manifest_id() {
-    let plugin_id = "acme.install-constraint-allow";
-    let source = stage_install_source("mcp-install-constraint-allow-src", plugin_id);
-    let state_dir = _support::tempdir("mcp-install-constraint-allow-state");
-
-    let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "install-restricted-allow",
-        r#"{"plugins.install":{"plugins":["acme.*"]}}"#,
-    );
-    let router = build_router(engine.clone());
-    let (router, session) = handshake(router, &bearer).await;
-
-    let response = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({"name": "plugins.install", "arguments": {
-            "source_dir": source.path().display().to_string(),
-        }}),
-    )
-    .await;
-    assert!(
-        response["error"].is_null(),
-        "allowed manifest id must clear the gate; got {response}",
-    );
-    let result = &response["result"];
-    assert_ne!(
-        result["isError"], true,
-        "install must succeed; got {response}"
-    );
-    assert_eq!(result["structuredContent"]["plugin_id"], plugin_id);
-    assert!(
-        engine.installed_plugins().get(plugin_id).is_some(),
-        "allowed install must register the plugin",
-    );
-}
-
 // ── events.subscribe (14.3 last item) ─────────────────────────────
 
 /// Helper: record one event to the durable log AND publish it
@@ -3195,12 +2811,12 @@ async fn list_tools_advertises_events_subscribe() {
     assert_eq!(annotations["destructiveHint"], false);
 }
 
-/// 14.3-last: `events:read` gates the tool the same way
+/// 14.3-last: `event.read` gates the tool the same way
 /// `events.history` gates its counterpart.
 #[tokio::test(flavor = "current_thread")]
 async fn events_subscribe_requires_events_read_scope() {
     let engine = oxidhome_core::Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "no-events", &["devices:list"]);
+    let bearer = mint_bearer_with_actions(&engine, "no-events", &["device.list"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -3214,7 +2830,7 @@ async fn events_subscribe_requires_events_read_scope() {
     .await;
     assert_eq!(
         response["error"]["code"], -32001,
-        "devices:list must not satisfy events:read; got {response}",
+        "device.list must not satisfy event.read; got {response}",
     );
 }
 
@@ -3738,169 +3354,18 @@ async fn events_cursor_pruned_by_retention_reports_cursor_expired() {
 
 // ── H6 slice 2: `authorize()` deny reasons in the audit ledger ──
 
-/// MCP tools now ask `auth::authorize` for both the route pre-check
-/// and the per-target 14.4 constraint. Each deny still writes one
-/// `deny` row whose `required_scope` is the missing scope or the
-/// `constraint:<tool>:<field>` sentinel, as the inline checks did.
-#[tokio::test(flavor = "current_thread")]
-async fn tool_denials_record_scope_and_constraint_sentinels() {
-    let engine = Engine::new().expect("engine");
-    let constrained = mint_bearer_with_constraint(
-        &engine,
-        "constrained-all",
-        r#"{
-            "device.send_command": {"devices": ["dev-a1b2*"]},
-            "plugins.show": {"plugins": ["acme.*"]},
-            "plugins.stop": {"plugins": ["acme.*"]},
-            "plugins.uninstall": {"plugins": ["acme.*"]},
-            "plugins.start": {"plugins": ["acme.*"]}
-        }"#,
-    );
-    let logs_only = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
-    let router = build_router(engine.clone());
-
-    let (router, session) = handshake(router, &constrained).await;
-    let calls = [
-        (
-            "device.send_command",
-            json!({"device_id": "dev-ffff000000000000", "capability": "switch", "action": "toggle"}),
-            "constraint:device.send_command:devices",
-        ),
-        (
-            "plugins.show",
-            json!({"plugin_id": "outside.p"}),
-            "constraint:plugins.show:plugins",
-        ),
-        (
-            "plugins.stop",
-            json!({"plugin_id": "outside.p"}),
-            "constraint:plugins.stop:plugins",
-        ),
-        (
-            "plugins.uninstall",
-            json!({"plugin_id": "outside.p"}),
-            "constraint:plugins.uninstall:plugins",
-        ),
-        (
-            "plugins.start",
-            json!({"plugin_id": "outside.p"}),
-            "constraint:plugins.start:plugins",
-        ),
-    ];
-    for (tool, args, _) in &calls {
-        let response = call(
-            &router,
-            &constrained,
-            &session,
-            "tools/call",
-            json!({"name": tool, "arguments": args}),
-        )
-        .await;
-        assert_eq!(response["error"]["code"], -32001, "{tool}: {response}");
-    }
-
-    let (router, session) = handshake(router, &logs_only).await;
-    let response = call(
-        &router,
-        &logs_only,
-        &session,
-        "tools/call",
-        json!({"name": "plugins.list", "arguments": {}}),
-    )
-    .await;
-    assert_eq!(response["error"]["code"], -32001, "{response}");
-
-    let audit = engine.audit_log();
-    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 256))
-        .await
-        .expect("audit query join")
-        .expect("audit query");
-    // One request per tool path: exactly one row each, no stray
-    // pending intent or duplicate denial.
-    let deny_for = |path: &str| {
-        let matching: Vec<_> = rows.iter().filter(|r| r.path == path).collect();
-        assert_eq!(matching.len(), 1, "{path}: {matching:?}");
-        assert_eq!(matching[0].decision, "deny", "{path}");
-        matching[0]
-    };
-    for (tool, _, sentinel) in &calls {
-        let row = deny_for(&format!("mcp.tool.{tool}"));
-        assert_eq!(row.status, 403, "{tool}");
-        assert_eq!(row.required_scope.as_deref(), Some(*sentinel), "{tool}");
-    }
-    let row = deny_for("mcp.tool.plugins.list");
-    assert_eq!(row.required_scope.as_deref(), Some("plugins:list"));
-}
-
-/// The `plugins.show` allowlist narrows the `plugins.show` tool only:
-/// the `oxidhome://plugins/{id}` resource read has always been gated by
-/// the flat `plugins:list` scope, and still is. Pins the resource the
-/// production handler authorizes.
-#[tokio::test(flavor = "current_thread")]
-async fn plugins_show_allowlist_does_not_narrow_the_plugin_resource() {
-    let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_constraint(
-        &engine,
-        "show-allowlist",
-        r#"{"plugins.show":{"plugins":["acme.*"]}}"#,
-    );
-    let router = build_router(engine.clone());
-    let (router, session) = handshake(router, &bearer).await;
-
-    let tool = call(
-        &router,
-        &bearer,
-        &session,
-        "tools/call",
-        json!({"name": "plugins.show", "arguments": {"plugin_id": "outside.p"}}),
-    )
-    .await;
-    assert_eq!(tool["error"]["code"], -32001, "{tool}");
-
-    let read = call(
-        &router,
-        &bearer,
-        &session,
-        "resources/read",
-        json!({"uri": "oxidhome://plugins/outside.p"}),
-    )
-    .await;
-    assert_ne!(read["error"]["code"], -32001, "{read}");
-
-    let audit = engine.audit_log();
-    let rows = tokio::task::spawn_blocking(move || audit.query(&AuditQuery::default(), 64))
-        .await
-        .expect("audit query join")
-        .expect("audit query");
-    let tool_row = rows
-        .iter()
-        .find(|r| r.path == "mcp.tool.plugins.show")
-        .expect("tool row");
-    assert_eq!(
-        tool_row.required_scope.as_deref(),
-        Some("constraint:plugins.show:plugins")
-    );
-    let read_row = rows
-        .iter()
-        .find(|r| r.path == "mcp.resource.plugins.detail")
-        .expect("resource row");
-    // Authorized, then not found: a 404 row with no `required_scope`.
-    assert_eq!(read_row.status, 404, "{read_row:?}");
-    assert!(read_row.required_scope.is_none(), "{read_row:?}");
-}
-
 /// MCP `events.subscribe` is a history poll, so it is gated by
-/// `events:read`, not the `events:tail` that gates the REST / Connect
-/// live tail: `events:read` alone succeeds, `events:tail` alone is
-/// denied with `events:read` in the audit row.
+/// `event.read`, not the `event.subscribe` that gates the REST / Connect
+/// live tail: `event.read` alone succeeds, `event.subscribe` alone is
+/// denied with `event.read` in the audit row.
 #[tokio::test(flavor = "current_thread")]
 async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
     let engine = oxidhome_core::Engine::new().expect("engine");
     for (label, scope, denied) in [
-        ("read-only", "events:read", false),
-        ("tail-only", "events:tail", true),
+        ("read-only", "event.read", false),
+        ("tail-only", "event.subscribe", true),
     ] {
-        let bearer = mint_bearer_with_scopes(&engine, label, &[scope]);
+        let bearer = mint_bearer_with_actions(&engine, label, &[scope]);
         let (router, session) = handshake(build_router(engine.clone()), &bearer).await;
         let response = call(
             &router,
@@ -3926,10 +3391,10 @@ async fn events_subscribe_is_gated_by_events_read_not_events_tail() {
         .iter()
         .find(|r| r.path == "mcp.tool.events.subscribe" && r.decision == "deny")
         .expect("deny row");
-    assert_eq!(deny.required_scope.as_deref(), Some("events:read"));
+    assert_eq!(deny.required_scope.as_deref(), Some("event.read"));
 }
 
-/// H6 slice 3: `tokens.list` is the owner's alone and never carries a
+/// `tokens.list` is the owner's alone and never carries a
 /// secret; there is no `tokens.create` (M7 keeps credentials out of
 /// MCP responses).
 #[tokio::test(flavor = "current_thread")]
@@ -3939,21 +3404,18 @@ async fn tokens_list_is_owner_only_and_there_is_no_create() {
     assert!(
         engine
             .auth_tokens()
-            .insert_owner_if_empty(&issued, "admin", br#"["*"]"#)
+            .insert_owner_if_empty(&issued, "admin")
             .expect("owner")
     );
     let owner = issued.plaintext;
     let wildcard = mint_bearer(&engine);
-    let assistant = engine
+    engine
         .auth_tokens()
-        .create_role("assistant", br#"{"grants":[{"actions":["device.list"]}]}"#)
+        .create_role("assistant", br#"[{"actions":["device.list"]}]"#)
         .expect("role");
     engine
         .auth_tokens()
-        .create(
-            "llm",
-            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, assistant.id).as_bytes(),
-        )
+        .create("llm", &["assistant"])
         .expect("role token");
     let router = build_router(engine.clone());
 
@@ -3992,12 +3454,13 @@ async fn tokens_list_is_owner_only_and_there_is_no_create() {
         .as_array()
         .expect("tokens");
     assert_eq!(tokens.len(), 3, "{response}");
-    assert_eq!(tokens[0]["roles"], json!(["owner"]));
+    assert_eq!(tokens[0]["owner"], true);
+    assert_eq!(tokens[0]["roles"], json!([]));
     assert_eq!(tokens[2]["roles"], json!(["assistant"]));
     assert!(!response.to_string().contains(&owner));
 }
 
-/// H6 slice 3: a `dashboard` role token over MCP reaches only light
+/// A `dashboard` role token over MCP reaches only light
 /// devices: a `switch` is missing from `oxidhome://devices`, its detail
 /// and `device.send_command` are refused, until the owner raises it to
 /// `light`.
@@ -4008,19 +3471,16 @@ async fn dashboard_role_reaches_only_lights_over_mcp() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
-    let dashboard = engine
+    engine
         .auth_tokens()
         .create_role(
             "dashboard",
-            br#"{"grants":[{"actions":["device.list","device.read","device.command"],"category":["light"]}]}"#,
+            br#"[{"actions":["device.list","device.read","device.command"],"category":["light"]}]"#,
         )
         .expect("role");
     let bearer = engine
         .auth_tokens()
-        .create(
-            "tablet",
-            format!(r#"{{"scopes":[],"roles":["{}"]}}"#, dashboard.id).as_bytes(),
-        )
+        .create("tablet", &["dashboard"])
         .expect("role token")
         .plaintext;
     let handle = engine

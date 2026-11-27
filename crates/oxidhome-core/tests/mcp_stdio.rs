@@ -129,12 +129,12 @@ async fn stdio_handshake_and_resources_list() {
     joined.expect("serve_stdio_over returned Err");
 }
 
-/// 14.5: the stdio ambient actor holds `*` scope, so a
-/// `tools/call` on a scope-sensitive tool succeeds (contrast
-/// with the HTTP mount, where every call must present a
-/// bearer with the matching scope).
+/// 14.5: the stdio ambient actor holds the `agent` role by
+/// default, so a `tools/call` on a tool `agent` grants succeeds
+/// without a bearer (contrast with the HTTP mount, where every
+/// call must present one).
 #[tokio::test(flavor = "multi_thread")]
-async fn stdio_ambient_actor_has_wildcard_scope() {
+async fn stdio_ambient_actor_holds_the_agent_role() {
     let engine = Engine::new().expect("engine");
 
     let (client_to_server, server_reader) = tokio::io::duplex(64 * 1024);
@@ -153,8 +153,8 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
     )
     .await;
 
-    // `plugins.list` requires `plugins:list`. Wildcard actor
-    // satisfies it; the tool returns an empty list on a fresh
+    // `plugins.list` requires `plugin.read`, which `agent`
+    // grants; the tool returns an empty list on a fresh
     // engine.
     send_line(
         &mut client_writer,
@@ -167,7 +167,7 @@ async fn stdio_ambient_actor_has_wildcard_scope() {
     let call_resp = read_line(&mut client_reader).await;
     assert!(
         call_resp["error"].is_null(),
-        "wildcard actor must satisfy plugins:list; got {call_resp}",
+        "the agent role must satisfy plugin.read; got {call_resp}",
     );
     let plugins = call_resp["result"]["structuredContent"]["plugins"]
         .as_array()

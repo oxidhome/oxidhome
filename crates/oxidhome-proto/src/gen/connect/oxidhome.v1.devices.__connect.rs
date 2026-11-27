@@ -323,7 +323,7 @@ pub trait DevicesService: Send + Sync + 'static {
         >,
     > + Send;
     /// Execute a capability command against a device. Sensitive
-    /// (`devices:command` scope) — controls physical actuation
+    /// (`device.command` permission) — controls physical actuation
     /// (switches, dimmers, locks). Same routing as the JSON
     /// `POST /api/v1/devices/{id}/command`: the host looks up the
     /// device's owning instance and forwards `execute-command` to
@@ -354,9 +354,9 @@ pub trait DevicesService: Send + Sync + 'static {
         >,
     > + Send;
     /// H2: current state of one device from the host-owned projection.
-    /// Mirrors `GET /api/v1/devices/{id}/state`; `devices:read`. An
+    /// Mirrors `GET /api/v1/devices/{id}/state`; `device.read`. An
     /// unknown device returns an empty `capabilities` list, not an
-    /// error. `bytes_val` fields are withheld without `blobs:read` (M7).
+    /// error. `bytes_val` fields are withheld without `blob.read` (M7).
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///
@@ -380,7 +380,7 @@ pub trait DevicesService: Send + Sync + 'static {
         >,
     > + Send;
     /// H2: one page of the full-store snapshot, the resync primitive.
-    /// Mirrors `GET /api/v1/devices/state`; `devices:read`. A malformed
+    /// Mirrors `GET /api/v1/devices/state`; `device.read`. A malformed
     /// `cursor` is `invalid_argument`; a cursor from an earlier daemon
     /// process or another store epoch is `aborted` (restart the resync
     /// without a cursor).
@@ -407,7 +407,7 @@ pub trait DevicesService: Send + Sync + 'static {
         >,
     > + Send;
     /// H2: cursor catch-up over the projection. Mirrors
-    /// `GET /api/v1/devices/state/changes`; `devices:read`.
+    /// `GET /api/v1/devices/state/changes`; `device.read`.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///

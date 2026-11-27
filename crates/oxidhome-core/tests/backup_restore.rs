@@ -543,7 +543,7 @@ fn backup_round_trips_invocation_audit_columns() {
                 path: "/api/v1/devices/d/command".into(),
                 status: 200,
                 decision: "allow".into(),
-                required_scope: Some("devices:command".into()),
+                required_scope: Some("device.command".into()),
                 execution_outcome: Some("success".into()),
                 domain_error: None,
                 credential_fp: None,

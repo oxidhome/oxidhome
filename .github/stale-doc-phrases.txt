@@ -22,3 +22,13 @@ no history access
 # The engine clock seam (oxidhome_core::clock) gives the test host a
 # virtual clock.
 no clock injection
+
+# Tokens hold roles only: no scope lists, constraints, deny lists,
+# per-token sensitive grants or rate limits.
+grant-sensitive
+revoke-sensitive
+--allow-sensitive
+devices:command
+blobs:read
+SensitiveGuard
+delete-forced

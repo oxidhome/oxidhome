@@ -25,7 +25,7 @@
 //!    operation.
 //! 2. [`AuditLog::finalize`] after the handler returns. UPDATEs the
 //!    row with the outcome (`allow` / `deny` / `error`), the final
-//!    HTTP status, and `required_scope` on scope-deny 403s; stamps
+//!    HTTP status, and `required_scope` on permission-deny 403s; stamps
 //!    `finalized_ms`. Best-effort — if the update errors, the
 //!    handler's side effects are already committed, and the pending
 //!    row is the operator-visible signal that something went wrong.
@@ -112,8 +112,8 @@ pub struct AuditEntry {
     ///   already abandoned).
     /// - `"allow"` — the request passed authorization and the wire
     ///   response was 2xx.
-    /// - `"deny"` — the request was rejected at the auth / scope /
-    ///   dispatch layer (scope failure, unknown device, bad input,
+    /// - `"deny"` — the request was rejected at the auth / permission
+    ///   / dispatch layer (permission failure, unknown device, bad input,
     ///   …). 4xx wire response.
     /// - `"error"` — server-side failure returning 5xx.
     ///
@@ -122,9 +122,12 @@ pub struct AuditEntry {
     /// succeeded — and populates [`Self::execution_outcome`] with
     /// `"failed"` to surface the domain-level failure.
     pub decision: String,
-    /// The scope the handler required, populated only on scope-deny
-    /// 403s finalized from a `DeniedScope` extension. `None` for
-    /// every allow and for non-scope denies.
+    /// On a permission deny, the refused action (finalized from a
+    /// `DeniedAction` extension), or the missing grant's name on a
+    /// plugin hop. On an allowed sensitive action's `AUTHZ` `warn` row,
+    /// the categories it reached: `sensitive:<categories>`, or
+    /// `owner:<categories>` for the owner token. `None` for every other
+    /// row.
     pub required_scope: Option<String>,
     /// **Execution** outcome — independent of [`Self::decision`]
     /// (architecture-review F4 follow-up).
@@ -953,10 +956,10 @@ mod tests {
         let id = log
             .record_intent(&sample_intent("tok", "/api/v1/instances"))
             .unwrap();
-        log.finalize(id, 403, "deny", Some("instances:list"), None, None)
+        log.finalize(id, 403, "deny", Some("instance.read"), None, None)
             .expect("finalize");
         let rows = log.query(&AuditQuery::default(), 1).unwrap();
-        assert_eq!(rows[0].required_scope.as_deref(), Some("instances:list"));
+        assert_eq!(rows[0].required_scope.as_deref(), Some("instance.read"));
     }
 
     #[test]

@@ -17,6 +17,8 @@
 #[path = "support.rs"]
 mod support;
 
+use support::Mint;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use oxidhome_core::Engine;
@@ -71,7 +73,7 @@ async fn malformed_and_unknown_tokens_both_yield_401() {
     let engine = Engine::new().expect("engine");
     // Pre-seed one real token so an unknown-hash path goes through
     // the same code as a non-empty store.
-    let _ = engine.auth_tokens().create("baseline", b"[]").unwrap();
+    let _ = engine.auth_tokens().mint("baseline", &[]).unwrap();
     let router = build_router(engine);
 
     // Malformed: no `oxh_` prefix.
@@ -107,7 +109,7 @@ async fn malformed_and_unknown_tokens_both_yield_401() {
 #[tokio::test(flavor = "current_thread")]
 async fn revoked_token_yields_401() {
     let engine = Engine::new().expect("engine");
-    let issued = engine.auth_tokens().create("temp", b"[]").unwrap();
+    let issued = engine.auth_tokens().mint("temp", &[]).unwrap();
     assert!(engine.auth_tokens().revoke(&issued.id).unwrap());
     let router = build_router(engine);
 
@@ -132,7 +134,7 @@ async fn valid_token_grants_access_and_bumps_last_used() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("admin", b"[\"instances:list\"]")
+        .mint("admin", &["instance.read"])
         .unwrap();
     let pre = engine.auth_tokens().get(&issued.id).unwrap().unwrap();
     assert!(pre.last_used_ms.is_none());
@@ -170,15 +172,15 @@ async fn valid_token_grants_access_and_bumps_last_used() {
 
 // ── Scope-policy enforcement (Phase 12-API-b) ─────────────────────
 
-/// A token without `instances:list` (but holding *some* other scope)
-/// gets through auth but is **403** at the scope check. Pre-fix the
+/// A token without `instance.read` (but holding *some* other scope)
+/// gets through auth but is **403** at the permission check. Pre-fix the
 /// route would have returned 200 — this is the new behavior.
 #[tokio::test(flavor = "current_thread")]
 async fn instances_list_returns_403_without_scope() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("limited", b"[\"devices:list\"]")
+        .mint("limited", &["device.list"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -197,7 +199,7 @@ async fn instances_list_returns_403_without_scope() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
-/// `GET /api/v1/devices` requires `devices:list`. A token without
+/// `GET /api/v1/devices` requires `device.list`. A token without
 /// it returns 403; a token with the literal scope returns 200 and
 /// an empty `devices` array (no devices registered on this fresh
 /// engine).
@@ -206,11 +208,11 @@ async fn devices_list_enforces_scope() {
     let engine = Engine::new().expect("engine");
     let denied = engine
         .auth_tokens()
-        .create("no-devices", b"[\"instances:list\"]")
+        .mint("no-devices", &["instance.read"])
         .unwrap();
     let allowed = engine
         .auth_tokens()
-        .create("can-list-devices", b"[\"devices:list\"]")
+        .mint("can-list-devices", &["device.list"])
         .unwrap();
     let router = build_router(engine);
 
@@ -259,10 +261,10 @@ async fn audit_log_records_one_event_per_authenticated_request() {
     use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
-    let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let allow_token = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let deny_token = engine
         .auth_tokens()
-        .create("no-instances", b"[\"devices:list\"]")
+        .mint("no-instances", &["device.list"])
         .unwrap();
     let audit_log = engine.audit_log();
 
@@ -298,7 +300,7 @@ async fn audit_log_records_one_event_per_authenticated_request() {
             "allow" => {
                 assert_eq!(row.status, 200);
                 // Allow rows carry no required_scope — the field
-                // is only populated on scope-deny 403s.
+                // is only populated on permission-deny 403s.
                 assert!(row.required_scope.is_none());
             }
             "deny" => {
@@ -306,7 +308,7 @@ async fn audit_log_records_one_event_per_authenticated_request() {
                 // Scope-denial 403s must surface *which* scope was
                 // missing — the whole point of the response-
                 // extension plumbing in `ScopeDenied`.
-                assert_eq!(row.required_scope.as_deref(), Some("instances:list"));
+                assert_eq!(row.required_scope.as_deref(), Some("instance.read"));
             }
             other => panic!("unexpected decision `{other}`"),
         }
@@ -318,21 +320,21 @@ async fn audit_log_records_one_event_per_authenticated_request() {
 
 /// `GET /api/v1/audit` — the external query surface for the C3
 /// ledger, replaces the pre-retirement
-/// `logs query --target api.audit` path. Scoped on `audit:read`.
+/// `logs query --target api.audit` path. Scoped on `host.audit`.
 /// This test seeds two rows via authenticated requests (one allow,
 /// one deny), then queries the endpoint and asserts both come back
 /// in the expected `{status, decision, path, ...}` shape.
 #[tokio::test(flavor = "current_thread")]
 async fn audit_endpoint_returns_ledger_rows() {
     let engine = Engine::new().expect("engine");
-    let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let allow_token = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let deny_token = engine
         .auth_tokens()
-        .create("no-instances", b"[\"devices:list\"]")
+        .mint("no-instances", &["device.list"])
         .unwrap();
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"audit:read\"]")
+        .mint("reader", &["host.audit"])
         .unwrap();
     let router = build_router(engine);
 
@@ -391,10 +393,10 @@ async fn audit_endpoint_returns_ledger_rows() {
 #[tokio::test(flavor = "current_thread")]
 async fn audit_endpoint_path_filter_narrows() {
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"audit:read\"]")
+        .mint("reader", &["host.audit"])
         .unwrap();
     let router = build_router(engine);
 
@@ -453,10 +455,10 @@ async fn audit_endpoint_path_filter_narrows() {
 #[tokio::test(flavor = "current_thread")]
 async fn audit_endpoint_excludes_self_referential_row() {
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"audit:read\"]")
+        .mint("reader", &["host.audit"])
         .unwrap();
     let router = build_router(engine);
 
@@ -513,10 +515,10 @@ async fn audit_endpoint_paginates_losslessly_via_cursor() {
     use std::collections::HashSet;
 
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"audit:read\"]")
+        .mint("reader", &["host.audit"])
         .unwrap();
     let router = build_router(engine);
 
@@ -599,7 +601,7 @@ async fn audit_endpoint_rejects_malformed_cursor() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"audit:read\"]")
+        .mint("reader", &["host.audit"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -618,16 +620,16 @@ async fn audit_endpoint_rejects_malformed_cursor() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `GET /api/v1/audit` refuses tokens without the `audit:read`
+/// `GET /api/v1/audit` refuses tokens without the `host.audit`
 /// scope with 403. Locks the scope-gate — the audit ledger is
 /// sensitive (every token id, path, decision), and any token
-/// lacking `audit:read` must not enumerate it.
+/// lacking `host.audit` must not enumerate it.
 #[tokio::test(flavor = "current_thread")]
 async fn audit_endpoint_requires_audit_read_scope() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("no-audit", b"[\"logs:read\"]")
+        .mint("no-audit", &["host.logs"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -672,7 +674,7 @@ fn audit_ledger_is_sole_source_no_tracing_mirror() {
         .expect("rt");
 
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let log_store = engine.log_store();
     let audit_log = engine.audit_log();
     let subscriber = Registry::default().with(log_store.layer());
@@ -845,7 +847,7 @@ fn audit_ledger_row_is_finalized_end_to_end() {
         .build()
         .expect("rt");
     let engine = Engine::new().expect("engine");
-    let allow_token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let allow_token = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let audit_log = engine.audit_log();
 
     rt.block_on(async {
@@ -893,13 +895,12 @@ fn audit_ledger_row_is_finalized_end_to_end() {
     );
 }
 
-/// The wildcard `["*"]` admin / bootstrap token satisfies every
-/// scoped route. Pins the wildcard contract (see
-/// `api::scopes::WILDCARD`) end-to-end through the HTTP path.
+/// A token whose role grants `*` satisfies every route that
+/// isn't owner-only, end-to-end through the HTTP path.
 #[tokio::test(flavor = "current_thread")]
-async fn wildcard_token_satisfies_every_scoped_route() {
+async fn star_role_satisfies_every_non_owner_route() {
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
 
     for path in ["/api/v1/instances", "/api/v1/devices", "/api/v1/logs"] {
@@ -917,7 +918,7 @@ async fn wildcard_token_satisfies_every_scoped_route() {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "wildcard token must satisfy {path}, got {:?}",
+            "a `*` role must satisfy {path}, got {:?}",
             response.status(),
         );
     }
@@ -940,7 +941,7 @@ async fn wildcard_token_satisfies_every_scoped_route() {
 // `devices_list_enforces_scope`.
 
 /// A non-WS probe hits axum's `WebSocketUpgrade` rejection at the
-/// extractor *before* the scope check runs in the handler body.
+/// extractor *before* the permission check runs in the handler body.
 /// That's intentional: a caller without a real handshake gets the
 /// same "wrong shape" response regardless of scope, so the probing
 /// signal "scope missing vs scope OK" only leaks through a real
@@ -950,7 +951,7 @@ async fn events_tail_non_websocket_probe_is_wrong_shape_not_403() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("limited", b"[\"devices:list\"]")
+        .mint("limited", &["device.list"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -975,19 +976,16 @@ async fn events_tail_non_websocket_probe_is_wrong_shape_not_403() {
 
 // ── Logs query — Phase 12-API-c ──────────────────────────────────
 
-/// A token without `logs:read` returns 403; an empty store + valid
+/// A token without `host.logs` returns 403; an empty store + valid
 /// scope returns 200 + `{"logs":[]}`.
 #[tokio::test(flavor = "current_thread")]
 async fn logs_query_enforces_scope_and_returns_empty_array() {
     let engine = Engine::new().expect("engine");
     let denied = engine
         .auth_tokens()
-        .create("no-logs", b"[\"devices:list\"]")
+        .mint("no-logs", &["device.list"])
         .unwrap();
-    let allowed = engine
-        .auth_tokens()
-        .create("reader", b"[\"logs:read\"]")
-        .unwrap();
+    let allowed = engine.auth_tokens().mint("reader", &["host.logs"]).unwrap();
     let router = build_router(engine);
 
     let denied_resp = router
@@ -1043,10 +1041,7 @@ fn logs_query_returns_emitted_events_through_layer() {
         .expect("rt");
 
     let engine = Engine::new().expect("engine");
-    let reader = engine
-        .auth_tokens()
-        .create("reader", b"[\"logs:read\"]")
-        .unwrap();
+    let reader = engine.auth_tokens().mint("reader", &["host.logs"]).unwrap();
 
     let log_store = engine.log_store();
     let subscriber = Registry::default().with(log_store.layer());
@@ -1095,10 +1090,7 @@ fn logs_query_returns_emitted_events_through_layer() {
 #[tokio::test(flavor = "current_thread")]
 async fn logs_query_accepts_overlarge_limit_without_400() {
     let engine = Engine::new().expect("engine");
-    let reader = engine
-        .auth_tokens()
-        .create("reader", b"[\"logs:read\"]")
-        .unwrap();
+    let reader = engine.auth_tokens().mint("reader", &["host.logs"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -1118,14 +1110,14 @@ async fn logs_query_accepts_overlarge_limit_without_400() {
 
 // ── Device-command + plugins (Phase 12-API-d) ────────────────────
 
-/// `POST /api/v1/devices/{id}/command` without `devices:command`
+/// `POST /api/v1/devices/{id}/command` without `device.command`
 /// returns 403 — even with a real device id and a valid body.
 #[tokio::test(flavor = "current_thread")]
 async fn device_command_returns_403_without_scope() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("no-cmd", b"[\"devices:list\"]")
+        .mint("no-cmd", &["device.list"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -1156,7 +1148,7 @@ async fn device_command_unknown_device_returns_404() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("cmd", b"[\"devices:command\"]")
+        .mint("cmd", &["device.command"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -1217,7 +1209,7 @@ async fn device_command_end_to_end_through_simulated_switch() {
         .id
         .clone();
 
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine.clone());
     let response = router
         .oneshot(
@@ -1278,7 +1270,7 @@ async fn device_command_end_to_end_through_simulated_switch() {
     handle.stop().await.expect("stop");
 }
 
-/// `GET /api/v1/plugins` without `plugins:list` returns 403; with
+/// `GET /api/v1/plugins` without `plugin.read` returns 403; with
 /// the scope and no instances running, returns 200 + an empty
 /// `plugins` array.
 #[tokio::test(flavor = "current_thread")]
@@ -1286,11 +1278,11 @@ async fn plugins_list_enforces_scope_and_returns_empty_array() {
     let engine = Engine::new().expect("engine");
     let denied = engine
         .auth_tokens()
-        .create("no-list", b"[\"devices:list\"]")
+        .mint("no-list", &["device.list"])
         .unwrap();
     let allowed = engine
         .auth_tokens()
-        .create("lister", b"[\"plugins:list\"]")
+        .mint("lister", &["plugin.read"])
         .unwrap();
     let router = build_router(engine);
 
@@ -1351,7 +1343,7 @@ async fn plugins_list_aggregates_running_instances() {
         .expect("start switch-b");
     b.wait_for_running().await.expect("b Running");
 
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let response = build_router(engine.clone())
         .oneshot(
             Request::builder()
@@ -1396,7 +1388,7 @@ async fn instances_list_includes_plugin_id() {
         .expect("start switch-one");
     handle.wait_for_running().await.expect("reach Running");
 
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let response = build_router(engine.clone())
         .oneshot(
             Request::builder()
@@ -1434,7 +1426,7 @@ async fn instances_list_includes_plugin_id() {
 /// through the in-process bus, and assert the JSON frame the
 /// client reads back is the same shape `WireEvent` ships on the
 /// `oneshot` path. Validates the bind/serve split, the WS handler's
-/// scope gate, the supervisor-less bus → WS dispatch, and the JSON
+/// permission gate, the supervisor-less bus → WS dispatch, and the JSON
 /// payload all at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn events_tail_ws_round_trip_with_real_listener() {
@@ -1448,11 +1440,11 @@ async fn events_tail_ws_round_trip_with_real_listener() {
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     let engine = Engine::new().expect("engine");
-    // `events:tail` only — the scope gate inside the handler
+    // `event.subscribe` only — the permission gate inside the handler
     // upgrades only if it passes.
     let token = engine
         .auth_tokens()
-        .create("ws-test", br#"["events:tail"]"#)
+        .mint("ws-test", &["event.subscribe"])
         .expect("mint token");
 
     let listener = bind(ApiConfig {
@@ -1577,7 +1569,7 @@ async fn install_requires_plugins_install_scope() {
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let token = engine
         .auth_tokens()
-        .create("no-install", b"[\"plugins:list\"]")
+        .mint("no-install", &["plugin.read"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -1603,7 +1595,7 @@ async fn install_requires_plugins_install_scope() {
 #[tokio::test(flavor = "multi_thread")]
 async fn install_returns_503_on_in_memory_engine() {
     let engine = Engine::new().expect("engine");
-    let token = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let token = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -1626,7 +1618,7 @@ async fn install_returns_503_on_in_memory_engine() {
 async fn install_returns_404_when_source_dir_missing() {
     let state_dir = support::tempdir("install-missing");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -1649,7 +1641,7 @@ async fn install_returns_404_when_source_dir_missing() {
 async fn install_returns_422_when_source_dir_relative() {
     let state_dir = support::tempdir("install-relative");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -1679,7 +1671,7 @@ async fn install_returns_422_when_manifest_malformed() {
     )
     .unwrap();
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let body = serde_json::json!({"source_dir": bad_source.path().to_str().unwrap()});
     let response = router
@@ -1704,7 +1696,7 @@ async fn install_succeeds_and_shows_up_in_listing() {
     let state_dir = support::tempdir("install-ok");
     let source = stage_install_source("kvc-source-ok", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
 
     let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
@@ -1769,7 +1761,7 @@ async fn install_returns_409_on_collision() {
     let state_dir = support::tempdir("install-collide");
     let source = stage_install_source("kvc-source-collide", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let install_body = serde_json::json!({"source_dir": source.path().to_str().unwrap()});
 
@@ -1814,7 +1806,7 @@ async fn start_requires_plugins_start_scope() {
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let token = engine
         .auth_tokens()
-        .create("no-start", b"[\"plugins:list\"]")
+        .mint("no-start", &["plugin.read"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -1836,7 +1828,7 @@ async fn start_requires_plugins_start_scope() {
 async fn start_returns_404_for_unknown_plugin() {
     let state_dir = support::tempdir("start-unknown");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -1858,7 +1850,7 @@ async fn uninstall_returns_409_when_instances_running() {
     let state_dir = support::tempdir("uninstall-busy");
     let source = stage_install_source("kvc-source-busy", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine.clone());
 
     // Install + start.
@@ -1928,7 +1920,7 @@ async fn install_start_stop_uninstall_end_to_end() {
     let state_dir = support::tempdir("lifecycle-e2e");
     let source = stage_install_source("kvc-source-e2e", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine.clone());
 
     // 1. Install.
@@ -2209,7 +2201,7 @@ fn connect_valid_token_reaches_dispatcher_and_404s_unknown_method() {
         .build()
         .expect("rt");
     let engine = Engine::new().expect("engine");
-    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let issued = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = rt.block_on(async {
         router
@@ -2252,7 +2244,7 @@ async fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
     use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let audit_log = engine.audit_log();
 
     let router = build_router(engine.clone());
@@ -2288,7 +2280,7 @@ async fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
         "unexpected status={}, decision={}",
         row.status, row.decision,
     );
-    // Not a scope denial — required_scope stays None.
+    // Not a permission denial — required_scope stays None.
     assert!(row.required_scope.is_none());
     // Method + path landed verbatim; the audit-target derivation
     // that used to happen for the tracing mirror is gone.
@@ -2406,7 +2398,7 @@ async fn readyz_non_get_methods_return_405() {
 #[tokio::test(flavor = "current_thread")]
 async fn readyz_remains_anonymous_even_with_token() {
     let engine = Engine::new().expect("engine");
-    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let issued = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -2431,7 +2423,7 @@ async fn readyz_remains_anonymous_even_with_token() {
 #[tokio::test(flavor = "current_thread")]
 async fn connect_health_check_remains_anonymous_even_with_token() {
     let engine = Engine::new().expect("engine");
-    let issued = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let issued = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -2468,7 +2460,7 @@ async fn connect_instances_list_reaches_handler_via_actor_extension_round_trip()
     let engine = Engine::new().expect("engine");
     let admin = engine
         .auth_tokens()
-        .create("admin", b"[\"instances:list\"]")
+        .mint("admin", &["instance.read"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -2508,7 +2500,7 @@ async fn connect_instances_list_returns_running_instance_payload() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
 
     let handle = engine
         .start_instance(switch_dir, "switch-one", None)
@@ -2547,7 +2539,7 @@ async fn connect_instances_list_returns_running_instance_payload() {
 async fn connect_instances_list_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.InstancesService/ListInstances",
-        b"[\"devices:list\"]",
+        &["device.list"],
     )
     .await;
 }
@@ -2556,7 +2548,7 @@ async fn connect_instances_list_scope_deny_returns_permission_denied() {
 async fn connect_devices_list_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.DevicesService/ListDevices",
-        b"[\"instances:list\"]",
+        &["instance.read"],
     )
     .await;
 }
@@ -2565,26 +2557,22 @@ async fn connect_devices_list_scope_deny_returns_permission_denied() {
 async fn connect_plugins_list_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.PluginsService/ListPlugins",
-        b"[\"instances:list\"]",
+        &["instance.read"],
     )
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn connect_logs_query_scope_deny_returns_permission_denied() {
-    assert_connect_scope_denied(
-        "/oxidhome.v1.LogsService/QueryLogs",
-        b"[\"instances:list\"]",
-    )
-    .await;
+    assert_connect_scope_denied("/oxidhome.v1.LogsService/QueryLogs", &["instance.read"]).await;
 }
 
-/// Shared harness for the four scope-deny tests: mint a token with
+/// Shared harness for the four permission-deny tests: mint a token with
 /// a scope that *isn't* the one the target RPC requires, POST an
 /// empty message body, assert 403 + Connect-JSON `permission_denied`.
-async fn assert_connect_scope_denied(uri: &str, scope_json: &[u8]) {
+async fn assert_connect_scope_denied(uri: &str, actions: &[&str]) {
     let engine = Engine::new().expect("engine");
-    let issued = engine.auth_tokens().create("scoped", scope_json).unwrap();
+    let issued = engine.auth_tokens().mint("scoped", actions).unwrap();
     let router = build_router(engine);
     let response = router
         .oneshot(
@@ -2604,7 +2592,7 @@ async fn assert_connect_scope_denied(uri: &str, scope_json: &[u8]) {
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "scope-deny on {uri} should be 403 (Connect PermissionDenied)",
+        "permission-deny on {uri} should be 403 (Connect PermissionDenied)",
     );
     let body = body_to_json(response.into_body()).await;
     assert_eq!(
@@ -2622,7 +2610,7 @@ async fn assert_connect_scope_denied(uri: &str, scope_json: &[u8]) {
 #[tokio::test(flavor = "current_thread")]
 async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // 999 is well past any known LogLevel variant. Connect's JSON
     // wire format accepts an int here; buffa lands it as
@@ -2652,7 +2640,7 @@ async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
     );
 }
 
-/// The Connect audit row on a scope denial carries the missing
+/// The Connect audit row on a permission denial carries the missing
 /// scope name in `required_scope` — the JSON side has done this
 /// since 12-API-b via a `DeniedScope` response-extension smuggle,
 /// and the Connect side matches it via a request-extension slot
@@ -2664,13 +2652,10 @@ async fn connect_scope_deny_audit_row_carries_required_scope() {
     use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
-    // Token has `logs:read` but the RPC we hit requires
-    // `devices:list` — a clean scope-deny with a known missing
+    // Token has `host.logs` but the RPC we hit requires
+    // `device.list` — a clean permission-deny with a known missing
     // scope name.
-    let issued = engine
-        .auth_tokens()
-        .create("scoped", b"[\"logs:read\"]")
-        .unwrap();
+    let issued = engine.auth_tokens().mint("scoped", &["host.logs"]).unwrap();
     let audit_log = engine.audit_log();
 
     let router = build_router(engine.clone());
@@ -2696,19 +2681,19 @@ async fn connect_scope_deny_audit_row_carries_required_scope() {
     assert_eq!(
         rows.len(),
         1,
-        "expected one audit row from the scope-denied Connect call, got {rows:?}",
+        "expected one audit row from the permission-denied Connect call, got {rows:?}",
     );
     let row = &rows[0];
     assert_eq!(row.status, 403);
     assert_eq!(row.decision, "deny");
     assert_eq!(
         row.required_scope.as_deref(),
-        Some("devices:list"),
+        Some("device.list"),
         "audit row should name the missing scope, got {row:?}",
     );
 }
 
-/// Same scope-denied Connect call as
+/// Same permission-denied Connect call as
 /// `connect_scope_deny_audit_row_carries_required_scope`, but on
 /// the **gRPC-Web** transport. The Connect spec renders RPC errors
 /// for gRPC / gRPC-Web as HTTP 200 with the status in body/trailers;
@@ -2723,16 +2708,13 @@ async fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
-    let issued = engine
-        .auth_tokens()
-        .create("scoped", b"[\"logs:read\"]")
-        .unwrap();
+    let issued = engine.auth_tokens().mint("scoped", &["host.logs"]).unwrap();
     let audit_log = engine.audit_log();
 
     let router = build_router(engine.clone());
     // A well-formed gRPC-Web frame is required for the dispatcher
     // to reach the handler — otherwise the dispatcher rejects on
-    // framing before scope check runs and we never populate
+    // framing before permission check runs and we never populate
     // `DeniedScopeSlot`. ListDevicesRequest is an empty proto3
     // message (zero-byte payload); framing is 1 byte flags (0 =
     // uncompressed data frame) + 4 bytes big-endian length (0) +
@@ -2764,17 +2746,17 @@ async fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     let row = &rows[0];
     assert_eq!(
         row.decision, "deny",
-        "gRPC-Web scope denial must audit as deny, got {row:?}",
+        "gRPC-Web permission denial must audit as deny, got {row:?}",
     );
-    assert_eq!(row.required_scope.as_deref(), Some("devices:list"));
+    assert_eq!(row.required_scope.as_deref(), Some("device.list"));
 }
 
 /// **Non-scope** handler-returned Connect error on gRPC-Web still
-/// audits as `deny`, not `allow`. Sibling of the scope-deny test
+/// audits as `deny`, not `allow`. Sibling of the permission-deny test
 /// above — verifies the outcome slot fix (PR #74 review) covers
 /// every `rpc_err(&ctx, ...)` path, not just the scope one.
 ///
-/// Setup: valid token with `logs:read`, gRPC-Web POST to
+/// Setup: valid token with `host.logs`, gRPC-Web POST to
 /// `Logs.QueryLogs` carrying `min_level = 999` (unknown enum). The
 /// handler `return Err(rpc_err(&ctx, ConnectError::invalid_argument(...)))`s,
 /// which on gRPC-Web comes back as HTTP 200 with `grpc-status: 3`.
@@ -2786,10 +2768,7 @@ async fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
     use oxidhome_core::state::AuditQuery;
 
     let engine = Engine::new().expect("engine");
-    let issued = engine
-        .auth_tokens()
-        .create("reader", b"[\"logs:read\"]")
-        .unwrap();
+    let issued = engine.auth_tokens().mint("reader", &["host.logs"]).unwrap();
     let audit_log = engine.audit_log();
 
     let router = build_router(engine.clone());
@@ -2838,7 +2817,7 @@ async fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
         row.decision, "deny",
         "gRPC-Web non-scope handler error must audit as deny, got {row:?}",
     );
-    // Not a scope denial → required_scope stays None.
+    // Not a permission denial → required_scope stays None.
     assert!(row.required_scope.is_none());
 }
 
@@ -2848,7 +2827,7 @@ async fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
 async fn connect_devices_execute_command_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.DevicesService/ExecuteCommand",
-        b"[\"devices:list\"]",
+        &["device.list"],
     )
     .await;
 }
@@ -2857,34 +2836,26 @@ async fn connect_devices_execute_command_scope_deny_returns_permission_denied() 
 async fn connect_plugins_install_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.PluginsService/InstallPlugin",
-        b"[\"plugins:list\"]",
+        &["plugin.read"],
     )
     .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn connect_plugins_start_scope_deny_returns_permission_denied() {
-    assert_connect_scope_denied(
-        "/oxidhome.v1.PluginsService/StartPlugin",
-        b"[\"plugins:list\"]",
-    )
-    .await;
+    assert_connect_scope_denied("/oxidhome.v1.PluginsService/StartPlugin", &["plugin.read"]).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn connect_plugins_stop_scope_deny_returns_permission_denied() {
-    assert_connect_scope_denied(
-        "/oxidhome.v1.PluginsService/StopPlugin",
-        b"[\"plugins:list\"]",
-    )
-    .await;
+    assert_connect_scope_denied("/oxidhome.v1.PluginsService/StopPlugin", &["plugin.read"]).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn connect_plugins_uninstall_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied(
         "/oxidhome.v1.PluginsService/UninstallPlugin",
-        b"[\"plugins:list\"]",
+        &["plugin.read"],
     )
     .await;
 }
@@ -2902,7 +2873,7 @@ async fn connect_devices_execute_command_unknown_device_audits_as_deny() {
     let engine = Engine::new().expect("engine");
     let admin = engine
         .auth_tokens()
-        .create("admin", b"[\"devices:command\"]")
+        .mint("admin", &["device.command"])
         .unwrap();
     let audit_log = engine.audit_log();
 
@@ -2932,7 +2903,7 @@ async fn connect_devices_execute_command_unknown_device_audits_as_deny() {
     let row = &rows[0];
     assert_eq!(row.status, 404);
     assert_eq!(row.decision, "deny");
-    // NotFound isn't a scope denial — required_scope stays None.
+    // NotFound isn't a permission denial — required_scope stays None.
     assert!(row.required_scope.is_none());
 }
 
@@ -2948,7 +2919,7 @@ async fn connect_devices_execute_command_end_to_end_through_simulated_switch() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let handle = engine
         .start_instance(switch_dir, "switch-one", None)
         .await
@@ -3023,7 +2994,7 @@ async fn send_command_domain_error_audits_execution_failure() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let audit_log = engine.audit_log();
     let handle = engine
         .start_instance(switch_dir, "switch-one", None)
@@ -3160,7 +3131,7 @@ async fn rest_accepted_command_resolves_in_the_audit_ledger() {
         .join("examples")
         .join("deferred-switch");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let handle = engine
         .start_instance(dir, "deferred", None)
         .await
@@ -3229,7 +3200,7 @@ async fn rest_trap_after_start_is_outcome_unknown() {
     let _wasm = support::build_example("crasher", "crasher.wasm");
     let dir = support::workspace_root().join("examples").join("crasher");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let overrides: toml::Value = toml::from_str("crash_on = \"command\"").unwrap();
     let handle = engine
         .start_instance(dir, "crasher", Some(overrides))
@@ -3293,7 +3264,7 @@ async fn connect_execute_command_domain_error_audits_execution_failure() {
         .join("examples")
         .join("simulated-switch");
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let audit_log = engine.audit_log();
     let handle = engine
         .start_instance(switch_dir, "switch-one", None)
@@ -3372,7 +3343,7 @@ async fn connect_plugins_install_start_stop_uninstall_end_to_end() {
     let state_dir = support::tempdir("connect-lifecycle-e2e");
     let source = stage_install_source("connect-kvc-source", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine.clone());
 
     // 1. Install.
@@ -3499,17 +3470,14 @@ fn connect_stream_request_envelope(payload: &[u8]) -> Vec<u8> {
 /// (Connect unary Content-Type), which the dispatcher rejects on
 /// streaming methods with `unimplemented` — different code path.
 /// This test sends `application/connect+json` (Connect streaming
-/// Content-Type) so it reaches the handler; the scope check runs
+/// Content-Type) so it reaches the handler; the permission check runs
 /// before the stream is established and comes back as HTTP 200
 /// with a gRPC-style trailer carrying `permission_denied`
 /// (streaming errors ride in trailers, not on the HTTP status).
 #[tokio::test(flavor = "current_thread")]
 async fn connect_events_tail_scope_deny_returns_permission_denied() {
     let engine = Engine::new().expect("engine");
-    let token = engine
-        .auth_tokens()
-        .create("scoped", b"[\"logs:read\"]")
-        .unwrap();
+    let token = engine.auth_tokens().mint("scoped", &["host.logs"]).unwrap();
     let router = build_router(engine);
     // Connect streaming expects a framed request envelope (5-byte
     // header + payload), same shape as the response frames — so a
@@ -3560,7 +3528,7 @@ async fn connect_events_tail_streams_a_custom_event() {
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("streamer", b"[\"events:tail\"]")
+        .mint("streamer", &["event.subscribe"])
         .unwrap();
     let router = build_router(engine.clone());
 
@@ -3685,7 +3653,7 @@ async fn connect_events_tail_state_changed_preserves_fields_and_unsigned_timesta
     let engine = Engine::new().expect("engine");
     let token = engine
         .auth_tokens()
-        .create("streamer", b"[\"events:tail\"]")
+        .mint("streamer", &["event.subscribe"])
         .unwrap();
     let router = build_router(engine.clone());
 
@@ -3793,7 +3761,7 @@ async fn events_query_returns_recorded_rows_with_durable_ids() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"events:read\"]")
+        .mint("reader", &["event.read"])
         .unwrap();
 
     // Record two events directly through the store so the test
@@ -3859,9 +3827,9 @@ async fn events_query_returns_recorded_rows_with_durable_ids() {
     assert_eq!(events[0]["plugin_id"], "com.example.recorder");
 }
 
-/// H5: `GET /api/v1/events` refuses without the `events:read`
-/// scope. A token that only carries `events:tail` (live-stream
-/// scope) can't drop into history — same shape as logs:read vs
+/// H5: `GET /api/v1/events` refuses without the `event.read`
+/// scope. A token that only carries `event.subscribe` (live-stream
+/// scope) can't drop into history — same shape as host.logs vs
 /// logs:tail (which doesn't exist yet, but the discipline lines
 /// up).
 #[tokio::test(flavor = "current_thread")]
@@ -3869,7 +3837,7 @@ async fn events_query_refuses_without_events_read_scope() {
     let engine = Engine::new().expect("engine");
     let tail_only = engine
         .auth_tokens()
-        .create("tail_only", b"[\"events:tail\"]")
+        .mint("tail_only", &["event.subscribe"])
         .unwrap();
 
     let response = build_router(engine.clone())
@@ -3902,7 +3870,7 @@ async fn events_query_after_id_returns_only_newer_rows() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"events:read\"]")
+        .mint("reader", &["event.read"])
         .unwrap();
     let event_log = engine.event_log();
     let mut ids = Vec::new();
@@ -3974,7 +3942,7 @@ async fn events_query_state_changed_exposes_fields() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"events:read\"]")
+        .mint("reader", &["event.read"])
         .unwrap();
     let event_log = engine.event_log();
     let ev = Event {
@@ -4090,7 +4058,7 @@ async fn devices_state_snapshot_reflects_applied_changes() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
 
     let store = engine.device_state();
@@ -4153,7 +4121,7 @@ async fn devices_state_changes_returns_cursor_deltas() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
 
     let store = engine.device_state();
@@ -4208,7 +4176,7 @@ async fn devices_state_changes_signals_reset_when_cursor_exceeds_current() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     // Seed a few entries so current_revision = 2 (well below the
     // 999 cursor the client sends).
@@ -4253,14 +4221,14 @@ async fn devices_state_changes_signals_reset_when_cursor_exceeds_current() {
 
 /// H9: `GET /api/v1/devices/{id}/state` and
 /// `GET /api/v1/devices/state/changes` both require the
-/// `devices:read` scope. `devices:list` (registration snapshot)
+/// `device.read` permission. `device.list` (registration snapshot)
 /// does not satisfy — this is a distinct capability.
 #[tokio::test(flavor = "current_thread")]
 async fn devices_state_endpoints_require_devices_read_scope() {
     let engine = Engine::new().expect("engine");
     let list_only = engine
         .auth_tokens()
-        .create("list-only", b"[\"devices:list\"]")
+        .mint("list-only", &["device.list"])
         .unwrap();
 
     for path in [
@@ -4283,7 +4251,7 @@ async fn devices_state_endpoints_require_devices_read_scope() {
         assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
-            "{path} must require devices:read",
+            "{path} must require device.read",
         );
     }
 }
@@ -4298,7 +4266,7 @@ async fn devices_state_partial_updates_merge_untouched_fields() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let store = engine.device_state();
     store.apply_delta(
@@ -4375,7 +4343,7 @@ async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let store = engine.device_state();
     store.apply_delta(
@@ -4425,7 +4393,7 @@ async fn devices_state_mark_device_stale_bumps_revision_and_flips_all_caps() {
 /// H9 round-10 finding 2: `GET /api/v1/devices/state` returns an
 /// atomic all-device snapshot with `epoch` + `revision`, so a
 /// client that hit `reset_required` can resync in one round-trip
-/// on the `devices:read` scope alone — no `devices:list` needed.
+/// on the `device.read` permission alone — no `device.list` needed.
 #[tokio::test(flavor = "current_thread")]
 async fn devices_state_full_snapshot_returns_every_device_atomically() {
     use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{KeyValue, Value};
@@ -4433,7 +4401,7 @@ async fn devices_state_full_snapshot_returns_every_device_atomically() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let store = engine.device_state();
     for i in 0..3 {
@@ -4500,7 +4468,7 @@ async fn devices_state_full_snapshot_pins_revision_across_pages() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let store = engine.device_state();
     for i in 0..4 {
@@ -4629,7 +4597,7 @@ async fn devices_state_full_snapshot_rejects_forged_and_stale_cursors() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     engine.device_state().apply_delta(
         "dev-1".into(),
@@ -4699,7 +4667,7 @@ async fn devices_state_full_snapshot_paginates_by_device_id() {
     let engine = Engine::new().expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let store = engine.device_state();
     // Five devices, each with two capabilities.
@@ -4781,14 +4749,14 @@ async fn devices_state_full_snapshot_paginates_by_device_id() {
 }
 
 /// H9 round-10 finding 2: `GET /api/v1/devices/state` requires
-/// `devices:read` — not `devices:list`. A `devices:list`-only
+/// `device.read` — not `device.list`. A `device.list`-only
 /// token gets 403.
 #[tokio::test(flavor = "current_thread")]
 async fn devices_state_full_snapshot_requires_devices_read_scope() {
     let engine = Engine::new().expect("engine");
     let lister = engine
         .auth_tokens()
-        .create("lister", b"[\"devices:list\"]")
+        .mint("lister", &["device.list"])
         .unwrap();
 
     let response = build_router(engine.clone())
@@ -4911,7 +4879,7 @@ async fn plugin_ui_session_wrapper_and_frame_round_trip_without_bearer() {
     let state_dir = support::tempdir("ui-round-trip");
     let source = stage_install_source("ui-round-trip-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
 
     // Install the plugin so `/ui-session` will find it.
@@ -5038,7 +5006,7 @@ async fn plugin_ui_ticket_does_not_survive_uninstall_reinstall() {
     let state_dir = support::tempdir("ui-reinstall");
     let source = stage_install_source("ui-reinstall-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
 
     // Install v1 of the plugin.
@@ -5142,7 +5110,7 @@ async fn plugin_ui_frame_rejects_ticket_bound_to_wrong_plugin() {
     let state_dir = support::tempdir("ui-wrong-plugin");
     let source_a = stage_install_source("ui-wrong-a", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // Install plugin A.
     let response = router
@@ -5206,7 +5174,7 @@ async fn plugin_ui_frame_rejects_missing_malformed_and_oversized_ticket() {
     let state_dir = support::tempdir("ui-bad-ticket");
     let source = stage_install_source("ui-bad-ticket-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // Install the plugin so path lookups don't 404 before
     // the ticket check even runs.
@@ -5269,16 +5237,16 @@ async fn plugin_ui_frame_rejects_missing_malformed_and_oversized_ticket() {
 }
 
 /// C6 round-2 finding 1: `POST /ui-session` requires the
-/// `plugins:ui` scope; a token with only `plugins:list`
+/// `plugin.ui` permission; a token with only `plugin.read`
 /// gets 403. `/ui` itself is public (ticket-gated), so a
-/// scope check there would be a category error.
+/// permission check there would be a category error.
 #[tokio::test(flavor = "multi_thread")]
 async fn plugin_ui_session_requires_plugins_ui_scope() {
     let state_dir = support::tempdir("ui-scope");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let lister = engine
         .auth_tokens()
-        .create("lister", b"[\"plugins:list\"]")
+        .mint("lister", &["plugin.read"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -5357,7 +5325,7 @@ async fn plugin_ui_endpoints_do_not_enumerate_installed_ids_on_bad_ticket() {
     let state_dir = support::tempdir("ui-no-oracle");
     let source = stage_install_source("ui-no-oracle-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // Install `example.kv-counter`; leave `example.other`
     // absent. Query both with a garbage ticket via each
@@ -5418,7 +5386,7 @@ async fn plugin_ui_responses_forbid_caching() {
     let state_dir = support::tempdir("ui-nostore");
     let source = stage_install_source("ui-nostore-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .clone()
@@ -5533,7 +5501,7 @@ async fn plugin_ui_responses_forbid_caching() {
 async fn plugin_ui_session_returns_404_for_unknown_plugin() {
     let state_dir = support::tempdir("ui-unknown");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .clone()
@@ -5561,7 +5529,7 @@ async fn plugin_schema_returns_config_and_ui_from_manifest() {
     let state_dir = support::tempdir("plugin-schema-ok");
     let source = stage_install_source("plugin-schema-ok-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .clone()
@@ -5605,7 +5573,7 @@ async fn plugin_schema_returns_config_and_ui_from_manifest() {
 }
 
 /// Phase 13 slice 2: `GET /schema` requires the
-/// `plugins:list` scope (same read-only role as the
+/// `plugin.read` permission (same read-only role as the
 /// listing endpoint).
 #[tokio::test(flavor = "multi_thread")]
 async fn plugin_schema_requires_plugins_list_scope() {
@@ -5613,7 +5581,7 @@ async fn plugin_schema_requires_plugins_list_scope() {
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let commander = engine
         .auth_tokens()
-        .create("commander", b"[\"devices:command\"]")
+        .mint("commander", &["device.command"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -5646,7 +5614,7 @@ async fn plugin_schema_refuses_after_direct_manifest_swap() {
     let state_dir = support::tempdir("plugin-schema-tamper");
     let source = stage_install_source("plugin-schema-tamper-src", "example.kv-counter");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // Install.
     let response = router
@@ -5711,7 +5679,7 @@ async fn plugin_schema_refuses_after_direct_manifest_swap() {
 async fn plugin_schema_returns_404_for_unknown_plugin() {
     let state_dir = support::tempdir("plugin-schema-unknown");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .clone()
@@ -5736,7 +5704,7 @@ async fn plugin_schema_returns_404_for_unknown_plugin() {
 async fn dashboards_create_read_and_list_round_trip() {
     let state_dir = support::tempdir("dashboards-round-trip");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let body = serde_json::json!({
         "name": "home",
@@ -5806,7 +5774,7 @@ async fn dashboards_create_read_and_list_round_trip() {
 async fn dashboards_update_and_delete_round_trip() {
     let state_dir = support::tempdir("dashboards-update-delete");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     let response = router
         .clone()
@@ -5891,11 +5859,11 @@ async fn dashboards_share_across_admin_tokens() {
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let token_a = engine
         .auth_tokens()
-        .create("admin-a", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .mint("admin-a", &["dashboard.read", "dashboard.write"])
         .unwrap();
     let token_b = engine
         .auth_tokens()
-        .create("admin-b", b"[\"dashboards:read\",\"dashboards:write\"]")
+        .mint("admin-b", &["dashboard.read", "dashboard.write"])
         .unwrap();
     let router = build_router(engine);
     // Token A creates a dashboard.
@@ -5971,7 +5939,7 @@ async fn dashboards_share_across_admin_tokens() {
 async fn dashboards_enforce_size_and_quota_caps() {
     let state_dir = support::tempdir("dashboards-caps");
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
     // Oversized `name` → 400.
     let huge_name = "a".repeat(1024);
@@ -5997,7 +5965,7 @@ async fn dashboards_enforce_size_and_quota_caps() {
 }
 
 /// Phase 13 slice 3: read + write scopes gate the CRUD
-/// endpoints independently. `dashboards:read` alone
+/// endpoints independently. `dashboard.read` alone
 /// forbids POST / PUT / DELETE.
 #[tokio::test(flavor = "multi_thread")]
 async fn dashboards_write_requires_dashboards_write_scope() {
@@ -6005,7 +5973,7 @@ async fn dashboards_write_requires_dashboards_write_scope() {
     let engine = Engine::with_state_dir(state_dir.path()).expect("engine");
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"dashboards:read\"]")
+        .mint("reader", &["dashboard.read"])
         .unwrap();
     let router = build_router(engine);
     let response = router
@@ -6027,7 +5995,7 @@ async fn dashboards_write_requires_dashboards_write_scope() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    // LIST still works with dashboards:read alone.
+    // LIST still works with dashboard.read alone.
     let response = router
         .clone()
         .oneshot(
@@ -6043,115 +6011,6 @@ async fn dashboards_write_requires_dashboards_write_scope() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// Round-3 P1 on PR #147: a constraint-bearing token
-/// (extended `TokenPolicy` envelope with `constraints`) must
-/// be refused at bearer time on transports that don't
-/// consume constraints. Without this, a caller could bypass
-/// the intended constraint by using a transport whose scope
-/// check silently succeeds while the constraint sits inert
-/// on the actor.
-///
-/// Round-4 P1 update: the refusal covers **every** transport
-/// in 14.4a — MCP included. Landing acceptance before the
-/// per-tool dispatch checks would grant a `{scopes: ["*"],
-/// constraints: {"device.send_command": {"devices": []}}}`
-/// token unrestricted MCP authority (flat scope passes; no
-/// dispatch site consults the deny-all constraint). Each
-/// 14.4b/c slice adds its own `EnforcedConstraint` entry to
-/// `AuthState::enforced_constraints` for the transport that
-/// consumes it, atomically with wiring the corresponding
-/// dispatch-site check.
-#[tokio::test(flavor = "multi_thread")]
-async fn rest_refuses_constraint_bearing_token() {
-    use oxidhome_core::state::AuditQuery;
-
-    let engine = Engine::new().expect("engine");
-    let issued = engine
-        .auth_tokens()
-        .create(
-            "constrained",
-            // H6 made `device.send_command` enforced on REST, so the
-            // refusal is pinned on a key REST still does not consume.
-            br#"{
-                "scopes": ["*"],
-                "constraints": {
-                    "plugins.install": {"plugins": ["acme.*"]}
-                }
-            }"#,
-        )
-        .expect("create constrained token");
-    let audit_log = engine.audit_log();
-    let router = build_router(engine.clone());
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/instances")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", issued.plaintext),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::FORBIDDEN,
-        "REST must refuse a constraint-bearing token with 403",
-    );
-
-    // Round-4 P2 on PR #147: the 403 must land in the ledger
-    // as an authenticated denial — attributed to the known
-    // token_id + actor_kind, NOT the anonymous bucket.
-    let rows = audit_log
-        .query(&AuditQuery::default(), 16)
-        .expect("query audit");
-    let denial = rows
-        .iter()
-        .find(|r| r.status == 403 && r.path == "/api/v1/instances")
-        .expect("constraint-refused row present");
-    assert_eq!(denial.token_id, issued.id, "token_id must be attributed");
-    assert_eq!(denial.actor_kind, "api", "actor_kind must be attributed");
-    assert_eq!(denial.decision, "deny");
-    assert_eq!(
-        denial.required_scope.as_deref(),
-        // Round-6 P2 on PR #147: the sentinel names the
-        // offending key so a ledger sweep can attribute the
-        // refusal without cross-referencing the log line.
-        // 14.4a enforces no keys, so this is
-        // `KeyNotEnforced`.
-        Some("<constraint-key-unenforced:plugins.install>"),
-    );
-}
-
-/// A bare scope-list token (the shape the bootstrap `["*"]` token
-/// uses) works on REST: the refuse-on-constraints check only fires
-/// when the extended envelope carries a non-empty `constraints` map.
-#[tokio::test(flavor = "multi_thread")]
-async fn rest_accepts_scope_list_token() {
-    let engine = Engine::new().expect("engine");
-    let issued = engine
-        .auth_tokens()
-        .create("scope-list-admin", b"[\"*\"]")
-        .expect("create scope-list token");
-    let router = build_router(engine);
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/instances")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", issued.plaintext),
-                )
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ── H6: device allowlist on every transport + invocation context ──
@@ -6179,21 +6038,23 @@ async fn start_switch() -> (Engine, oxidhome_core::InstanceHandle, String) {
     (engine, handle, device_id)
 }
 
+/// A token whose role grants `device.command` on `allowed` only.
 fn device_allowlist_token(engine: &Engine, label: &str, allowed: &str) -> String {
-    let policy = format!(
-        r#"{{"scopes":["devices:command"],"constraints":{{"device.send_command":{{"devices":["{allowed}"]}}}}}}"#
-    );
-    engine
-        .auth_tokens()
-        .create(label, policy.as_bytes())
-        .expect("create constrained token")
+    let tokens = engine.auth_tokens();
+    let grants = format!(r#"[{{"actions":["device.command"],"devices":["{allowed}"]}}]"#);
+    tokens
+        .create_role(label, grants.as_bytes())
+        .expect("create role");
+    tokens
+        .create(label, &[label])
+        .expect("create token")
         .plaintext
 }
 
-/// H6: `devices:command` no longer grants every device on REST when
-/// the token carries a `device.send_command` allowlist — the same
-/// shared check MCP applies. The allowed device dispatches and its
-/// audit row records the request's invocation (call id + REST root).
+/// A role grant narrowed to one device covers that device only, through
+/// the same `authorize()` check MCP and Connect apply. The allowed
+/// device dispatches and its audit row records the request's invocation
+/// (call id + REST root).
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_device_command_enforces_allowlist_and_records_invocation() {
     use oxidhome_core::state::AuditQuery;
@@ -6236,10 +6097,7 @@ async fn rest_device_command_enforces_allowlist_and_records_invocation() {
         )
         .expect("query audit");
     let deny = rows.iter().find(|r| r.status == 403).expect("deny row");
-    assert_eq!(
-        deny.required_scope.as_deref(),
-        Some("constraint:device.send_command:devices"),
-    );
+    assert_eq!(deny.required_scope.as_deref(), Some("device.command"),);
     let allow = rows.iter().find(|r| r.status == 200).expect("allow row");
     let call_id = allow.call_id.as_deref().expect("call_id on entry row");
     assert!(call_id.starts_with("call-"));
@@ -6255,7 +6113,7 @@ async fn rest_device_command_enforces_allowlist_and_records_invocation() {
     handle.stop().await.expect("stop");
 }
 
-/// H6: same allowlist on Connect `DevicesService.ExecuteCommand`.
+/// The same device-narrowed grant on Connect `DevicesService.ExecuteCommand`.
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_device_command_enforces_allowlist_and_records_invocation() {
     use oxidhome_core::state::AuditQuery;
@@ -6302,10 +6160,7 @@ async fn connect_device_command_enforces_allowlist_and_records_invocation() {
         .iter()
         .find(|r| r.decision == "deny")
         .expect("deny row");
-    assert_eq!(
-        deny.required_scope.as_deref(),
-        Some("constraint:device.send_command:devices"),
-    );
+    assert_eq!(deny.required_scope.as_deref(), Some("device.command"),);
     let allow = rows
         .iter()
         .find(|r| r.decision == "allow")
@@ -6321,7 +6176,7 @@ async fn connect_device_command_enforces_allowlist_and_records_invocation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn audit_endpoint_filters_by_call_id() {
     let engine = Engine::new().expect("engine");
-    let admin = engine.auth_tokens().create("admin", b"[\"*\"]").unwrap();
+    let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let get = |uri: String| {
         Request::builder()
             .uri(uri)
@@ -6365,7 +6220,10 @@ async fn expired_invocation_is_refused_before_plugin_runs() {
 
     let (engine, handle, device_id) = start_switch().await;
     let mut events = engine.events().subscribe_all();
-    let actor = oxidhome_core::Actor::api("tok-late", vec!["*".into()]);
+    let actor = oxidhome_core::Actor::api(
+        "tok-late",
+        vec![oxidhome_core::auth::role::builtin("admin").unwrap()],
+    );
     let expired =
         InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
             .with_deadline(Some(tokio::time::Instant::now()));
@@ -6407,12 +6265,12 @@ async fn connect_device_state_scope_deny_returns_permission_denied() {
         "/oxidhome.v1.DevicesService/ListDeviceState",
         "/oxidhome.v1.DevicesService/ListDeviceStateChanges",
     ] {
-        assert_connect_scope_denied(path, b"[\"devices:list\"]").await;
+        assert_connect_scope_denied(path, &["device.list"]).await;
     }
 }
 
 /// H2: the Connect state RPCs mirror the REST state endpoints,
-/// including M7 bytes withholding without `blobs:read`.
+/// including M7 bytes withholding without `blob.read`.
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn connect_device_state_rpcs_mirror_rest() {
@@ -6450,7 +6308,7 @@ async fn connect_device_state_rpcs_mirror_rest() {
     );
     let reader = engine
         .auth_tokens()
-        .create("reader", b"[\"devices:read\"]")
+        .mint("reader", &["device.read"])
         .unwrap();
     let call = |path: &'static str, body: String| {
         let engine = engine.clone();
@@ -6542,7 +6400,7 @@ async fn connect_device_state_rpcs_mirror_rest() {
 /// Every REST and Connect route now asks `auth::authorize`; a deny
 /// still lands as a `403` / `permission_denied` whose audit row names
 /// the missing scope in `required_scope`, exactly as the per-route
-/// scope checks recorded it. A token holding only `events:tail`
+/// permission checks recorded it. A token holding only `event.subscribe`
 /// exercises one route per action; the tail's replay branch is covered
 /// in `events_resume.rs`.
 #[tokio::test(flavor = "current_thread")]
@@ -6553,59 +6411,54 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
     let engine = Engine::new().expect("engine");
     let issued = engine
         .auth_tokens()
-        .create("tail-only", b"[\"events:tail\"]")
+        .mint("tail-only", &["event.subscribe"])
         .expect("create token");
     let bearer = format!("Bearer {}", issued.plaintext);
     let rest_routes: &[(&str, &str, &str, Option<&str>)] = &[
-        ("GET", "/api/v1/config", "status:read", None),
-        ("GET", "/api/v1/instances", "instances:list", None),
-        ("GET", "/api/v1/devices", "devices:list", None),
+        ("GET", "/api/v1/config", "host.status", None),
+        ("GET", "/api/v1/instances", "instance.read", None),
+        ("GET", "/api/v1/devices", "device.list", None),
         (
             "GET",
             "/api/v1/devices/dev-0000000000000000/state",
-            "devices:read",
+            "device.read",
             None,
         ),
-        ("GET", "/api/v1/devices/state", "devices:read", None),
+        ("GET", "/api/v1/devices/state", "device.read", None),
         (
             "POST",
             "/api/v1/devices/dev-0000000000000000/command",
-            "devices:command",
+            "device.command",
             Some(r#"{"capability":"switch","action":"toggle","args":[]}"#),
         ),
-        ("GET", "/api/v1/plugins", "plugins:list", None),
-        ("GET", "/api/v1/plugins/acme.p/schema", "plugins:list", None),
+        ("GET", "/api/v1/plugins", "plugin.read", None),
+        ("GET", "/api/v1/plugins/acme.p/schema", "plugin.read", None),
         (
             "POST",
             "/api/v1/plugins",
-            "plugins:install",
+            "plugin.install",
             Some(r#"{"source_dir":"/nonexistent"}"#),
         ),
         (
             "POST",
             "/api/v1/plugins/acme.p/start",
-            "plugins:start",
+            "instance.start",
             None,
         ),
-        ("POST", "/api/v1/plugins/acme.p/stop", "plugins:stop", None),
-        (
-            "DELETE",
-            "/api/v1/plugins/acme.p",
-            "plugins:uninstall",
-            None,
-        ),
+        ("POST", "/api/v1/plugins/acme.p/stop", "instance.stop", None),
+        ("DELETE", "/api/v1/plugins/acme.p", "plugin.uninstall", None),
         (
             "POST",
             "/api/v1/plugins/acme.p/ui-session",
-            "plugins:ui",
+            "plugin.ui",
             None,
         ),
-        ("GET", "/api/v1/logs", "logs:read", None),
-        ("GET", "/api/v1/events", "events:read", None),
-        ("GET", "/api/v1/audit", "audit:read", None),
-        ("GET", "/api/v1/dashboards", "dashboards:read", None),
-        ("GET", "/api/v1/dashboards/1", "dashboards:read", None),
-        ("DELETE", "/api/v1/dashboards/1", "dashboards:write", None),
+        ("GET", "/api/v1/logs", "host.logs", None),
+        ("GET", "/api/v1/events", "event.read", None),
+        ("GET", "/api/v1/audit", "host.audit", None),
+        ("GET", "/api/v1/dashboards", "dashboard.read", None),
+        ("GET", "/api/v1/dashboards/1", "dashboard.read", None),
+        ("DELETE", "/api/v1/dashboards/1", "dashboard.write", None),
     ];
     for (method, uri, _, body) in rest_routes {
         let mut req = Request::builder()
@@ -6628,14 +6481,14 @@ async fn authorize_denials_record_the_missing_scope_on_every_surface() {
         (
             "/oxidhome.v1.InstancesService/ListInstances",
             "{}",
-            "instances:list",
+            "instance.read",
         ),
         (
             "/oxidhome.v1.PluginsService/StopPlugin",
             r#"{"pluginId":"acme.p"}"#,
-            "plugins:stop",
+            "instance.stop",
         ),
-        ("/oxidhome.v1.LogsService/QueryLogs", "{}", "logs:read"),
+        ("/oxidhome.v1.LogsService/QueryLogs", "{}", "host.logs"),
     ];
     for (path, body, _) in connect {
         let response = build_router(engine.clone())

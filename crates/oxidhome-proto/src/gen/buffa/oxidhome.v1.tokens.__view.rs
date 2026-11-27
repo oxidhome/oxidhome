@@ -7,23 +7,11 @@ pub struct CreateTokenRequestView<'a> {
     ///
     /// Field 1: `label`
     pub label: &'a str,
-    /// Names of owner-defined roles.
+    /// Names of the roles the token holds, built-in or custom. At least
+    /// one.
     ///
     /// Field 2: `roles`
     pub roles: ::buffa::RepeatedView<'a, &'a str>,
-    /// Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
-    ///
-    /// Field 3: `scopes`
-    pub scopes: ::buffa::RepeatedView<'a, &'a str>,
-    /// Sensitive categories (`lock`, `opener`, `alarm`, `camera`)
-    /// granted on every device.
-    ///
-    /// Field 4: `sensitive`
-    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// The token's deny list.
-    ///
-    /// Field 5: `deny`
-    pub deny: ::buffa::RepeatedView<'a, super::super::__buffa::view::SelectorView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for CreateTokenRequestView<'a> {
@@ -72,46 +60,6 @@ impl<'a> ::buffa::MessageView<'a> for CreateTokenRequestView<'a> {
                 )?;
                 view.roles.push(__elem);
             }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.scopes.push(__elem);
-            }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.sensitive.push(__elem);
-            }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __sub_ctx = ctx.descend()?;
-                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                ctx.register_element_memory(
-                    ::core::mem::size_of::<super::super::__buffa::view::SelectorView>(),
-                )?;
-                view.deny
-                    .push(
-                        <super::super::__buffa::view::SelectorView as ::buffa::MessageView>::decode_view_ctx(
-                            sub,
-                            __sub_ctx,
-                        )?,
-                    );
-            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -136,13 +84,6 @@ impl<'a> ::buffa::MessageView<'a> for CreateTokenRequestView<'a> {
         ::core::result::Result::Ok(super::super::CreateTokenRequest {
             label: self.label.to_string(),
             roles: self.roles.iter().map(|s| s.to_string()).collect(),
-            scopes: self.scopes.iter().map(|s| s.to_string()).collect(),
-            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
-            deny: self
-                .deny
-                .iter()
-                .map(|v| v.to_owned_from_source(__buffa_src))
-                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -150,7 +91,7 @@ impl<'a> ::buffa::MessageView<'a> for CreateTokenRequestView<'a> {
 }
 impl<'a> ::buffa::ViewEncode<'a> for CreateTokenRequestView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
@@ -160,27 +101,13 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateTokenRequestView<'a> {
         for v in &self.roles {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.scopes {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     #[allow(clippy::needless_borrow)]
     fn write_to(
         &self,
-        __cache: &mut ::buffa::SizeCache,
+        _cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -190,20 +117,6 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateTokenRequestView<'a> {
         }
         for v in &self.roles {
             ::buffa::types::put_string_field(2u32, v, buf);
-        }
-        for v in &self.scopes {
-            ::buffa::types::put_string_field(3u32, v, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(4u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_len_delimited_header(
-                5u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -231,15 +144,6 @@ impl<'__a> ::serde::Serialize for CreateTokenRequestView<'__a> {
         }
         if !self.roles.is_empty() {
             __map.serialize_entry("roles", &*self.roles)?;
-        }
-        if !self.scopes.is_empty() {
-            __map.serialize_entry("scopes", &*self.scopes)?;
-        }
-        if !self.sensitive.is_empty() {
-            __map.serialize_entry("sensitive", &*self.sensitive)?;
-        }
-        if !self.deny.is_empty() {
-            __map.serialize_entry("deny", &*self.deny)?;
         }
         __map.end()
     }
@@ -343,36 +247,13 @@ impl CreateTokenRequestOwnedView {
     pub fn label(&self) -> &'_ str {
         self.0.reborrow().label
     }
-    /// Names of owner-defined roles.
+    /// Names of the roles the token holds, built-in or custom. At least
+    /// one.
     ///
     /// Field 2: `roles`
     #[must_use]
     pub fn roles(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().roles
-    }
-    /// Flat scopes (`devices:read`, ..., or `*`), on top of the roles.
-    ///
-    /// Field 3: `scopes`
-    #[must_use]
-    pub fn scopes(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().scopes
-    }
-    /// Sensitive categories (`lock`, `opener`, `alarm`, `camera`)
-    /// granted on every device.
-    ///
-    /// Field 4: `sensitive`
-    #[must_use]
-    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().sensitive
-    }
-    /// The token's deny list.
-    ///
-    /// Field 5: `deny`
-    #[must_use]
-    pub fn deny(
-        &self,
-    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::SelectorView<'_>> {
-        &self.0.reborrow().deny
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<CreateTokenRequestView<'static>>>
@@ -405,34 +286,397 @@ impl ::serde::Serialize for CreateTokenRequestOwnedView {
         ::serde::Serialize::serialize(&self.0, __s)
     }
 }
-/// One grant or deny entry: `actions`, optionally narrowed to devices.
+/// One grant of a role: `actions`, optionally narrowed to device
+/// categories and devices. A sensitive category (`lock`, `opener`,
+/// `alarm`, `camera`) is reached only by a grant whose `category`
+/// names it.
 #[derive(Clone, Debug, Default)]
-pub struct SelectorView<'a> {
-    /// Action names (`device.command`) or `*`. Required.
+pub struct GrantView<'a> {
+    /// Action names (`device.command`) or `*` for every action a role can
+    /// grant. Required.
     ///
     /// Field 1: `actions`
     pub actions: ::buffa::RepeatedView<'a, &'a str>,
-    /// Device categories the entry is narrowed to; empty for every
-    /// resource.
+    /// Device categories the grant is narrowed to; unset for every
+    /// resource. Set but empty is refused, as on the JSON API.
     ///
     /// Field 2: `category`
-    pub category: ::buffa::RepeatedView<'a, &'a str>,
-    /// Device ids or `prefix*` patterns the entry is narrowed to; empty
-    /// for every device.
+    pub category: ::buffa::MessageFieldView<super::super::__buffa::view::NamesView<'a>>,
+    /// Device ids or `prefix*` patterns the grant is narrowed to; unset
+    /// for every device. Set but empty is refused.
     ///
     /// Field 3: `devices`
-    pub devices: ::buffa::RepeatedView<'a, &'a str>,
-    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
-    /// literal or `prefix*`) the entry is narrowed to; empty for every
-    /// service. Narrows `service.call` only and excludes `category` and
-    /// `devices`.
-    ///
-    /// Field 4: `services`
-    pub services: ::buffa::RepeatedView<'a, &'a str>,
+    pub devices: ::buffa::MessageFieldView<super::super::__buffa::view::NamesView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
-impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
-    type Owned = super::super::Selector;
+impl<'a> ::buffa::MessageView<'a> for GrantView<'a> {
+    type Owned = super::super::Grant;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            2u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.category.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.category = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::NamesView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            3u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                match view.devices.as_mut() {
+                    Some(existing) => {
+                        ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
+                    }
+                    None => {
+                        view.devices = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::NamesView as ::buffa::MessageView>::decode_view_ctx(
+                                sub,
+                                __sub_ctx,
+                            )?,
+                        );
+                    }
+                }
+            }
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::borrow_str(&mut cur)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                view.actions.push(__elem);
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::Grant, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::Grant, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::Grant {
+            actions: self.actions.iter().map(|s| s.to_string()).collect(),
+            category: match self.category.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::Names,
+                        ::buffa::Inline<super::super::Names>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            devices: match self.devices.as_option() {
+                Some(v) => {
+                    ::buffa::MessageField::<
+                        super::super::Names,
+                        ::buffa::Inline<super::super::Names>,
+                    >::some(v.to_owned_from_source(__buffa_src)?)
+                }
+                None => ::buffa::MessageField::none(),
+            },
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for GrantView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        for v in &self.actions {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        if self.category.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.category.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        if self.devices.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.devices.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        for v in &self.actions {
+            ::buffa::types::put_string_field(1u32, v, buf);
+        }
+        if self.category.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.category.write_to(__cache, buf);
+        }
+        if self.devices.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.devices.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GrantView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !self.actions.is_empty() {
+            __map.serialize_entry("actions", &*self.actions)?;
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.category.as_option() {
+                __map.serialize_entry("category", __v)?;
+            }
+        }
+        {
+            if let ::core::option::Option::Some(__v) = self.devices.as_option() {
+                __map.serialize_entry("devices", __v)?;
+            }
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GrantView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "Grant";
+    const FULL_NAME: &'static str = "oxidhome.v1.Grant";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Grant";
+}
+::buffa::impl_default_view_instance!(GrantView);
+::buffa::impl_view_reborrow!(GrantView);
+/** Self-contained, `'static` owned view of a `Grant` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`GrantView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GrantView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct GrantOwnedView(::buffa::OwnedView<GrantView<'static>>);
+impl GrantOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(GrantOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GrantOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Grant,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(GrantOwnedView(::buffa::OwnedView::from_owned(msg)?))
+    }
+    /// Borrow the full [`GrantView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &GrantView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Grant {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Action names (`device.command`) or `*` for every action a role can
+    /// grant. Required.
+    ///
+    /// Field 1: `actions`
+    #[must_use]
+    pub fn actions(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().actions
+    }
+    /// Device categories the grant is narrowed to; unset for every
+    /// resource. Set but empty is refused, as on the JSON API.
+    ///
+    /// Field 2: `category`
+    #[must_use]
+    pub fn category(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::NamesView<'_>> {
+        &self.0.reborrow().category
+    }
+    /// Device ids or `prefix*` patterns the grant is narrowed to; unset
+    /// for every device. Set but empty is refused.
+    ///
+    /// Field 3: `devices`
+    #[must_use]
+    pub fn devices(
+        &self,
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::NamesView<'_>> {
+        &self.0.reborrow().devices
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<GrantView<'static>>> for GrantOwnedView {
+    fn from(inner: ::buffa::OwnedView<GrantView<'static>>) -> Self {
+        GrantOwnedView(inner)
+    }
+}
+impl ::core::convert::From<GrantOwnedView> for ::buffa::OwnedView<GrantView<'static>> {
+    fn from(wrapper: GrantOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<GrantView<'static>>> for GrantOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<GrantView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Grant {
+    type View<'a> = GrantView<'a>;
+    type ViewHandle = GrantOwnedView;
+}
+impl ::serde::Serialize for GrantOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// A list whose presence is meaningful: unset is not the same as empty.
+#[derive(Clone, Debug, Default)]
+pub struct NamesView<'a> {
+    /// Field 1: `names`
+    pub names: ::buffa::RepeatedView<'a, &'a str>,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for NamesView<'a> {
+    type Owned = super::super::Names;
     fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
         <Self as ::buffa::MessageView>::decode_view_ctx(
@@ -468,40 +712,7 @@ impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
                 ctx.register_element_memory(
                     ::buffa::__private::element_footprint(&__elem),
                 )?;
-                view.actions.push(__elem);
-            }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.category.push(__elem);
-            }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.devices.push(__elem);
-            }
-            4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.services.push(__elem);
+                view.names.push(__elem);
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
@@ -513,43 +724,31 @@ impl<'a> ::buffa::MessageView<'a> for SelectorView<'a> {
     }
     fn to_owned_message(
         &self,
-    ) -> ::core::result::Result<super::super::Selector, ::buffa::DecodeError> {
+    ) -> ::core::result::Result<super::super::Names, ::buffa::DecodeError> {
         self.to_owned_from_source(None)
     }
     #[allow(clippy::useless_conversion, clippy::needless_update)]
     fn to_owned_from_source(
         &self,
         __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<super::super::Selector, ::buffa::DecodeError> {
+    ) -> ::core::result::Result<super::super::Names, ::buffa::DecodeError> {
         #[allow(unused_imports)]
         use ::buffa::alloc::string::ToString as _;
         let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::Selector {
-            actions: self.actions.iter().map(|s| s.to_string()).collect(),
-            category: self.category.iter().map(|s| s.to_string()).collect(),
-            devices: self.devices.iter().map(|s| s.to_string()).collect(),
-            services: self.services.iter().map(|s| s.to_string()).collect(),
+        ::core::result::Result::Ok(super::super::Names {
+            names: self.names.iter().map(|s| s.to_string()).collect(),
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
     }
 }
-impl<'a> ::buffa::ViewEncode<'a> for SelectorView<'a> {
+impl<'a> ::buffa::ViewEncode<'a> for NamesView<'a> {
     #[allow(clippy::needless_borrow, clippy::let_and_return)]
     fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
-        for v in &self.actions {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.category {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.devices {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.services {
+        for v in &self.names {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
@@ -563,17 +762,8 @@ impl<'a> ::buffa::ViewEncode<'a> for SelectorView<'a> {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        for v in &self.actions {
+        for v in &self.names {
             ::buffa::types::put_string_field(1u32, v, buf);
-        }
-        for v in &self.category {
-            ::buffa::types::put_string_field(2u32, v, buf);
-        }
-        for v in &self.devices {
-            ::buffa::types::put_string_field(3u32, v, buf);
-        }
-        for v in &self.services {
-            ::buffa::types::put_string_field(4u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -589,44 +779,35 @@ impl<'a> ::buffa::ViewEncode<'a> for SelectorView<'a> {
 /// fields depends on default-omission rules; serializers that require
 /// known map lengths (e.g. `bincode`) will return a runtime error.
 /// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for SelectorView<'__a> {
+impl<'__a> ::serde::Serialize for NamesView<'__a> {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
     ) -> ::core::result::Result<__S::Ok, __S::Error> {
         use ::serde::ser::SerializeMap as _;
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        if !self.actions.is_empty() {
-            __map.serialize_entry("actions", &*self.actions)?;
-        }
-        if !self.category.is_empty() {
-            __map.serialize_entry("category", &*self.category)?;
-        }
-        if !self.devices.is_empty() {
-            __map.serialize_entry("devices", &*self.devices)?;
-        }
-        if !self.services.is_empty() {
-            __map.serialize_entry("services", &*self.services)?;
+        if !self.names.is_empty() {
+            __map.serialize_entry("names", &*self.names)?;
         }
         __map.end()
     }
 }
-impl<'a> ::buffa::MessageName for SelectorView<'a> {
+impl<'a> ::buffa::MessageName for NamesView<'a> {
     const PACKAGE: &'static str = "oxidhome.v1";
-    const NAME: &'static str = "Selector";
-    const FULL_NAME: &'static str = "oxidhome.v1.Selector";
-    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Selector";
+    const NAME: &'static str = "Names";
+    const FULL_NAME: &'static str = "oxidhome.v1.Names";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Names";
 }
-::buffa::impl_default_view_instance!(SelectorView);
-::buffa::impl_view_reborrow!(SelectorView);
-/** Self-contained, `'static` owned view of a `Selector` message.
+::buffa::impl_default_view_instance!(NamesView);
+::buffa::impl_view_reborrow!(NamesView);
+/** Self-contained, `'static` owned view of a `Names` message.
 
- Wraps [`::buffa::OwnedView`]`<`[`SelectorView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+ Wraps [`::buffa::OwnedView`]`<`[`NamesView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
 
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`SelectorView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`NamesView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
 #[derive(Clone, Debug)]
-pub struct SelectorOwnedView(::buffa::OwnedView<SelectorView<'static>>);
-impl SelectorOwnedView {
+pub struct NamesOwnedView(::buffa::OwnedView<NamesView<'static>>);
+impl NamesOwnedView {
     /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
     ///
     /// The view borrows directly from the buffer's data; the buffer is
@@ -639,7 +820,7 @@ impl SelectorOwnedView {
     pub fn decode(
         bytes: ::buffa::bytes::Bytes,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(SelectorOwnedView(::buffa::OwnedView::decode(bytes)?))
+        ::core::result::Result::Ok(NamesOwnedView(::buffa::OwnedView::decode(bytes)?))
     }
     /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
     /// max message size).
@@ -653,7 +834,7 @@ impl SelectorOwnedView {
         opts: &::buffa::DecodeOptions,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
         ::core::result::Result::Ok(
-            SelectorOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+            NamesOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
         )
     }
     /// Build from an owned message via an encode → decode round-trip.
@@ -665,15 +846,13 @@ impl SelectorOwnedView {
     /// another [`::buffa::DecodeError`] if the re-encoded bytes are
     /// somehow invalid (should not happen for well-formed messages).
     pub fn from_owned(
-        msg: &super::super::Selector,
+        msg: &super::super::Names,
     ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            SelectorOwnedView(::buffa::OwnedView::from_owned(msg)?),
-        )
+        ::core::result::Result::Ok(NamesOwnedView(::buffa::OwnedView::from_owned(msg)?))
     }
-    /// Borrow the full [`SelectorView`] with its lifetime tied to `&self`.
+    /// Borrow the full [`NamesView`] with its lifetime tied to `&self`.
     #[must_use]
-    pub fn view(&self) -> &SelectorView<'_> {
+    pub fn view(&self) -> &NamesView<'_> {
         self.0.reborrow()
     }
     /// Convert to the owned message type.
@@ -684,7 +863,7 @@ impl SelectorOwnedView {
     /// whose contract also governs handles converted from a raw
     /// [`::buffa::OwnedView`].
     #[must_use]
-    pub fn to_owned_message(&self) -> super::super::Selector {
+    pub fn to_owned_message(&self) -> super::super::Names {
         self.0.to_owned_message()
     }
     /// The underlying bytes buffer.
@@ -697,63 +876,32 @@ impl SelectorOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// Action names (`device.command`) or `*`. Required.
-    ///
-    /// Field 1: `actions`
+    /// Field 1: `names`
     #[must_use]
-    pub fn actions(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().actions
-    }
-    /// Device categories the entry is narrowed to; empty for every
-    /// resource.
-    ///
-    /// Field 2: `category`
-    #[must_use]
-    pub fn category(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().category
-    }
-    /// Device ids or `prefix*` patterns the entry is narrowed to; empty
-    /// for every device.
-    ///
-    /// Field 3: `devices`
-    #[must_use]
-    pub fn devices(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().devices
-    }
-    /// Service patterns (`<plugin>` or `<plugin>/<local-id>`, each half
-    /// literal or `prefix*`) the entry is narrowed to; empty for every
-    /// service. Narrows `service.call` only and excludes `category` and
-    /// `devices`.
-    ///
-    /// Field 4: `services`
-    #[must_use]
-    pub fn services(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().services
+    pub fn names(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
+        &self.0.reborrow().names
     }
 }
-impl ::core::convert::From<::buffa::OwnedView<SelectorView<'static>>>
-for SelectorOwnedView {
-    fn from(inner: ::buffa::OwnedView<SelectorView<'static>>) -> Self {
-        SelectorOwnedView(inner)
+impl ::core::convert::From<::buffa::OwnedView<NamesView<'static>>> for NamesOwnedView {
+    fn from(inner: ::buffa::OwnedView<NamesView<'static>>) -> Self {
+        NamesOwnedView(inner)
     }
 }
-impl ::core::convert::From<SelectorOwnedView>
-for ::buffa::OwnedView<SelectorView<'static>> {
-    fn from(wrapper: SelectorOwnedView) -> Self {
+impl ::core::convert::From<NamesOwnedView> for ::buffa::OwnedView<NamesView<'static>> {
+    fn from(wrapper: NamesOwnedView) -> Self {
         wrapper.0
     }
 }
-impl ::core::convert::AsRef<::buffa::OwnedView<SelectorView<'static>>>
-for SelectorOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<SelectorView<'static>> {
+impl ::core::convert::AsRef<::buffa::OwnedView<NamesView<'static>>> for NamesOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<NamesView<'static>> {
         &self.0
     }
 }
-impl ::buffa::HasMessageView for super::super::Selector {
-    type View<'a> = SelectorView<'a>;
-    type ViewHandle = SelectorOwnedView;
+impl ::buffa::HasMessageView for super::super::Names {
+    type View<'a> = NamesView<'a>;
+    type ViewHandle = NamesOwnedView;
 }
-impl ::serde::Serialize for SelectorOwnedView {
+impl ::serde::Serialize for NamesOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -1586,41 +1734,25 @@ pub struct TokenView<'a> {
     pub token_id: &'a str,
     /// Field 2: `label`
     pub label: &'a str,
-    /// `true` for the bootstrap / recovered owner token.
+    /// `true` for the bootstrap / recovered owner token, which may do
+    /// everything.
     ///
     /// Field 3: `owner`
     pub owner: bool,
     /// Field 4: `revoked`
     pub revoked: bool,
-    /// Role names (`<id> (deleted)` for a deleted role); `owner` for the
-    /// owner token.
+    /// Names of the roles the token holds.
     ///
     /// Field 5: `roles`
     pub roles: ::buffa::RepeatedView<'a, &'a str>,
-    /// Field 6: `scopes`
-    pub scopes: ::buffa::RepeatedView<'a, &'a str>,
-    /// `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
-    ///
-    /// Field 7: `sensitive`
-    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 8: `deny`
-    pub deny: ::buffa::RepeatedView<'a, &'a str>,
     /// Unix ms.
     ///
-    /// Field 9: `created_ms`
+    /// Field 6: `created_ms`
     pub created_ms: i64,
     /// Unix ms; unset when never used.
     ///
-    /// Field 10: `last_used_ms`
+    /// Field 7: `last_used_ms`
     pub last_used_ms: ::core::option::Option<i64>,
-    /// `false` when the stored policy doesn't parse (deny-all).
-    ///
-    /// Field 11: `policy_valid`
-    pub policy_valid: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for TokenView<'a> {
@@ -1679,26 +1811,19 @@ impl<'a> ::buffa::MessageView<'a> for TokenView<'a> {
                 )?;
                 view.revoked = ::buffa::types::decode_bool(&mut cur)?;
             }
-            9u32 => {
+            6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.created_ms = ::buffa::types::decode_int64(&mut cur)?;
             }
-            10u32 => {
+            7u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
                 view.last_used_ms = Some(::buffa::types::decode_int64(&mut cur)?);
-            }
-            11u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.policy_valid = ::buffa::types::decode_bool(&mut cur)?;
             }
             5u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -1710,39 +1835,6 @@ impl<'a> ::buffa::MessageView<'a> for TokenView<'a> {
                     ::buffa::__private::element_footprint(&__elem),
                 )?;
                 view.roles.push(__elem);
-            }
-            6u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.scopes.push(__elem);
-            }
-            7u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.sensitive.push(__elem);
-            }
-            8u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.deny.push(__elem);
             }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
@@ -1771,12 +1863,8 @@ impl<'a> ::buffa::MessageView<'a> for TokenView<'a> {
             owner: self.owner,
             revoked: self.revoked,
             roles: self.roles.iter().map(|s| s.to_string()).collect(),
-            scopes: self.scopes.iter().map(|s| s.to_string()).collect(),
-            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
-            deny: self.deny.iter().map(|s| s.to_string()).collect(),
             created_ms: self.created_ms,
             last_used_ms: self.last_used_ms,
-            policy_valid: self.policy_valid,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -1803,23 +1891,11 @@ impl<'a> ::buffa::ViewEncode<'a> for TokenView<'a> {
         for v in &self.roles {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.scopes {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
         if self.created_ms != 0i64 {
             size += 1u64 + ::buffa::types::int64_encoded_len(self.created_ms) as u64;
         }
         if let Some(v) = self.last_used_ms {
             size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
-        }
-        if self.policy_valid {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -1847,23 +1923,11 @@ impl<'a> ::buffa::ViewEncode<'a> for TokenView<'a> {
         for v in &self.roles {
             ::buffa::types::put_string_field(5u32, v, buf);
         }
-        for v in &self.scopes {
-            ::buffa::types::put_string_field(6u32, v, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(7u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_string_field(8u32, v, buf);
-        }
         if self.created_ms != 0i64 {
-            ::buffa::types::put_int64_field(9u32, self.created_ms, buf);
+            ::buffa::types::put_int64_field(6u32, self.created_ms, buf);
         }
         if let Some(v) = self.last_used_ms {
-            ::buffa::types::put_int64_field(10u32, v, buf);
-        }
-        if self.policy_valid {
-            ::buffa::types::put_bool_field(11u32, self.policy_valid, buf);
+            ::buffa::types::put_int64_field(7u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -1901,15 +1965,6 @@ impl<'__a> ::serde::Serialize for TokenView<'__a> {
         if !self.roles.is_empty() {
             __map.serialize_entry("roles", &*self.roles)?;
         }
-        if !self.scopes.is_empty() {
-            __map.serialize_entry("scopes", &*self.scopes)?;
-        }
-        if !self.sensitive.is_empty() {
-            __map.serialize_entry("sensitive", &*self.sensitive)?;
-        }
-        if !self.deny.is_empty() {
-            __map.serialize_entry("deny", &*self.deny)?;
-        }
         if !::buffa::json_helpers::skip_if::is_zero_i64(&self.created_ms) {
             __map
                 .serialize_entry(
@@ -1920,9 +1975,6 @@ impl<'__a> ::serde::Serialize for TokenView<'__a> {
         if let ::core::option::Option::Some(__v) = self.last_used_ms {
             __map
                 .serialize_entry("lastUsedMs", &::buffa::json_helpers::ProtoJson(&__v))?;
-        }
-        if self.policy_valid {
-            __map.serialize_entry("policyValid", &self.policy_valid)?;
         }
         __map.end()
     }
@@ -2021,7 +2073,8 @@ impl TokenOwnedView {
     pub fn label(&self) -> &'_ str {
         self.0.reborrow().label
     }
-    /// `true` for the bootstrap / recovered owner token.
+    /// `true` for the bootstrap / recovered owner token, which may do
+    /// everything.
     ///
     /// Field 3: `owner`
     #[must_use]
@@ -2033,55 +2086,26 @@ impl TokenOwnedView {
     pub fn revoked(&self) -> bool {
         self.0.reborrow().revoked
     }
-    /// Role names (`<id> (deleted)` for a deleted role); `owner` for the
-    /// owner token.
+    /// Names of the roles the token holds.
     ///
     /// Field 5: `roles`
     #[must_use]
     pub fn roles(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().roles
     }
-    /// Field 6: `scopes`
-    #[must_use]
-    pub fn scopes(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().scopes
-    }
-    /// `lock`, or `camera[dev-a1* dev-b2*]` when narrowed to devices.
-    ///
-    /// Field 7: `sensitive`
-    #[must_use]
-    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().sensitive
-    }
-    /// Deny entries as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 8: `deny`
-    #[must_use]
-    pub fn deny(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().deny
-    }
     /// Unix ms.
     ///
-    /// Field 9: `created_ms`
+    /// Field 6: `created_ms`
     #[must_use]
     pub fn created_ms(&self) -> i64 {
         self.0.reborrow().created_ms
     }
     /// Unix ms; unset when never used.
     ///
-    /// Field 10: `last_used_ms`
+    /// Field 7: `last_used_ms`
     #[must_use]
     pub fn last_used_ms(&self) -> ::core::option::Option<i64> {
         self.0.reborrow().last_used_ms
-    }
-    /// `false` when the stored policy doesn't parse (deny-all).
-    ///
-    /// Field 11: `policy_valid`
-    #[must_use]
-    pub fn policy_valid(&self) -> bool {
-        self.0.reborrow().policy_valid
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<TokenView<'static>>> for TokenOwnedView {
@@ -2111,405 +2135,29 @@ impl ::serde::Serialize for TokenOwnedView {
         ::serde::Serialize::serialize(&self.0, __s)
     }
 }
-/// A role's definition.
-#[derive(Clone, Debug, Default)]
-pub struct RoleDefinitionView<'a> {
-    /// What the role grants: actions a scope can grant (`*` for all).
-    ///
-    /// Field 1: `grants`
-    pub grants: ::buffa::RepeatedView<'a, super::super::__buffa::view::SelectorView<'a>>,
-    /// Sensitive categories the role grants, on every device.
-    ///
-    /// Field 2: `sensitive`
-    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// What the role denies, whatever grants it.
-    ///
-    /// Field 3: `deny`
-    pub deny: ::buffa::RepeatedView<'a, super::super::__buffa::view::SelectorView<'a>>,
-    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
-}
-impl<'a> ::buffa::MessageView<'a> for RoleDefinitionView<'a> {
-    type Owned = super::super::RoleDefinition;
-    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
-        <Self as ::buffa::MessageView>::decode_view_ctx(
-            buf,
-            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
-        )
-    }
-    fn decode_view_with_ctx(
-        buf: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
-    }
-    #[inline]
-    fn merge_view_field(
-        &mut self,
-        tag: ::buffa::encoding::Tag,
-        cur: &'a [u8],
-        before_tag: &'a [u8],
-        ctx: ::buffa::DecodeContext<'_>,
-    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
-        let _ = ctx;
-        #[allow(unused_variables)]
-        let view = self;
-        let mut cur = cur;
-        match tag.field_number() {
-            1u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __sub_ctx = ctx.descend()?;
-                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                ctx.register_element_memory(
-                    ::core::mem::size_of::<super::super::__buffa::view::SelectorView>(),
-                )?;
-                view.grants
-                    .push(
-                        <super::super::__buffa::view::SelectorView as ::buffa::MessageView>::decode_view_ctx(
-                            sub,
-                            __sub_ctx,
-                        )?,
-                    );
-            }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.sensitive.push(__elem);
-            }
-            3u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __sub_ctx = ctx.descend()?;
-                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                ctx.register_element_memory(
-                    ::core::mem::size_of::<super::super::__buffa::view::SelectorView>(),
-                )?;
-                view.deny
-                    .push(
-                        <super::super::__buffa::view::SelectorView as ::buffa::MessageView>::decode_view_ctx(
-                            sub,
-                            __sub_ctx,
-                        )?,
-                    );
-            }
-            _ => {
-                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
-                let span_len = before_tag.len() - cur.len();
-                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
-            }
-        }
-        ::core::result::Result::Ok(cur)
-    }
-    fn to_owned_message(
-        &self,
-    ) -> ::core::result::Result<super::super::RoleDefinition, ::buffa::DecodeError> {
-        self.to_owned_from_source(None)
-    }
-    #[allow(clippy::useless_conversion, clippy::needless_update)]
-    fn to_owned_from_source(
-        &self,
-        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
-    ) -> ::core::result::Result<super::super::RoleDefinition, ::buffa::DecodeError> {
-        #[allow(unused_imports)]
-        use ::buffa::alloc::string::ToString as _;
-        let _ = __buffa_src;
-        ::core::result::Result::Ok(super::super::RoleDefinition {
-            grants: self
-                .grants
-                .iter()
-                .map(|v| v.to_owned_from_source(__buffa_src))
-                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
-            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
-            deny: self
-                .deny
-                .iter()
-                .map(|v| v.to_owned_from_source(__buffa_src))
-                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
-            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
-            ..::core::default::Default::default()
-        })
-    }
-}
-impl<'a> ::buffa::ViewEncode<'a> for RoleDefinitionView<'a> {
-    #[allow(clippy::needless_borrow, clippy::let_and_return)]
-    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        let mut size = 0u64;
-        for v in &self.grants {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
-            let __slot = __cache.reserve();
-            let inner_size = v.compute_size(__cache);
-            __cache.set(__slot, inner_size);
-            size
-                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
-                    + inner_size as u64;
-        }
-        size += self.__buffa_unknown_fields.encoded_len() as u64;
-        ::buffa::saturate_size(size)
-    }
-    #[allow(clippy::needless_borrow)]
-    fn write_to(
-        &self,
-        __cache: &mut ::buffa::SizeCache,
-        buf: &mut impl ::buffa::EncodeSink,
-    ) {
-        #[allow(unused_imports)]
-        use ::buffa::Enumeration as _;
-        for v in &self.grants {
-            ::buffa::types::put_len_delimited_header(
-                1u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
-        }
-        for v in &self.sensitive {
-            ::buffa::types::put_string_field(2u32, v, buf);
-        }
-        for v in &self.deny {
-            ::buffa::types::put_len_delimited_header(
-                3u32,
-                u64::from(__cache.consume_next()),
-                buf,
-            );
-            v.write_to(__cache, buf);
-        }
-        self.__buffa_unknown_fields.write_to(buf);
-    }
-}
-/// Serializes this view as protobuf JSON.
-///
-/// Implicit-presence fields with default values are omitted, `required`
-/// fields are always emitted, explicit-presence (`optional`) fields are
-/// emitted only when set, bytes fields are base64-encoded, and enum
-/// values are their proto name strings.
-///
-/// This impl uses `serialize_map(None)` because the number of emitted
-/// fields depends on default-omission rules; serializers that require
-/// known map lengths (e.g. `bincode`) will return a runtime error.
-/// Use the owned message type for those formats.
-impl<'__a> ::serde::Serialize for RoleDefinitionView<'__a> {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        use ::serde::ser::SerializeMap as _;
-        let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        if !self.grants.is_empty() {
-            __map.serialize_entry("grants", &*self.grants)?;
-        }
-        if !self.sensitive.is_empty() {
-            __map.serialize_entry("sensitive", &*self.sensitive)?;
-        }
-        if !self.deny.is_empty() {
-            __map.serialize_entry("deny", &*self.deny)?;
-        }
-        __map.end()
-    }
-}
-impl<'a> ::buffa::MessageName for RoleDefinitionView<'a> {
-    const PACKAGE: &'static str = "oxidhome.v1";
-    const NAME: &'static str = "RoleDefinition";
-    const FULL_NAME: &'static str = "oxidhome.v1.RoleDefinition";
-    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.RoleDefinition";
-}
-::buffa::impl_default_view_instance!(RoleDefinitionView);
-::buffa::impl_view_reborrow!(RoleDefinitionView);
-/** Self-contained, `'static` owned view of a `RoleDefinition` message.
-
- Wraps [`::buffa::OwnedView`]`<`[`RoleDefinitionView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
-
- Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`RoleDefinitionView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
-#[derive(Clone, Debug)]
-pub struct RoleDefinitionOwnedView(::buffa::OwnedView<RoleDefinitionView<'static>>);
-impl RoleDefinitionOwnedView {
-    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
-    ///
-    /// The view borrows directly from the buffer's data; the buffer is
-    /// retained inside the returned handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
-    /// protobuf data.
-    pub fn decode(
-        bytes: ::buffa::bytes::Bytes,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            RoleDefinitionOwnedView(::buffa::OwnedView::decode(bytes)?),
-        )
-    }
-    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
-    /// max message size).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
-    /// exceeds the configured limits.
-    pub fn decode_with_options(
-        bytes: ::buffa::bytes::Bytes,
-        opts: &::buffa::DecodeOptions,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            RoleDefinitionOwnedView(
-                ::buffa::OwnedView::decode_with_options(bytes, opts)?,
-            ),
-        )
-    }
-    /// Build from an owned message via an encode → decode round-trip.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
-    /// message's encoded size exceeds the 2 GiB protobuf limit, or
-    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
-    /// somehow invalid (should not happen for well-formed messages).
-    pub fn from_owned(
-        msg: &super::super::RoleDefinition,
-    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
-        ::core::result::Result::Ok(
-            RoleDefinitionOwnedView(::buffa::OwnedView::from_owned(msg)?),
-        )
-    }
-    /// Borrow the full [`RoleDefinitionView`] with its lifetime tied to `&self`.
-    #[must_use]
-    pub fn view(&self) -> &RoleDefinitionView<'_> {
-        self.0.reborrow()
-    }
-    /// Convert to the owned message type.
-    ///
-    /// Infallible: this type's constructors wire-decode their
-    /// buffer, and a view produced by wire decoding always
-    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
-    /// whose contract also governs handles converted from a raw
-    /// [`::buffa::OwnedView`].
-    #[must_use]
-    pub fn to_owned_message(&self) -> super::super::RoleDefinition {
-        self.0.to_owned_message()
-    }
-    /// The underlying bytes buffer.
-    #[must_use]
-    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
-        self.0.bytes()
-    }
-    /// Consume the handle, returning the underlying bytes buffer.
-    #[must_use]
-    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
-        self.0.into_bytes()
-    }
-    /// What the role grants: actions a scope can grant (`*` for all).
-    ///
-    /// Field 1: `grants`
-    #[must_use]
-    pub fn grants(
-        &self,
-    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::SelectorView<'_>> {
-        &self.0.reborrow().grants
-    }
-    /// Sensitive categories the role grants, on every device.
-    ///
-    /// Field 2: `sensitive`
-    #[must_use]
-    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().sensitive
-    }
-    /// What the role denies, whatever grants it.
-    ///
-    /// Field 3: `deny`
-    #[must_use]
-    pub fn deny(
-        &self,
-    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::SelectorView<'_>> {
-        &self.0.reborrow().deny
-    }
-}
-impl ::core::convert::From<::buffa::OwnedView<RoleDefinitionView<'static>>>
-for RoleDefinitionOwnedView {
-    fn from(inner: ::buffa::OwnedView<RoleDefinitionView<'static>>) -> Self {
-        RoleDefinitionOwnedView(inner)
-    }
-}
-impl ::core::convert::From<RoleDefinitionOwnedView>
-for ::buffa::OwnedView<RoleDefinitionView<'static>> {
-    fn from(wrapper: RoleDefinitionOwnedView) -> Self {
-        wrapper.0
-    }
-}
-impl ::core::convert::AsRef<::buffa::OwnedView<RoleDefinitionView<'static>>>
-for RoleDefinitionOwnedView {
-    fn as_ref(&self) -> &::buffa::OwnedView<RoleDefinitionView<'static>> {
-        &self.0
-    }
-}
-impl ::buffa::HasMessageView for super::super::RoleDefinition {
-    type View<'a> = RoleDefinitionView<'a>;
-    type ViewHandle = RoleDefinitionOwnedView;
-}
-impl ::serde::Serialize for RoleDefinitionOwnedView {
-    fn serialize<__S: ::serde::Serializer>(
-        &self,
-        __s: __S,
-    ) -> ::core::result::Result<__S::Ok, __S::Error> {
-        ::serde::Serialize::serialize(&self.0, __s)
-    }
-}
 /// One role, as listed. Same fields as the JSON API's rows.
 #[derive(Clone, Debug, Default)]
 pub struct RoleView<'a> {
-    /// Field 1: `role_id`
-    pub role_id: &'a str,
-    /// Field 2: `name`
+    /// Field 1: `name`
     pub name: &'a str,
-    /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
+    /// `true` for a built-in role.
+    ///
+    /// Field 2: `builtin`
+    pub builtin: bool,
+    /// Grants as `actions[@categories][[devices]]`.
     ///
     /// Field 3: `grants`
     pub grants: ::buffa::RepeatedView<'a, &'a str>,
-    /// Field 4: `sensitive`
-    pub sensitive: ::buffa::RepeatedView<'a, &'a str>,
-    /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 5: `deny`
-    pub deny: ::buffa::RepeatedView<'a, &'a str>,
     /// Ids of the live tokens holding the role.
     ///
-    /// Field 6: `tokens`
+    /// Field 4: `tokens`
     pub tokens: ::buffa::RepeatedView<'a, &'a str>,
-    /// Unix ms.
+    /// Unix ms; unset for a built-in role.
     ///
-    /// Field 7: `created_ms`
-    pub created_ms: i64,
-    /// Field 8: `updated_ms`
-    pub updated_ms: i64,
-    /// `false` when the stored definition doesn't parse (grants nothing).
-    ///
-    /// Field 9: `definition_valid`
-    pub definition_valid: bool,
+    /// Field 5: `created_ms`
+    pub created_ms: ::core::option::Option<i64>,
+    /// Field 6: `updated_ms`
+    pub updated_ms: ::core::option::Option<i64>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for RoleView<'a> {
@@ -2545,35 +2193,28 @@ impl<'a> ::buffa::MessageView<'a> for RoleView<'a> {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                view.role_id = ::buffa::types::borrow_str(&mut cur)?;
+                view.name = ::buffa::types::borrow_str(&mut cur)?;
             }
             2u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
+                    ::buffa::encoding::WireType::Varint,
                 )?;
-                view.name = ::buffa::types::borrow_str(&mut cur)?;
+                view.builtin = ::buffa::types::decode_bool(&mut cur)?;
             }
-            7u32 => {
+            5u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                view.created_ms = ::buffa::types::decode_int64(&mut cur)?;
+                view.created_ms = Some(::buffa::types::decode_int64(&mut cur)?);
             }
-            8u32 => {
+            6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::Varint,
                 )?;
-                view.updated_ms = ::buffa::types::decode_int64(&mut cur)?;
-            }
-            9u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.definition_valid = ::buffa::types::decode_bool(&mut cur)?;
+                view.updated_ms = Some(::buffa::types::decode_int64(&mut cur)?);
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
@@ -2587,28 +2228,6 @@ impl<'a> ::buffa::MessageView<'a> for RoleView<'a> {
                 view.grants.push(__elem);
             }
             4u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.sensitive.push(__elem);
-            }
-            5u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::LengthDelimited,
-                )?;
-                let __elem = ::buffa::types::borrow_str(&mut cur)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
-                )?;
-                view.deny.push(__elem);
-            }
-            6u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
@@ -2641,15 +2260,12 @@ impl<'a> ::buffa::MessageView<'a> for RoleView<'a> {
         use ::buffa::alloc::string::ToString as _;
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::Role {
-            role_id: self.role_id.to_string(),
             name: self.name.to_string(),
+            builtin: self.builtin,
             grants: self.grants.iter().map(|s| s.to_string()).collect(),
-            sensitive: self.sensitive.iter().map(|s| s.to_string()).collect(),
-            deny: self.deny.iter().map(|s| s.to_string()).collect(),
             tokens: self.tokens.iter().map(|s| s.to_string()).collect(),
             created_ms: self.created_ms,
             updated_ms: self.updated_ms,
-            definition_valid: self.definition_valid,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -2661,32 +2277,23 @@ impl<'a> ::buffa::ViewEncode<'a> for RoleView<'a> {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
-        if !self.role_id.is_empty() {
-            size += 1u64 + ::buffa::types::string_encoded_len(&self.role_id) as u64;
-        }
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
+        if self.builtin {
+            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        }
         for v in &self.grants {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.sensitive {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
-        }
-        for v in &self.deny {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
         for v in &self.tokens {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        if self.created_ms != 0i64 {
-            size += 1u64 + ::buffa::types::int64_encoded_len(self.created_ms) as u64;
+        if let Some(v) = self.created_ms {
+            size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
         }
-        if self.updated_ms != 0i64 {
-            size += 1u64 + ::buffa::types::int64_encoded_len(self.updated_ms) as u64;
-        }
-        if self.definition_valid {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
+        if let Some(v) = self.updated_ms {
+            size += 1u64 + ::buffa::types::int64_encoded_len(v) as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
@@ -2699,32 +2306,23 @@ impl<'a> ::buffa::ViewEncode<'a> for RoleView<'a> {
     ) {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
-        if !self.role_id.is_empty() {
-            ::buffa::types::put_string_field(1u32, &self.role_id, buf);
-        }
         if !self.name.is_empty() {
-            ::buffa::types::put_string_field(2u32, &self.name, buf);
+            ::buffa::types::put_string_field(1u32, &self.name, buf);
+        }
+        if self.builtin {
+            ::buffa::types::put_bool_field(2u32, self.builtin, buf);
         }
         for v in &self.grants {
             ::buffa::types::put_string_field(3u32, v, buf);
         }
-        for v in &self.sensitive {
+        for v in &self.tokens {
             ::buffa::types::put_string_field(4u32, v, buf);
         }
-        for v in &self.deny {
-            ::buffa::types::put_string_field(5u32, v, buf);
+        if let Some(v) = self.created_ms {
+            ::buffa::types::put_int64_field(5u32, v, buf);
         }
-        for v in &self.tokens {
-            ::buffa::types::put_string_field(6u32, v, buf);
-        }
-        if self.created_ms != 0i64 {
-            ::buffa::types::put_int64_field(7u32, self.created_ms, buf);
-        }
-        if self.updated_ms != 0i64 {
-            ::buffa::types::put_int64_field(8u32, self.updated_ms, buf);
-        }
-        if self.definition_valid {
-            ::buffa::types::put_bool_field(9u32, self.definition_valid, buf);
+        if let Some(v) = self.updated_ms {
+            ::buffa::types::put_int64_field(6u32, v, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2747,40 +2345,23 @@ impl<'__a> ::serde::Serialize for RoleView<'__a> {
     ) -> ::core::result::Result<__S::Ok, __S::Error> {
         use ::serde::ser::SerializeMap as _;
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
-        if !::buffa::json_helpers::skip_if::is_empty_str(self.role_id) {
-            __map.serialize_entry("roleId", self.role_id)?;
-        }
         if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
             __map.serialize_entry("name", self.name)?;
+        }
+        if self.builtin {
+            __map.serialize_entry("builtin", &self.builtin)?;
         }
         if !self.grants.is_empty() {
             __map.serialize_entry("grants", &*self.grants)?;
         }
-        if !self.sensitive.is_empty() {
-            __map.serialize_entry("sensitive", &*self.sensitive)?;
-        }
-        if !self.deny.is_empty() {
-            __map.serialize_entry("deny", &*self.deny)?;
-        }
         if !self.tokens.is_empty() {
             __map.serialize_entry("tokens", &*self.tokens)?;
         }
-        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.created_ms) {
-            __map
-                .serialize_entry(
-                    "createdMs",
-                    &::buffa::json_helpers::ProtoJson(&self.created_ms),
-                )?;
+        if let ::core::option::Option::Some(__v) = self.created_ms {
+            __map.serialize_entry("createdMs", &::buffa::json_helpers::ProtoJson(&__v))?;
         }
-        if !::buffa::json_helpers::skip_if::is_zero_i64(&self.updated_ms) {
-            __map
-                .serialize_entry(
-                    "updatedMs",
-                    &::buffa::json_helpers::ProtoJson(&self.updated_ms),
-                )?;
-        }
-        if self.definition_valid {
-            __map.serialize_entry("definitionValid", &self.definition_valid)?;
+        if let ::core::option::Option::Some(__v) = self.updated_ms {
+            __map.serialize_entry("updatedMs", &::buffa::json_helpers::ProtoJson(&__v))?;
         }
         __map.end()
     }
@@ -2869,64 +2450,43 @@ impl RoleOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// Field 1: `role_id`
-    #[must_use]
-    pub fn role_id(&self) -> &'_ str {
-        self.0.reborrow().role_id
-    }
-    /// Field 2: `name`
+    /// Field 1: `name`
     #[must_use]
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Grants as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
+    /// `true` for a built-in role.
+    ///
+    /// Field 2: `builtin`
+    #[must_use]
+    pub fn builtin(&self) -> bool {
+        self.0.reborrow().builtin
+    }
+    /// Grants as `actions[@categories][[devices]]`.
     ///
     /// Field 3: `grants`
     #[must_use]
     pub fn grants(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().grants
     }
-    /// Field 4: `sensitive`
-    #[must_use]
-    pub fn sensitive(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().sensitive
-    }
-    /// Denies as `actions@categories[devices]`, or `actions{services}`
-    /// for one narrowed to services (comma-separated patterns; the
-    /// pattern grammar admits no comma, space or brace).
-    ///
-    /// Field 5: `deny`
-    #[must_use]
-    pub fn deny(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
-        &self.0.reborrow().deny
-    }
     /// Ids of the live tokens holding the role.
     ///
-    /// Field 6: `tokens`
+    /// Field 4: `tokens`
     #[must_use]
     pub fn tokens(&self) -> &::buffa::RepeatedView<'_, &'_ str> {
         &self.0.reborrow().tokens
     }
-    /// Unix ms.
+    /// Unix ms; unset for a built-in role.
     ///
-    /// Field 7: `created_ms`
+    /// Field 5: `created_ms`
     #[must_use]
-    pub fn created_ms(&self) -> i64 {
+    pub fn created_ms(&self) -> ::core::option::Option<i64> {
         self.0.reborrow().created_ms
     }
-    /// Field 8: `updated_ms`
+    /// Field 6: `updated_ms`
     #[must_use]
-    pub fn updated_ms(&self) -> i64 {
+    pub fn updated_ms(&self) -> ::core::option::Option<i64> {
         self.0.reborrow().updated_ms
-    }
-    /// `false` when the stored definition doesn't parse (grants nothing).
-    ///
-    /// Field 9: `definition_valid`
-    #[must_use]
-    pub fn definition_valid(&self) -> bool {
-        self.0.reborrow().definition_valid
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<RoleView<'static>>> for RoleOwnedView {
@@ -3453,14 +3013,15 @@ impl ::serde::Serialize for ListRolesResponseOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct CreateRoleRequestView<'a> {
-    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner`.
+    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner` or a
+    /// built-in role's name.
     ///
     /// Field 1: `name`
     pub name: &'a str,
-    /// Field 2: `definition`
-    pub definition: ::buffa::MessageFieldView<
-        super::super::__buffa::view::RoleDefinitionView<'a>,
-    >,
+    /// Required (INVALID_ARGUMENT when unset); empty grants nothing.
+    ///
+    /// Field 2: `grants`
+    pub grants: ::buffa::MessageFieldView<super::super::__buffa::view::GrantsView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for CreateRoleRequestView<'a> {
@@ -3505,13 +3066,13 @@ impl<'a> ::buffa::MessageView<'a> for CreateRoleRequestView<'a> {
                 )?;
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                match view.definition.as_mut() {
+                match view.grants.as_mut() {
                     Some(existing) => {
                         ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
                     }
                     None => {
-                        view.definition = ::buffa::MessageFieldView::set(
-                            <super::super::__buffa::view::RoleDefinitionView as ::buffa::MessageView>::decode_view_ctx(
+                        view.grants = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::GrantsView as ::buffa::MessageView>::decode_view_ctx(
                                 sub,
                                 __sub_ctx,
                             )?,
@@ -3542,11 +3103,11 @@ impl<'a> ::buffa::MessageView<'a> for CreateRoleRequestView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::CreateRoleRequest {
             name: self.name.to_string(),
-            definition: match self.definition.as_option() {
+            grants: match self.grants.as_option() {
                 Some(v) => {
                     ::buffa::MessageField::<
-                        super::super::RoleDefinition,
-                        ::buffa::Inline<super::super::RoleDefinition>,
+                        super::super::Grants,
+                        ::buffa::Inline<super::super::Grants>,
                     >::some(v.to_owned_from_source(__buffa_src)?)
                 }
                 None => ::buffa::MessageField::none(),
@@ -3565,9 +3126,9 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateRoleRequestView<'a> {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.definition.is_set() {
+        if self.grants.is_set() {
             let __slot = __cache.reserve();
-            let inner_size = self.definition.compute_size(__cache);
+            let inner_size = self.grants.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -3587,13 +3148,13 @@ impl<'a> ::buffa::ViewEncode<'a> for CreateRoleRequestView<'a> {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        if self.definition.is_set() {
+        if self.grants.is_set() {
             ::buffa::types::put_len_delimited_header(
                 2u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.definition.write_to(__cache, buf);
+            self.grants.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -3620,8 +3181,8 @@ impl<'__a> ::serde::Serialize for CreateRoleRequestView<'__a> {
             __map.serialize_entry("name", self.name)?;
         }
         {
-            if let ::core::option::Option::Some(__v) = self.definition.as_option() {
-                __map.serialize_entry("definition", __v)?;
+            if let ::core::option::Option::Some(__v) = self.grants.as_option() {
+                __map.serialize_entry("grants", __v)?;
             }
         }
         __map.end()
@@ -3719,21 +3280,22 @@ impl CreateRoleRequestOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner`.
+    /// 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner` or a
+    /// built-in role's name.
     ///
     /// Field 1: `name`
     #[must_use]
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Field 2: `definition`
+    /// Required (INVALID_ARGUMENT when unset); empty grants nothing.
+    ///
+    /// Field 2: `grants`
     #[must_use]
-    pub fn definition(
+    pub fn grants(
         &self,
-    ) -> &::buffa::MessageFieldView<
-        super::super::__buffa::view::RoleDefinitionView<'_>,
-    > {
-        &self.0.reborrow().definition
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::GrantsView<'_>> {
+        &self.0.reborrow().grants
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<CreateRoleRequestView<'static>>>
@@ -3759,6 +3321,272 @@ impl ::buffa::HasMessageView for super::super::CreateRoleRequest {
     type ViewHandle = CreateRoleRequestOwnedView;
 }
 impl ::serde::Serialize for CreateRoleRequestOwnedView {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        ::serde::Serialize::serialize(&self.0, __s)
+    }
+}
+/// A role's grants, with presence: an unset field is refused rather
+/// than read as "no grants".
+#[derive(Clone, Debug, Default)]
+pub struct GrantsView<'a> {
+    /// Field 1: `grants`
+    pub grants: ::buffa::RepeatedView<'a, super::super::__buffa::view::GrantView<'a>>,
+    pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
+}
+impl<'a> ::buffa::MessageView<'a> for GrantsView<'a> {
+    type Owned = super::super::Grants;
+    fn decode_view(buf: &'a [u8]) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        let __limit = ::core::cell::Cell::new(::buffa::DEFAULT_UNKNOWN_FIELD_LIMIT);
+        <Self as ::buffa::MessageView>::decode_view_ctx(
+            buf,
+            ::buffa::DecodeContext::new(::buffa::RECURSION_LIMIT, &__limit),
+        )
+    }
+    fn decode_view_with_ctx(
+        buf: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        <Self as ::buffa::MessageView>::decode_view_ctx(buf, ctx)
+    }
+    #[inline]
+    fn merge_view_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        cur: &'a [u8],
+        before_tag: &'a [u8],
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<&'a [u8], ::buffa::DecodeError> {
+        let _ = ctx;
+        #[allow(unused_variables)]
+        let view = self;
+        let mut cur = cur;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __sub_ctx = ctx.descend()?;
+                let sub = ::buffa::types::borrow_bytes(&mut cur)?;
+                ctx.register_element_memory(
+                    ::core::mem::size_of::<super::super::__buffa::view::GrantView>(),
+                )?;
+                view.grants
+                    .push(
+                        <super::super::__buffa::view::GrantView as ::buffa::MessageView>::decode_view_ctx(
+                            sub,
+                            __sub_ctx,
+                        )?,
+                    );
+            }
+            _ => {
+                ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
+                let span_len = before_tag.len() - cur.len();
+                view.__buffa_unknown_fields.push_record(before_tag, span_len, ctx)?;
+            }
+        }
+        ::core::result::Result::Ok(cur)
+    }
+    fn to_owned_message(
+        &self,
+    ) -> ::core::result::Result<super::super::Grants, ::buffa::DecodeError> {
+        self.to_owned_from_source(None)
+    }
+    #[allow(clippy::useless_conversion, clippy::needless_update)]
+    fn to_owned_from_source(
+        &self,
+        __buffa_src: ::core::option::Option<&::buffa::bytes::Bytes>,
+    ) -> ::core::result::Result<super::super::Grants, ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::alloc::string::ToString as _;
+        let _ = __buffa_src;
+        ::core::result::Result::Ok(super::super::Grants {
+            grants: self
+                .grants
+                .iter()
+                .map(|v| v.to_owned_from_source(__buffa_src))
+                .collect::<::core::result::Result<_, ::buffa::DecodeError>>()?,
+            __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
+            ..::core::default::Default::default()
+        })
+    }
+}
+impl<'a> ::buffa::ViewEncode<'a> for GrantsView<'a> {
+    #[allow(clippy::needless_borrow, clippy::let_and_return)]
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        for v in &self.grants {
+            let __slot = __cache.reserve();
+            let inner_size = v.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    #[allow(clippy::needless_borrow)]
+    fn write_to(
+        &self,
+        __cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        for v in &self.grants {
+            ::buffa::types::put_len_delimited_header(
+                1u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            v.write_to(__cache, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+}
+/// Serializes this view as protobuf JSON.
+///
+/// Implicit-presence fields with default values are omitted, `required`
+/// fields are always emitted, explicit-presence (`optional`) fields are
+/// emitted only when set, bytes fields are base64-encoded, and enum
+/// values are their proto name strings.
+///
+/// This impl uses `serialize_map(None)` because the number of emitted
+/// fields depends on default-omission rules; serializers that require
+/// known map lengths (e.g. `bincode`) will return a runtime error.
+/// Use the owned message type for those formats.
+impl<'__a> ::serde::Serialize for GrantsView<'__a> {
+    fn serialize<__S: ::serde::Serializer>(
+        &self,
+        __s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
+        use ::serde::ser::SerializeMap as _;
+        let mut __map = __s.serialize_map(::core::option::Option::None)?;
+        if !self.grants.is_empty() {
+            __map.serialize_entry("grants", &*self.grants)?;
+        }
+        __map.end()
+    }
+}
+impl<'a> ::buffa::MessageName for GrantsView<'a> {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "Grants";
+    const FULL_NAME: &'static str = "oxidhome.v1.Grants";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Grants";
+}
+::buffa::impl_default_view_instance!(GrantsView);
+::buffa::impl_view_reborrow!(GrantsView);
+/** Self-contained, `'static` owned view of a `Grants` message.
+
+ Wraps [`::buffa::OwnedView`]`<`[`GrantsView`]`<'static>>`: the decoded view and the [`::buffa::bytes::Bytes`] buffer it borrows from travel together, so the handle is `'static` and `Send + Sync` — suitable for async handlers, spawned tasks, and anywhere a `'static` bound is required.
+
+ Field accessors return borrows tied to `&self`. Use [`Self::view`] to get the full [`GrantsView`] when you need struct patterns, iteration helpers, or to pass the view to lifetime-parameterised code.*/
+#[derive(Clone, Debug)]
+pub struct GrantsOwnedView(::buffa::OwnedView<GrantsView<'static>>);
+impl GrantsOwnedView {
+    /// Decode an owned view from a [`::buffa::bytes::Bytes`] buffer.
+    ///
+    /// The view borrows directly from the buffer's data; the buffer is
+    /// retained inside the returned handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer contains invalid
+    /// protobuf data.
+    pub fn decode(
+        bytes: ::buffa::bytes::Bytes,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(GrantsOwnedView(::buffa::OwnedView::decode(bytes)?))
+    }
+    /// Decode with custom [`::buffa::DecodeOptions`] (recursion limit,
+    /// max message size).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError`] if the buffer is invalid or
+    /// exceeds the configured limits.
+    pub fn decode_with_options(
+        bytes: ::buffa::bytes::Bytes,
+        opts: &::buffa::DecodeOptions,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(
+            GrantsOwnedView(::buffa::OwnedView::decode_with_options(bytes, opts)?),
+        )
+    }
+    /// Build from an owned message via an encode → decode round-trip.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`::buffa::DecodeError::MessageTooLarge`] if the
+    /// message's encoded size exceeds the 2 GiB protobuf limit, or
+    /// another [`::buffa::DecodeError`] if the re-encoded bytes are
+    /// somehow invalid (should not happen for well-formed messages).
+    pub fn from_owned(
+        msg: &super::super::Grants,
+    ) -> ::core::result::Result<Self, ::buffa::DecodeError> {
+        ::core::result::Result::Ok(GrantsOwnedView(::buffa::OwnedView::from_owned(msg)?))
+    }
+    /// Borrow the full [`GrantsView`] with its lifetime tied to `&self`.
+    #[must_use]
+    pub fn view(&self) -> &GrantsView<'_> {
+        self.0.reborrow()
+    }
+    /// Convert to the owned message type.
+    ///
+    /// Infallible: this type's constructors wire-decode their
+    /// buffer, and a view produced by wire decoding always
+    /// converts. Delegates to [`::buffa::OwnedView::to_owned_message`],
+    /// whose contract also governs handles converted from a raw
+    /// [`::buffa::OwnedView`].
+    #[must_use]
+    pub fn to_owned_message(&self) -> super::super::Grants {
+        self.0.to_owned_message()
+    }
+    /// The underlying bytes buffer.
+    #[must_use]
+    pub fn bytes(&self) -> &::buffa::bytes::Bytes {
+        self.0.bytes()
+    }
+    /// Consume the handle, returning the underlying bytes buffer.
+    #[must_use]
+    pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
+        self.0.into_bytes()
+    }
+    /// Field 1: `grants`
+    #[must_use]
+    pub fn grants(
+        &self,
+    ) -> &::buffa::RepeatedView<'_, super::super::__buffa::view::GrantView<'_>> {
+        &self.0.reborrow().grants
+    }
+}
+impl ::core::convert::From<::buffa::OwnedView<GrantsView<'static>>> for GrantsOwnedView {
+    fn from(inner: ::buffa::OwnedView<GrantsView<'static>>) -> Self {
+        GrantsOwnedView(inner)
+    }
+}
+impl ::core::convert::From<GrantsOwnedView> for ::buffa::OwnedView<GrantsView<'static>> {
+    fn from(wrapper: GrantsOwnedView) -> Self {
+        wrapper.0
+    }
+}
+impl ::core::convert::AsRef<::buffa::OwnedView<GrantsView<'static>>>
+for GrantsOwnedView {
+    fn as_ref(&self) -> &::buffa::OwnedView<GrantsView<'static>> {
+        &self.0
+    }
+}
+impl ::buffa::HasMessageView for super::super::Grants {
+    type View<'a> = GrantsView<'a>;
+    type ViewHandle = GrantsOwnedView;
+}
+impl ::serde::Serialize for GrantsOwnedView {
     fn serialize<__S: ::serde::Serializer>(
         &self,
         __s: __S,
@@ -4053,10 +3881,12 @@ impl ::serde::Serialize for CreateRoleResponseOwnedView {
 pub struct UpdateRoleRequestView<'a> {
     /// Field 1: `name`
     pub name: &'a str,
-    /// Field 2: `definition`
-    pub definition: ::buffa::MessageFieldView<
-        super::super::__buffa::view::RoleDefinitionView<'a>,
-    >,
+    /// The replacement grants. Required (INVALID_ARGUMENT when unset, so
+    /// an omitted field can't wipe the role); set but empty grants
+    /// nothing.
+    ///
+    /// Field 2: `grants`
+    pub grants: ::buffa::MessageFieldView<super::super::__buffa::view::GrantsView<'a>>,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for UpdateRoleRequestView<'a> {
@@ -4101,13 +3931,13 @@ impl<'a> ::buffa::MessageView<'a> for UpdateRoleRequestView<'a> {
                 )?;
                 let __sub_ctx = ctx.descend()?;
                 let sub = ::buffa::types::borrow_bytes(&mut cur)?;
-                match view.definition.as_mut() {
+                match view.grants.as_mut() {
                     Some(existing) => {
                         ::buffa::MessageView::merge_into_view(existing, sub, __sub_ctx)?
                     }
                     None => {
-                        view.definition = ::buffa::MessageFieldView::set(
-                            <super::super::__buffa::view::RoleDefinitionView as ::buffa::MessageView>::decode_view_ctx(
+                        view.grants = ::buffa::MessageFieldView::set(
+                            <super::super::__buffa::view::GrantsView as ::buffa::MessageView>::decode_view_ctx(
                                 sub,
                                 __sub_ctx,
                             )?,
@@ -4138,11 +3968,11 @@ impl<'a> ::buffa::MessageView<'a> for UpdateRoleRequestView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::UpdateRoleRequest {
             name: self.name.to_string(),
-            definition: match self.definition.as_option() {
+            grants: match self.grants.as_option() {
                 Some(v) => {
                     ::buffa::MessageField::<
-                        super::super::RoleDefinition,
-                        ::buffa::Inline<super::super::RoleDefinition>,
+                        super::super::Grants,
+                        ::buffa::Inline<super::super::Grants>,
                     >::some(v.to_owned_from_source(__buffa_src)?)
                 }
                 None => ::buffa::MessageField::none(),
@@ -4161,9 +3991,9 @@ impl<'a> ::buffa::ViewEncode<'a> for UpdateRoleRequestView<'a> {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.definition.is_set() {
+        if self.grants.is_set() {
             let __slot = __cache.reserve();
-            let inner_size = self.definition.compute_size(__cache);
+            let inner_size = self.grants.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -4183,13 +4013,13 @@ impl<'a> ::buffa::ViewEncode<'a> for UpdateRoleRequestView<'a> {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        if self.definition.is_set() {
+        if self.grants.is_set() {
             ::buffa::types::put_len_delimited_header(
                 2u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.definition.write_to(__cache, buf);
+            self.grants.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4216,8 +4046,8 @@ impl<'__a> ::serde::Serialize for UpdateRoleRequestView<'__a> {
             __map.serialize_entry("name", self.name)?;
         }
         {
-            if let ::core::option::Option::Some(__v) = self.definition.as_option() {
-                __map.serialize_entry("definition", __v)?;
+            if let ::core::option::Option::Some(__v) = self.grants.as_option() {
+                __map.serialize_entry("grants", __v)?;
             }
         }
         __map.end()
@@ -4320,14 +4150,16 @@ impl UpdateRoleRequestOwnedView {
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Field 2: `definition`
+    /// The replacement grants. Required (INVALID_ARGUMENT when unset, so
+    /// an omitted field can't wipe the role); set but empty grants
+    /// nothing.
+    ///
+    /// Field 2: `grants`
     #[must_use]
-    pub fn definition(
+    pub fn grants(
         &self,
-    ) -> &::buffa::MessageFieldView<
-        super::super::__buffa::view::RoleDefinitionView<'_>,
-    > {
-        &self.0.reborrow().definition
+    ) -> &::buffa::MessageFieldView<super::super::__buffa::view::GrantsView<'_>> {
+        &self.0.reborrow().grants
     }
 }
 impl ::core::convert::From<::buffa::OwnedView<UpdateRoleRequestView<'static>>>
@@ -4647,11 +4479,6 @@ impl ::serde::Serialize for UpdateRoleResponseOwnedView {
 pub struct DeleteRoleRequestView<'a> {
     /// Field 1: `name`
     pub name: &'a str,
-    /// Delete even while live tokens hold the role; their reference then
-    /// grants nothing.
-    ///
-    /// Field 2: `force`
-    pub force: bool,
     pub __buffa_unknown_fields: ::buffa::UnknownFieldsView<'a>,
 }
 impl<'a> ::buffa::MessageView<'a> for DeleteRoleRequestView<'a> {
@@ -4689,13 +4516,6 @@ impl<'a> ::buffa::MessageView<'a> for DeleteRoleRequestView<'a> {
                 )?;
                 view.name = ::buffa::types::borrow_str(&mut cur)?;
             }
-            2u32 => {
-                ::buffa::encoding::check_wire_type(
-                    tag,
-                    ::buffa::encoding::WireType::Varint,
-                )?;
-                view.force = ::buffa::types::decode_bool(&mut cur)?;
-            }
             _ => {
                 ::buffa::encoding::skip_field_depth(tag, &mut cur, ctx.depth())?;
                 let span_len = before_tag.len() - cur.len();
@@ -4719,7 +4539,6 @@ impl<'a> ::buffa::MessageView<'a> for DeleteRoleRequestView<'a> {
         let _ = __buffa_src;
         ::core::result::Result::Ok(super::super::DeleteRoleRequest {
             name: self.name.to_string(),
-            force: self.force,
             __buffa_unknown_fields: self.__buffa_unknown_fields.to_owned()?.into(),
             ..::core::default::Default::default()
         })
@@ -4734,9 +4553,6 @@ impl<'a> ::buffa::ViewEncode<'a> for DeleteRoleRequestView<'a> {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.force {
-            size += 1u64 + ::buffa::types::BOOL_ENCODED_LEN as u64;
-        }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
@@ -4750,9 +4566,6 @@ impl<'a> ::buffa::ViewEncode<'a> for DeleteRoleRequestView<'a> {
         use ::buffa::Enumeration as _;
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
-        }
-        if self.force {
-            ::buffa::types::put_bool_field(2u32, self.force, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -4777,9 +4590,6 @@ impl<'__a> ::serde::Serialize for DeleteRoleRequestView<'__a> {
         let mut __map = __s.serialize_map(::core::option::Option::None)?;
         if !::buffa::json_helpers::skip_if::is_empty_str(self.name) {
             __map.serialize_entry("name", self.name)?;
-        }
-        if self.force {
-            __map.serialize_entry("force", &self.force)?;
         }
         __map.end()
     }
@@ -4881,14 +4691,6 @@ impl DeleteRoleRequestOwnedView {
     pub fn name(&self) -> &'_ str {
         self.0.reborrow().name
     }
-    /// Delete even while live tokens hold the role; their reference then
-    /// grants nothing.
-    ///
-    /// Field 2: `force`
-    #[must_use]
-    pub fn force(&self) -> bool {
-        self.0.reborrow().force
-    }
 }
 impl ::core::convert::From<::buffa::OwnedView<DeleteRoleRequestView<'static>>>
 for DeleteRoleRequestOwnedView {
@@ -4922,7 +4724,7 @@ impl ::serde::Serialize for DeleteRoleRequestOwnedView {
 }
 #[derive(Clone, Debug, Default)]
 pub struct DeleteRoleResponseView<'a> {
-    /// The deleted role, with the tokens that held it.
+    /// The deleted role.
     ///
     /// Field 1: `role`
     pub role: ::buffa::MessageFieldView<super::super::__buffa::view::RoleView<'a>>,
@@ -5167,7 +4969,7 @@ impl DeleteRoleResponseOwnedView {
     pub fn into_bytes(self) -> ::buffa::bytes::Bytes {
         self.0.into_bytes()
     }
-    /// The deleted role, with the tokens that held it.
+    /// The deleted role.
     ///
     /// Field 1: `role`
     #[must_use]

@@ -1,20 +1,20 @@
-//! H6 slice 3: tokens minted by role, end to end.
+//! Tokens minted by role, end to end.
 //!
 //! The owner mints role tokens over REST and Connect (and the offline
 //! CLI); nobody else can. A `dashboard` token lists, reads and commands
 //! light devices only: a `simulated-switch` device is a `switch` until
-//! the owner raises it to `light`, then a `lock`. An `assistant` token
-//! never commands a lock, even with the `lock` grant.
+//! the owner raises it to `light`, then a `lock`. Only a role grant
+//! naming `lock` reaches it then.
 
 #[path = "support.rs"]
 mod support;
 
+use support::Mint;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use oxidhome_core::Engine;
-use oxidhome_core::api::sensitive_admin::grant_sensitive;
 use oxidhome_core::api::{build_router, ensure_admin_token};
-use oxidhome_core::auth::SensitiveCategory;
 use oxidhome_core::state::AuditQuery;
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -80,9 +80,9 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     let category_uri = format!("/api/v1/devices/{device}/category");
     let router = build_router(engine.clone());
 
-    // Only the owner defines roles and mints; the wildcard can't, and
+    // Only the owner defines roles and mints; `admin` can't, and
     // neither list nor body shape leaks to it.
-    let wildcard = engine.auth_tokens().create("ha", br#"["*"]"#).unwrap();
+    let admin = engine.auth_tokens().create("ha", &["admin"]).unwrap();
     let read = json!([
         "device.list",
         "device.read",
@@ -98,8 +98,7 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
             {"actions": ["device.list", "device.read", "device.command"], "category": ["light"]}]}),
         json!({"name": "monitor", "grants": [{"actions": read}]}),
         json!({"name": "assistant",
-            "grants": [{"actions": read}, {"actions": ["device.command"], "category": ["light"]}],
-            "deny": [{"actions": ["device.command"], "category": ["lock"]}]}),
+            "grants": [{"actions": read}, {"actions": ["device.command"], "category": ["light"]}]}),
         json!({"name": "resident", "grants": [{"actions": read},
             {"actions": ["device.command", "blob.read"]}]}),
     ];
@@ -107,12 +106,12 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
         &router,
         "POST",
         "/api/v1/roles",
-        &wildcard.plaintext,
+        &admin.plaintext,
         &roles[0].to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = send(&router, "GET", "/api/v1/roles", &wildcard.plaintext, "").await;
+    let (status, _) = send(&router, "GET", "/api/v1/roles", &admin.plaintext, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     for role in &roles {
         let (status, body) = send(
@@ -135,8 +134,10 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     for bad in [
-        json!({"name": "owner"}),
+        json!({"name": "owner", "grants": []}),
+        json!({"name": "member", "grants": []}),
         json!({"name": "x", "grants": [{"actions": ["token.manage"]}]}),
+        json!({"name": "x", "grants": [], "deny": []}),
         json!({"name": "x", "grants": [{"actions": ["device.read"], "category": ["door"]}]}),
     ] {
         let (status, body) = send(
@@ -150,18 +151,11 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
     let mint = json!({"label": "hall tablet", "roles": ["dashboard"]}).to_string();
-    let (status, _) = send(
-        &router,
-        "POST",
-        "/api/v1/tokens",
-        &wildcard.plaintext,
-        &mint,
-    )
-    .await;
+    let (status, _) = send(&router, "POST", "/api/v1/tokens", &admin.plaintext, &mint).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = send(&router, "POST", "/api/v1/tokens", &wildcard.plaintext, "{").await;
+    let (status, _) = send(&router, "POST", "/api/v1/tokens", &admin.plaintext, "{").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = send(&router, "GET", "/api/v1/tokens", &wildcard.plaintext, "").await;
+    let (status, _) = send(&router, "GET", "/api/v1/tokens", &admin.plaintext, "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let (status, created) = send(&router, "POST", "/api/v1/tokens", &owner.plaintext, &mint).await;
@@ -177,7 +171,8 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
         json!({"label": "x", "roles": ["nope"]}),
         json!({"label": "admin", "roles": ["monitor"]}),
         json!({"label": "x", "roles": ["monitor"], "extra": 1}),
-        json!({"label": "x", "roles": ["monitor"], "deny": [{"actions": ["nope"]}]}),
+        json!({"label": "x", "roles": ["monitor"], "scopes": ["*"]}),
+        json!({"label": "x", "roles": []}),
     ] {
         let (status, body) = send(
             &router,
@@ -194,7 +189,8 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     assert_eq!(status, StatusCode::OK);
     let rows = list["tokens"].as_array().unwrap();
     assert_eq!(rows.len(), 3, "{list}");
-    assert_eq!(rows[0]["roles"], json!(["owner"]));
+    assert_eq!(rows[0]["owner"], true);
+    assert_eq!(rows[0]["roles"], json!([]));
     let row = rows.iter().find(|r| r["token_id"] == dashboard_id).unwrap();
     assert_eq!(row["label"], "hall tablet");
     assert!(
@@ -276,17 +272,16 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // An assistant with the lock grant still can't command a lock.
+    // An assistant can't command a lock: no grant of its role names it.
     let (_, created) = send(
         &router,
         "POST",
         "/api/v1/tokens",
         &owner.plaintext,
-        &json!({"label": "llm", "roles": ["assistant"], "sensitive": ["lock"]}).to_string(),
+        &json!({"label": "llm", "roles": ["assistant"]}).to_string(),
     )
     .await;
     let assistant = created["token"].as_str().unwrap().to_owned();
-    assert_eq!(created["sensitive"], json!(["lock"]));
     let (status, _) = send(&router, "POST", &command_uri, &assistant, TOGGLE).await;
     assert_eq!(status, StatusCode::OK, "a light is in the assistant's role");
     let (status, _) = send(
@@ -314,11 +309,11 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     assert!(
         denied
             .iter()
-            .any(|r| r.required_scope.as_deref() == Some("deny")),
+            .any(|r| r.required_scope.as_deref() == Some("device.command")),
         "{denied:?}"
     );
 
-    // A resident with the lock grant reaches it (role + explicit grant).
+    // A resident reaches it once its role names `lock`.
     let (_, created) = send(
         &router,
         "POST",
@@ -329,20 +324,23 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     .await;
     let resident = created["token"].as_str().unwrap().to_owned();
     let (status, _) = send(&router, "POST", &command_uri, &resident, TOGGLE).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "no lock grant yet");
-    grant_sensitive(
-        &engine.auth_tokens(),
-        &engine.audit_log(),
-        created["token_id"].as_str().unwrap(),
-        SensitiveCategory::Lock,
-        &[],
-    )
-    .unwrap();
-    let (status, body) = send(&router, "POST", &command_uri, &resident, TOGGLE).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "no grant names lock yet");
     let resident_id = created["token_id"].as_str().unwrap().to_owned();
 
-    // Tokens hold a role by id: an edit applies from the next request.
+    // Tokens hold a role by name: an edit applies from the next request.
+    let (status, body) = send(
+        &router,
+        "PUT",
+        "/api/v1/roles/resident",
+        &owner.plaintext,
+        &json!({"grants": [{"actions": read},
+            {"actions": ["device.command"], "category": ["lock"]}]})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&router, "POST", &command_uri, &resident, TOGGLE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = send(
         &router,
         "PUT",
@@ -367,8 +365,7 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // A held role is deleted only when forced; the reference then
-    // grants nothing.
+    // A held role can't be deleted; built-in roles can't be at all.
     let (status, body) = send(
         &router,
         "DELETE",
@@ -381,29 +378,12 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     let (status, body) = send(
         &router,
         "DELETE",
-        "/api/v1/roles/resident?force=true",
+        "/api/v1/roles/admin",
         &owner.plaintext,
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, _) = send(&router, "GET", "/api/v1/devices", &resident, "").await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a deleted role grants nothing"
-    );
-    let (_, list) = send(&router, "GET", "/api/v1/tokens", &owner.plaintext, "").await;
-    let row = list["tokens"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["token_id"] == resident_id)
-        .unwrap();
-    assert!(
-        row["roles"][0].as_str().unwrap().ends_with("(deleted)"),
-        "{row}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, list) = send(&router, "GET", "/api/v1/roles", &owner.plaintext, "").await;
     assert_eq!(status, StatusCode::OK);
     let names: Vec<&str> = list["roles"]
@@ -412,7 +392,19 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
         .iter()
         .map(|r| r["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["assistant", "dashboard", "monitor"]);
+    assert_eq!(
+        names,
+        [
+            "admin",
+            "member",
+            "guest",
+            "agent",
+            "assistant",
+            "dashboard",
+            "monitor",
+            "resident"
+        ]
+    );
     let audit = engine
         .audit_log()
         .query(&AuditQuery::default(), 200)
@@ -420,7 +412,6 @@ async fn role_tokens_minted_by_the_owner_reach_only_their_devices() {
     for path in [
         "api.auth.role.create:dashboard",
         "api.auth.role.update:resident",
-        "api.auth.role.delete-forced:resident",
     ] {
         assert!(audit.iter().any(|r| r.path == path), "{path}");
     }
@@ -456,18 +447,18 @@ async fn connect_tokens_service_is_owner_only() {
     let owner = ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), state.path())
         .expect("bootstrap")
         .expect("owner");
-    let wildcard = engine.auth_tokens().create("ha", br#"["*"]"#).unwrap();
+    let wildcard = engine.auth_tokens().mint("ha", &["*"]).unwrap();
     let router = build_router(engine.clone());
-    let guest = json!({"name": "guest", "definition": {"grants": [
+    let visitor = json!({"name": "visitor", "grants": {"grants": [
         {"actions": ["device.list", "device.read", "device.command"],
-         "category": ["light", "media", "climate"]}]}})
+         "category": {"names": ["light", "media", "climate"]}}]}})
     .to_string();
     let (status, body) = send(
         &router,
         "POST",
         "/oxidhome.v1.RolesService/CreateRole",
         &wildcard.plaintext,
-        &guest,
+        &visitor,
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -476,11 +467,11 @@ async fn connect_tokens_service_is_owner_only() {
         "POST",
         "/oxidhome.v1.RolesService/CreateRole",
         &owner.plaintext,
-        &guest,
+        &visitor,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["role"]["name"], "guest");
+    assert_eq!(body["role"]["name"], "visitor");
     assert_eq!(
         body["role"]["grants"],
         json!(["device.list,device.read,device.command@light,media,climate"])
@@ -490,17 +481,12 @@ async fn connect_tokens_service_is_owner_only() {
         "POST",
         "/oxidhome.v1.RolesService/CreateRole",
         &owner.plaintext,
-        &guest,
+        &visitor,
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "already_exists");
-    let create = json!({
-        "label": "wall",
-        "roles": ["guest"],
-        "deny": [{"actions": ["device.command"], "category": ["media"]}],
-    })
-    .to_string();
+    let create = json!({"label": "wall", "roles": ["visitor"]}).to_string();
 
     let (status, body) = send(
         &router,
@@ -523,8 +509,7 @@ async fn connect_tokens_service_is_owner_only() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let secret = body["secret"].as_str().expect("secret");
-    assert_eq!(body["token"]["roles"], json!(["guest"]));
-    assert_eq!(body["token"]["deny"], json!(["device.command@media"]));
+    assert_eq!(body["token"]["roles"], json!(["visitor"]));
     let rec = engine.auth_tokens().verify(secret).expect("verifies");
     assert!(!rec.owner);
 
@@ -559,7 +544,7 @@ async fn connect_tokens_service_is_owner_only() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Roles: list, update, delete (refused while held, then forced).
+    // Roles: list, update, delete (refused while held).
     let (status, body) = send(
         &router,
         "POST",
@@ -569,24 +554,56 @@ async fn connect_tokens_service_is_owner_only() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["roles"][0]["tokens"].as_array().unwrap().len(), 1);
+    let visitor_row = body["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "visitor")
+        .expect("visitor listed");
+    assert_eq!(visitor_row["tokens"].as_array().unwrap().len(), 1);
+    assert_eq!(body["roles"][0]["builtin"], true);
     let (status, body) = send(
         &router,
         "POST",
         "/oxidhome.v1.RolesService/UpdateRole",
         &owner.plaintext,
-        &json!({"name": "guest", "definition": {"grants": [{"actions": ["device.list"]}]}})
+        &json!({"name": "visitor", "grants": {"grants": [{"actions": ["device.list"]}]}})
             .to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["role"]["grants"], json!(["device.list"]));
+    // An omitted `grants` is refused, not read as "no grants".
     let (status, body) = send(
         &router,
         "POST",
         "/oxidhome.v1.RolesService/UpdateRole",
         &owner.plaintext,
-        &json!({"name": "nope", "definition": {}}).to_string(),
+        &json!({"name": "visitor"}).to_string(),
+    )
+    .await;
+    assert_eq!(body["code"], "invalid_argument", "{status} {body}");
+    let (_, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.RolesService/ListRoles",
+        &owner.plaintext,
+        "{}",
+    )
+    .await;
+    let kept = body["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "visitor")
+        .expect("visitor listed");
+    assert_eq!(kept["grants"], json!(["device.list"]));
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.RolesService/UpdateRole",
+        &owner.plaintext,
+        &json!({"name": "nope", "grants": {}}).to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -595,24 +612,26 @@ async fn connect_tokens_service_is_owner_only() {
         "POST",
         "/oxidhome.v1.RolesService/DeleteRole",
         &owner.plaintext,
-        &json!({"name": "guest"}).to_string(),
+        &json!({"name": "visitor"}).to_string(),
     )
     .await;
     assert_eq!(body["code"], "failed_precondition", "{status} {body}");
+    engine.auth_tokens().revoke(&rec.id).expect("revoke");
     let (status, body) = send(
         &router,
         "POST",
         "/oxidhome.v1.RolesService/DeleteRole",
         &owner.plaintext,
-        &json!({"name": "guest", "force": true}).to_string(),
+        &json!({"name": "visitor"}).to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["role"]["tokens"].as_array().unwrap().len(), 1);
+    assert_eq!(body["role"]["name"], "visitor");
 }
 
-/// The offline CLI mints and lists role tokens.
+/// The offline CLI mints, lists and revokes role tokens and edits roles.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn cli_creates_and_lists_role_tokens() {
     let state = support::tempdir("token-roles-cli");
     let run = |args: &[&str]| {
@@ -645,19 +664,14 @@ fn cli_creates_and_lists_role_tokens() {
         "role",
         "create",
         "monitor",
-        r#"{"grants":[{"actions":["device.list","event.read","event.subscribe"]}]}"#,
+        r#"[{"actions":["device.list","event.read","event.subscribe"]}]"#,
     ]);
     assert!(ok, "{stderr}");
     assert!(
-        stdout.contains("\tmonitor\tgrants=device.list,event."),
+        stdout.contains("monitor\tcustom\tgrants=device.list,event."),
         "{stdout}"
     );
-    let (ok, _, stderr) = run(&[
-        "role",
-        "create",
-        "bad",
-        r#"{"grants":[{"actions":["host.logz"]}]}"#,
-    ]);
+    let (ok, _, stderr) = run(&["role", "create", "bad", r#"[{"actions":["host.logz"]}]"#]);
     assert!(!ok);
     assert!(stderr.contains("host.logz"), "{stderr}");
     let (ok, stdout, stderr) = run(&[
@@ -666,8 +680,8 @@ fn cli_creates_and_lists_role_tokens() {
         "prometheus",
         "--role",
         "monitor",
-        "--deny",
-        "event.read,event.subscribe",
+        "--role",
+        "guest",
     ]);
     assert!(ok, "{stderr}");
     let secret = stdout.trim();
@@ -676,8 +690,7 @@ fn cli_creates_and_lists_role_tokens() {
     let (ok, stdout, stderr) = run(&["token", "list"]);
     assert!(ok, "{stderr}");
     assert!(
-        stdout.contains("prometheus\t-\troles=monitor\tscopes=-\tsensitive=-")
-            && stdout.contains("deny=event.subscribe,event.read"),
+        stdout.contains("prometheus\t-\troles=monitor,guest"),
         "{stdout}"
     );
     assert!(!stdout.contains(secret), "a listing never shows a secret");
@@ -689,17 +702,47 @@ fn cli_creates_and_lists_role_tokens() {
     let (ok, stdout, stderr) = run(&["role", "list"]);
     assert!(ok, "{stderr}");
     assert!(
-        stdout.contains("\tmonitor\t") && stdout.contains("tokens=1"),
+        stdout.contains("monitor\tcustom\t") && stdout.contains("tokens=1"),
         "{stdout}"
     );
     let (ok, _, stderr) = run(&["role", "delete", "monitor"]);
     assert!(!ok);
     assert!(stderr.contains("held by 1 live token"), "{stderr}");
-    let (ok, _, stderr) = run(&["role", "delete", "monitor", "--force"]);
+    let (ok, _, _) = run(&["role", "delete", "guest"]);
+    assert!(!ok, "a built-in role can't be deleted");
+    let (ok, stdout, stderr) = run(&[
+        "role",
+        "update",
+        "monitor",
+        r#"[{"actions":["device.list"]}]"#,
+    ]);
     assert!(ok, "{stderr}");
-    assert!(stderr.contains("grants nothing"), "{stderr}");
+    assert!(
+        stdout.contains("monitor\tcustom\tgrants=device.list\t"),
+        "{stdout}"
+    );
 
+    let rec = {
+        let engine = Engine::with_state_dir(state.path()).expect("engine");
+        let rec = engine.auth_tokens().verify(secret).expect("verifies");
+        assert_eq!(rec.label, "prometheus");
+        let owner = engine
+            .auth_tokens()
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.owner)
+            .expect("owner");
+        (rec.id, owner.id)
+    };
+    let (ok, _, stderr) = run(&["token", "revoke", &rec.1]);
+    assert!(!ok, "the owner isn't revoked this way");
+    assert!(stderr.contains("recover-admin-token"), "{stderr}");
+    let (ok, stdout, stderr) = run(&["token", "revoke", &rec.0]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("prometheus\trevoked"), "{stdout}");
+    let (ok, _, stderr) = run(&["role", "delete", "monitor"]);
+    assert!(ok, "a revoked holder frees the role: {stderr}");
     let engine = Engine::with_state_dir(state.path()).expect("engine");
-    let rec = engine.auth_tokens().verify(secret).expect("verifies");
-    assert_eq!(rec.label, "prometheus");
+    assert!(engine.auth_tokens().verify(secret).is_err());
 }

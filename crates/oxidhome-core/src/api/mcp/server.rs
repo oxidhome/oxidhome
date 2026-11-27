@@ -84,8 +84,7 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 
 /// Maximum concurrent MCP sessions. Sized for a home hub with
 /// one operator; a session count beyond this is either an
-/// abuser or a client bug. 14.4 wires per-token limits, at
-/// which point this becomes a config knob.
+/// abuser or a client bug.
 pub(super) const MAX_SESSIONS: usize = 128;
 
 /// Maximum concurrent POST bodies alive on the mount at any
@@ -201,47 +200,6 @@ pub fn mount_routes_with_all_limits(
     )
 }
 
-/// Constraint keys the MCP mount enforces, each with the
-/// `ToolConstraint` field its dispatch site consults through
-/// [`crate::auth::authorize()`]:
-///
-/// - 14.4b: `device.send_command` / `devices`.
-/// - 14.4c: four `plugins.*` entries / `plugins`, each checked
-///   before touching any state (existence / running-state / FS
-///   layout can't be probed).
-/// - 14.4d: `plugins.install` / `plugins` — takes `source_dir`, not
-///   `plugin_id`, so the check runs inside
-///   `installed_plugins::install_gated` against the manifest-derived
-///   id BEFORE any FS or SQL side effect.
-pub(crate) const MCP_ENFORCED_CONSTRAINTS: &[crate::auth::EnforcedConstraint] = &[
-    crate::auth::DEVICE_COMMAND_ENFORCED,
-    crate::auth::EnforcedConstraint {
-        key: "plugins.show",
-        enforce_devices: false,
-        enforce_plugins: true,
-    },
-    crate::auth::EnforcedConstraint {
-        key: "plugins.stop",
-        enforce_devices: false,
-        enforce_plugins: true,
-    },
-    crate::auth::EnforcedConstraint {
-        key: "plugins.uninstall",
-        enforce_devices: false,
-        enforce_plugins: true,
-    },
-    crate::auth::EnforcedConstraint {
-        key: "plugins.start",
-        enforce_devices: false,
-        enforce_plugins: true,
-    },
-    crate::auth::EnforcedConstraint {
-        key: "plugins.install",
-        enforce_devices: false,
-        enforce_plugins: true,
-    },
-];
-
 /// Internal mount that takes every knob. Every `mount_*` public
 /// variant delegates here.
 fn mount_inner(
@@ -287,17 +245,12 @@ fn mount_inner(
     // on PR #120). The middleware also inserts the resolved
     // [`Actor`](crate::auth::Actor) into the request
     // extensions, which the resource dispatch pulls back out
-    // via `RequestContext.extensions.get::<Parts>()`. 14.4
-    // adds per-token scope enforcement on top of this basic
-    // "must have a valid token" check.
+    // via `RequestContext.extensions.get::<Parts>()`. Each tool
+    // and resource then checks its action through
+    // `crate::auth::authorize()`.
     let auth_state = super::super::auth::AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // Phase 14.4b/c/d: each entry names a tool key + which
-        // `ToolConstraint` fields the dispatch site consults.
-        // Added atomically with the corresponding dispatch
-        // check so bearer time and dispatch time can't drift.
-        enforced_constraints: MCP_ENFORCED_CONSTRAINTS,
         transport: crate::auth::Transport::McpHttp,
     };
 

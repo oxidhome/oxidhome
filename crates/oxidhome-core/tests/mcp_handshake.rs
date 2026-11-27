@@ -25,6 +25,7 @@
 #[path = "support.rs"]
 mod _support;
 
+use _support::Mint;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -82,7 +83,7 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 fn mint_bearer(engine: &Engine) -> String {
     engine
         .auth_tokens()
-        .create("test", b"[\"*\"]")
+        .mint("test", &["*"])
         .expect("mint bearer")
         .plaintext
 }
@@ -734,12 +735,12 @@ async fn rate_limit_is_per_token_not_global() {
     let engine = Engine::new().expect("engine");
     let bearer_a = engine
         .auth_tokens()
-        .create("token-a", b"[\"*\"]")
+        .mint("token-a", &["*"])
         .expect("mint bearer a")
         .plaintext;
     let bearer_b = engine
         .auth_tokens()
-        .create("token-b", b"[\"*\"]")
+        .mint("token-b", &["*"])
         .expect("mint bearer b")
         .plaintext;
     let router = mount_routes_with_rate_limiter(&engine, 1, 0.0);

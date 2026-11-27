@@ -1,18 +1,20 @@
-//! H6 slice 2: sensitive device categories end to end over REST.
+//! Sensitive device categories end to end over REST.
 //!
 //! A `simulated-switch` device raised to `lock` by the operator stands
-//! in for a lock (the raise is itself under test): the wildcard scope
-//! doesn't reach it, an explicit grant does (rate limited, with a
-//! `warn` audit row), a grant narrowed to another device doesn't leak,
-//! and the bootstrap owner token keeps everything.
+//! in for a lock (the raise is itself under test): a role granting `*`
+//! doesn't reach it, a grant naming `lock` does (with a `warn` audit
+//! row), a grant narrowed to another device doesn't leak, and the
+//! bootstrap owner token keeps everything.
 
+use support::Mint;
 #[path = "support.rs"]
 mod support;
+
+use oxidhome_core::state::TokenStore;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use oxidhome_core::Engine;
-use oxidhome_core::api::sensitive_admin::grant_sensitive;
 use oxidhome_core::api::{build_router, ensure_admin_token};
 use oxidhome_core::auth::{DeviceCategory, SensitiveCategory};
 use oxidhome_core::state::AuditQuery;
@@ -64,7 +66,7 @@ fn warn_rows(engine: &Engine) -> Vec<oxidhome_core::state::AuditEntry> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn lock_commands_need_an_explicit_grant() {
+async fn lock_commands_need_a_grant_naming_lock() {
     let _wasm = support::build_example("simulated-switch", "simulated_switch.wasm");
     let dir = support::workspace_root()
         .join("examples")
@@ -91,30 +93,24 @@ async fn lock_commands_need_an_explicit_grant() {
     let category_uri = format!("/api/v1/devices/{device}/category");
     let router = build_router(engine.clone());
 
-    let wildcard = engine.auth_tokens().create("ha", br#"["*"]"#).unwrap();
-    let granted = engine
-        .auth_tokens()
-        .create("door", br#"["devices:command"]"#)
-        .unwrap();
-    let elsewhere = engine.auth_tokens().create("other", br#"["*"]"#).unwrap();
-    grant_sensitive(
-        &engine.auth_tokens(),
-        &engine.audit_log(),
-        &granted.id,
-        SensitiveCategory::Lock,
-        &[],
-    )
-    .unwrap();
-    grant_sensitive(
-        &engine.auth_tokens(),
-        &engine.audit_log(),
-        &elsewhere.id,
-        SensitiveCategory::Lock,
-        &["dev-ffffffffffffffff".into()],
-    )
-    .unwrap();
+    let role = |tokens: &TokenStore, name: &str, grants: &str| {
+        tokens.create_role(name, grants.as_bytes()).unwrap();
+        tokens.create(name, &[name]).unwrap()
+    };
+    let tokens = engine.auth_tokens();
+    let wildcard = tokens.mint("ha", &["*", "device.command"]).unwrap();
+    let granted = role(
+        &tokens,
+        "door",
+        r#"[{"actions":["device.command"],"category":["lock"]}]"#,
+    );
+    let elsewhere = role(
+        &tokens,
+        "other",
+        r#"[{"actions":["device.command"],"category":["lock"],"devices":["dev-ffffffffffffffff"]}]"#,
+    );
 
-    // A switch is not sensitive: the wildcard reaches it.
+    // A switch is not sensitive: `*` reaches it.
     let (status, _) = send(&router, "POST", &command_uri, &wildcard.plaintext, TOGGLE).await;
     assert_eq!(status, StatusCode::OK);
     let before = warn_rows(&engine).len();
@@ -144,8 +140,8 @@ async fn lock_commands_need_an_explicit_grant() {
     let (_, list) = send(&router, "GET", "/api/v1/devices", &owner.plaintext, "").await;
     assert_eq!(list["devices"][0]["category"], "lock", "{list}");
 
-    // Wildcard and a grant narrowed to another device: denied, audited
-    // with the sensitive label, before the command runs.
+    // `*` and a grant narrowed to another device: denied, audited with
+    // the action, before the command runs.
     for token in [&wildcard, &elsewhere] {
         let (status, _) = send(&router, "POST", &command_uri, &token.plaintext, TOGGLE).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
@@ -165,11 +161,11 @@ async fn lock_commands_need_an_explicit_grant() {
     assert!(
         denied
             .iter()
-            .all(|r| r.required_scope.as_deref() == Some("sensitive:lock"))
+            .all(|r| r.required_scope.as_deref() == Some("device.command"))
     );
 
-    // The explicit grant reaches it, with a `warn` row joined to the
-    // request's own row by call id.
+    // The grant naming `lock` reaches it, with a `warn` row joined to
+    // the request's own row by call id.
     let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let rows = warn_rows(&engine);
@@ -193,8 +189,7 @@ async fn lock_commands_need_an_explicit_grant() {
         "{request_row:?}"
     );
 
-    // The owner keeps every category and isn't rate limited, but is
-    // still audited at `warn`.
+    // The owner keeps every category, audited at `warn` too.
     let (status, _) = send(&router, "POST", &command_uri, &owner.plaintext, TOGGLE).await;
     assert_eq!(status, StatusCode::OK);
     let owner_rows: Vec<_> = warn_rows(&engine)
@@ -205,67 +200,33 @@ async fn lock_commands_need_an_explicit_grant() {
     assert_eq!(owner_rows[0].required_scope.as_deref(), Some("owner:lock"));
 
     // A command that never reaches the plugin (its deadline passed
-    // before dispatch) keeps no charge once dropped and leaves no `warn` row: far
-    // more of them than the allowance leave it whole.
+    // before dispatch) leaves no `warn` row.
     {
-        use oxidhome_core::auth::{
-            Action, ActorKind, InvocationContext, Principal, SensitiveGrant, TokenPolicy,
-            Transport, authorize,
-        };
+        use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, RoleDef, Transport};
         use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::Command;
-        let actor = oxidhome_core::Actor::from_token_policy(
-            &granted.id,
-            TokenPolicy {
-                scopes: vec!["devices:command".into()],
-                sensitive: vec![SensitiveGrant::all(SensitiveCategory::Lock)],
-                ..TokenPolicy::default()
-            },
-            false,
-        );
+        let role = RoleDef::parse(
+            "door",
+            br#"[{"actions":["device.command"],"category":["lock"]}]"#,
+        )
+        .unwrap();
+        let actor = oxidhome_core::Actor::api(&granted.id, vec![std::sync::Arc::new(role)]);
         let expired =
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest))
                 .with_deadline(Some(tokio::time::Instant::now()));
-        let decision = authorize(
-            &expired,
-            Action::DeviceCommand,
-            &engine.devices().resource(&device),
-        );
-        assert!(decision.allow, "{decision:?}");
-        for _ in 0..30 {
-            let charge = engine
-                .sensitive()
-                .reserve(&expired, Action::DeviceCommand, &device, &decision)
-                .expect("a withdrawn command keeps no charge");
-            let report = handle
-                .execute_command_admitted(
-                    expired.clone(),
-                    device.clone(),
-                    Command {
-                        id: String::new(),
-                        capability: "switch".into(),
-                        action: "toggle".into(),
-                        args: Vec::new(),
-                    },
-                    charge,
-                )
-                .await;
-            assert_eq!(report.outcome.as_str(), "timed_out", "{report:?}");
-            // The supervisor drops the withdrawn command (refunding its
-            // charge) when it dequeues it; a host command queued behind
-            // it returns once it has.
-            let flushed = handle
-                .execute_command(
-                    device.clone(),
-                    Command {
-                        id: String::new(),
-                        capability: "switch".into(),
-                        action: "toggle".into(),
-                        args: Vec::new(),
-                    },
-                )
-                .await;
-            assert_eq!(flushed.outcome.as_str(), "completed", "{flushed:?}");
-        }
+        let toggle = || Command {
+            id: String::new(),
+            capability: "switch".into(),
+            action: "toggle".into(),
+            args: Vec::new(),
+        };
+        let report = handle
+            .execute_command_in(expired, device.clone(), toggle())
+            .await;
+        assert_eq!(report.outcome.as_str(), "timed_out", "{report:?}");
+        // The supervisor drops the withdrawn command when it dequeues
+        // it; a host command queued behind it returns once it has.
+        let flushed = handle.execute_command(device.clone(), toggle()).await;
+        assert_eq!(flushed.outcome.as_str(), "completed", "{flushed:?}");
         assert_eq!(
             warn_rows(&engine)
                 .into_iter()
@@ -276,31 +237,46 @@ async fn lock_commands_need_an_explicit_grant() {
         );
     }
 
-    // Rate limit: the granted token's lock allowance runs out: one
-    // charge went to the command above, nine remain.
-    let mut limited = None;
-    for _ in 0..20 {
-        let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            limited = Some(body);
-            break;
-        }
-        assert_eq!(status, StatusCode::OK);
-    }
-    let limited = limited.expect("rate limited within the allowance");
-    assert_eq!(limited["category"], "lock");
-    assert!(limited["retry_after_secs"].as_u64().unwrap() >= 1);
-    let granted_rows = warn_rows(&engine)
-        .into_iter()
-        .filter(|r| r.token_id == granted.id)
-        .count();
-    assert_eq!(granted_rows, 10, "one warn row per allowed command");
-
     // An empty body doesn't clear it: the field is required.
     let (status, _) = send(&router, "PUT", &category_uri, &owner.plaintext, "{}").await;
     assert!(status.is_client_error(), "{status}");
     let (status, _) = send(&router, "POST", &command_uri, &wildcard.plaintext, TOGGLE).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // No `warn` row, no run: with `AUTHZ` inserts failing, the granted
+    // command is refused and the switch doesn't move.
+    let db = rusqlite::Connection::open(state.path().join("oxidhome.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER no_authz BEFORE INSERT ON audit_event \
+         WHEN NEW.method = 'AUTHZ' BEGIN SELECT RAISE(ABORT, 'no'); END;",
+    )
+    .unwrap();
+    let state_uri = format!("/api/v1/devices/{device}/state");
+    let switch_on = |body: &Value| -> Option<Value> {
+        body["capabilities"]
+            .as_array()?
+            .iter()
+            .flat_map(|c| c["fields"].as_array().cloned().unwrap_or_default())
+            .find(|f| f["key"] == "state")
+            .map(|f| f["value"].clone())
+    };
+    let (status, before) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let on_before = switch_on(&before).unwrap_or_else(|| panic!("switch field in {before}"));
+    let rows_before = warn_rows(&engine).len();
+    let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["outcome"], "rejected", "{body}");
+    let (status, after) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(status, StatusCode::OK, "{after}");
+    assert_eq!(
+        switch_on(&after),
+        Some(on_before),
+        "the plugin was not entered"
+    );
+    assert_eq!(warn_rows(&engine).len(), rows_before);
+    db.execute_batch("DROP TRIGGER no_authz;").unwrap();
+    drop(db);
 
     // Clearing the raise puts the switch back in reach.
     let (status, _) = send(
@@ -337,7 +313,7 @@ fn category_override_persists_and_only_raises() {
     let id = "dev-0123456789abcdef";
     {
         let engine = Engine::with_state_dir(state.path()).expect("engine");
-        oxidhome_core::api::sensitive_admin::set_device_category(
+        oxidhome_core::api::offline::set_device_category(
             &engine.audit_log(),
             engine.devices().meta(),
             id,
@@ -362,7 +338,7 @@ fn category_override_persists_and_only_raises() {
 }
 
 fn set_bad_id(engine: &Engine) -> anyhow::Result<()> {
-    oxidhome_core::api::sensitive_admin::set_device_category(
+    oxidhome_core::api::offline::set_device_category(
         &engine.audit_log(),
         engine.devices().meta(),
         "not-a-device",
@@ -375,7 +351,7 @@ fn set_bad_id(engine: &Engine) -> anyhow::Result<()> {
 /// is the daemon's job.
 #[test]
 fn offline_commands_refuse_an_unmigrated_database() {
-    use oxidhome_core::api::sensitive_admin::with_offline_stores;
+    use oxidhome_core::api::offline::with_offline_stores;
     use oxidhome_core::state::db::schema_version;
     let state = support::tempdir("sensitive-offline-version");
     let db = oxidhome_core::state::Db::open_file(state.path()).expect("db");

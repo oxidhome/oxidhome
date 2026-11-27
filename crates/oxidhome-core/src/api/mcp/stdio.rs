@@ -16,21 +16,15 @@
 //!
 //! No bearer tokens; the trust boundary is the process itself.
 //! The parent process launched us with filesystem access to the
-//! state dir, so it already has the operator's authority. The
-//! handler runs under a wildcard-scope
-//! `Actor::api("mcp-stdio-parent-process", ["*"])` so
-//! `authorize` decisions land as `allow`; the audit ledger
-//! records every action with that exact token id, distinct from
-//! any HTTP token id an operator would mint, so a forensic
-//! sweep filters mcp-stdio traffic by matching on it.
-//!
-//! The ambient actor is **not** the owner (H6 slice 2, Q7): like any
-//! wildcard token it doesn't reach lock / opener / alarm commands or
-//! camera bytes. The operator opts in per category when launching the
-//! subprocess, `oxidhome mcp-stdio --allow-sensitive lock
-//! --allow-sensitive camera` ([`StdioOptions::allow_sensitive`]);
-//! allowed sensitive actions are then rate limited and leave `warn`
-//! audit rows like any token's.
+//! state dir. The session runs as an ambient actor holding one role,
+//! `oxidhome mcp-stdio --role <name>` ([`StdioOptions::role`], the
+//! built-in `agent` by default), and is never the owner. The audit
+//! ledger records every action with the token id [`STDIO_TOKEN_ID`],
+//! distinct from any minted token's, so a forensic sweep filters
+//! mcp-stdio traffic by matching on it. Sensitive categories (lock,
+//! opener and alarm commands, camera bytes) are reached only when the
+//! chosen role grants them, and leave `warn` audit rows like any
+//! token's.
 //!
 //! # Engine ownership
 //!
@@ -68,7 +62,7 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::Engine;
-use crate::auth::{Actor, SensitiveCategory, SensitiveGrant};
+use crate::auth::Actor;
 
 use super::handler::OxidHomeMcpHandler;
 
@@ -81,36 +75,58 @@ pub enum ServeStdioError {
     Serve(String),
     #[error("stdio MCP session task join failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("unknown role `{0}`")]
+    UnknownRole(String),
+    #[error("role `{0}`'s stored definition doesn't parse")]
+    BadRole(String),
+    #[error("reading role `{0}` failed: {1}")]
+    RoleStore(String, String),
 }
 
 /// Operator choices for an `mcp-stdio` session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StdioOptions {
-    /// Sensitive categories the session may reach
-    /// (`--allow-sensitive <category>`, repeatable). Empty by default:
-    /// the ambient wildcard actor doesn't reach locks, openers, alarms
-    /// or camera bytes.
-    pub allow_sensitive: Vec<SensitiveCategory>,
+    /// The role the session holds (`--role <name>`): built-in or
+    /// custom. `agent` by default.
+    pub role: String,
+}
+
+impl Default for StdioOptions {
+    fn default() -> Self {
+        Self {
+            role: "agent".to_owned(),
+        }
+    }
 }
 
 /// Audit token id of the ambient `mcp-stdio` actor.
 pub const STDIO_TOKEN_ID: &str = "mcp-stdio-parent-process";
 
-/// The ambient actor an `mcp-stdio` session runs as: wildcard scopes,
-/// not the owner, plus the operator's `--allow-sensitive` categories.
-#[must_use]
-pub fn stdio_actor(options: &StdioOptions) -> Actor {
-    // See the module-doc's "Auth" section for the rationale. The id
-    // lands in the audit ledger under `actor_kind = api` (same shape
-    // HTTP tokens use), distinct so operators can filter mcp-stdio
-    // traffic from HTTP-token traffic in a forensic sweep.
-    Actor::api(STDIO_TOKEN_ID, vec!["*".to_string()]).with_sensitive(
-        options
-            .allow_sensitive
-            .iter()
-            .map(|c| SensitiveGrant::all(*c))
-            .collect(),
-    )
+/// The ambient actor an `mcp-stdio` session runs as: the role
+/// `options` names, not the owner.
+///
+/// # Errors
+///
+/// [`ServeStdioError::UnknownRole`] when no role has that name,
+/// [`ServeStdioError::BadRole`] when its stored definition doesn't
+/// parse, [`ServeStdioError::RoleStore`] when reading it fails.
+pub fn stdio_actor(engine: &Engine, options: &StdioOptions) -> Result<Actor, ServeStdioError> {
+    let name = &options.role;
+    if let Some(role) = crate::auth::role::builtin(name) {
+        return Ok(Actor::api(STDIO_TOKEN_ID, vec![role]));
+    }
+    let rows = engine
+        .auth_tokens()
+        .roles_by_name(std::slice::from_ref(name))
+        .map_err(|e| ServeStdioError::RoleStore(name.clone(), e.to_string()))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| ServeStdioError::UnknownRole(name.clone()))?;
+    let role = std::sync::Arc::new(
+        row.def()
+            .ok_or_else(|| ServeStdioError::BadRole(name.clone()))?,
+    );
+    Ok(Actor::api(STDIO_TOKEN_ID, vec![role]))
 }
 
 /// Convenience: serve MCP over the process's stdin / stdout
@@ -156,7 +172,7 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let actor = stdio_actor(options);
+    let actor = stdio_actor(&engine, options)?;
     let handler = OxidHomeMcpHandler::for_stdio(engine, actor);
 
     let service = rmcp::serve_server(handler, (reader, writer))
@@ -177,42 +193,68 @@ mod tests {
         Transport, authorize,
     };
 
-    fn decide(options: &StdioOptions, category: DeviceCategory, action: Action) -> bool {
-        let actor = stdio_actor(options);
-        let ctx = InvocationContext::external(Principal::token(
-            ActorKind::Api,
-            &actor,
-            Transport::McpStdio,
-        ));
+    fn decide(engine: &Engine, role: &str, category: DeviceCategory, action: Action) -> bool {
+        let options = StdioOptions { role: role.into() };
+        let actor = stdio_actor(engine, &options).expect("role");
+        assert!(!actor.is_owner());
+        // As the stdio handler builds it: a local process, never the owner.
+        let ctx = InvocationContext::external(
+            Principal::local_process(ActorKind::Mcp, actor.id(), Transport::McpStdio)
+                .with_authority(crate::auth::Authority::of_local_process(&actor)),
+        );
         let resource = Resource::device("dev-0000000000000001", DeviceClass::of(category));
         authorize(&ctx, action, &resource).allow
     }
 
     #[test]
-    fn stdio_actor_reaches_sensitive_categories_only_when_allowed() {
-        let default = StdioOptions::default();
+    fn stdio_actor_holds_the_named_role() {
+        let engine = Engine::new().expect("engine");
+        assert_eq!(StdioOptions::default().role, "agent");
         assert!(decide(
-            &default,
+            &engine,
+            "agent",
             DeviceCategory::Light,
             Action::DeviceCommand
         ));
         assert!(!decide(
-            &default,
+            &engine,
+            "agent",
             DeviceCategory::Lock,
             Action::DeviceCommand
         ));
-        assert!(!decide(&default, DeviceCategory::Camera, Action::BlobRead));
-        assert!(!stdio_actor(&default).is_owner());
-
-        let lock = StdioOptions {
-            allow_sensitive: vec![SensitiveCategory::Lock],
-        };
-        assert!(decide(&lock, DeviceCategory::Lock, Action::DeviceCommand));
+        assert!(decide(
+            &engine,
+            "member",
+            DeviceCategory::Lock,
+            Action::DeviceCommand
+        ));
+        engine
+            .auth_tokens()
+            .create_role(
+                "doors",
+                br#"[{"actions":["device.command"],"category":["lock"]}]"#,
+            )
+            .unwrap();
+        assert!(decide(
+            &engine,
+            "doors",
+            DeviceCategory::Lock,
+            Action::DeviceCommand
+        ));
         assert!(!decide(
-            &lock,
+            &engine,
+            "doors",
             DeviceCategory::Opener,
             Action::DeviceCommand
         ));
-        assert!(!decide(&lock, DeviceCategory::Camera, Action::BlobRead));
+        assert!(matches!(
+            stdio_actor(
+                &engine,
+                &StdioOptions {
+                    role: "nope".into()
+                }
+            ),
+            Err(ServeStdioError::UnknownRole(_))
+        ));
     }
 }

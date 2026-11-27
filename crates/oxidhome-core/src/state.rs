@@ -69,13 +69,6 @@ pub use installed_plugins::{
     narrowed_network_grant, network_rule_covers, plan_network_grant_offline, read_installed_bytes,
     recompute_digest_and_manifest, recompute_installed_digest,
 };
-pub use tls_pins::{
-    Fingerprint, MAX_PINS_PER_INSTANCE, MAX_PINS_TOTAL, PinCheck, PinFilter, PinKey, TlsPin,
-    TlsPinStore,
-};
-// Crate-private wrapper for the gated-install flow; see the
-// type doc for why this stays out of the public re-export.
-pub(crate) use installed_plugins::GatedInstallError;
 pub(crate) use kv::stored_value_size;
 pub use kv::{KvError, KvStore};
 pub use log_store::{
@@ -86,3 +79,7 @@ pub use retention::{
     RetentionPolicy, RetentionTask, RetentionTasks,
 };
 pub use services::{CallGuard, ServiceMeta, ServiceRegistry};
+pub use tls_pins::{
+    Fingerprint, MAX_PINS_PER_INSTANCE, MAX_PINS_TOTAL, PinCheck, PinFilter, PinKey, TlsPin,
+    TlsPinStore,
+};

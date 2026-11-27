@@ -61,8 +61,8 @@ impl OxidHomeMcpHandler {
     /// of the "no HTTP context = deny everything" fallback used
     /// on the HTTP mount. The parent process launched us with
     /// filesystem access to the state dir, so the trust model is
-    /// the process boundary; scope enforcement remains real for
-    /// audit purposes but the ambient actor holds `*`.
+    /// the process boundary; the ambient actor holds the role the
+    /// operator chose (`--role`), and every check still applies.
     pub(crate) fn for_stdio(engine: Engine, actor: Actor) -> Self {
         Self {
             engine,
@@ -133,8 +133,9 @@ impl ServerHandler for OxidHomeMcpHandler {
     {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
-        // Resource reads write their own audit row without a call id;
-        // the context only carries the root's authority to `authorize`.
+        // Resource reads write their own audit row, with this
+        // context's call id; it also carries the root's authority to
+        // `authorize`.
         let invocation = crate::auth::InvocationContext::external(self.principal(&actor));
         async move {
             // 14.7c: standardised completion event. `read` is
@@ -268,7 +269,7 @@ impl ServerHandler for OxidHomeMcpHandler {
 
 impl OxidHomeMcpHandler {
     /// H6: the root principal of an MCP request, carrying `actor`'s
-    /// scopes and constraints as its authority. stdio is authorized by
+    /// owner flag and roles as its authority. stdio is authorized by
     /// the parent process, not a credential, so its principal carries
     /// no `credential_id`.
     fn principal(&self, actor: &Actor) -> crate::auth::Principal {
@@ -301,7 +302,7 @@ impl OxidHomeMcpHandler {
     /// (which still owns those extensions) onto
     /// [`RequestContext::extensions`]. Missing at either hop
     /// means something upstream skipped the auth layer —
-    /// synthesize a **no-scope anonymous actor** so every
+    /// synthesize a **role-less anonymous actor** so every
     /// subsequent authorization check fails closed. This
     /// protects against a future mis-wire (e.g. someone
     /// removing the `require_token` layer): the resource
@@ -404,7 +405,7 @@ fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &st
 ///   `CallToolResult { isError: true }`).
 /// - `Ok(_)` otherwise → `"ok"`.
 /// - `Err(mcp_error)` → tag derived from the JSON-RPC code
-///   ([`classify_mcp_error`]), so scope denials, oversized
+///   ([`classify_mcp_error`]), so permission denials, oversized
 ///   responses, and the audit-queue busy path each get a
 ///   dashboard-friendly slice.
 fn classify_call(result: &Result<CallToolResult, McpError>) -> &'static str {

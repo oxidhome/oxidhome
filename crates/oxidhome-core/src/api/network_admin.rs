@@ -5,7 +5,7 @@
 //!   <instance> [<host> [<port>]]` / `reset --all` — offline, under the
 //!   exclusive state-dir lock, like the `token` commands; a reset leaves a
 //!   two-phase `LOCAL` audit row (actor `cli`).
-//! - `GET /api/v1/network/tls-pins[?instance_id=…]` (`instances:list`) and
+//! - `GET /api/v1/network/tls-pins[?instance_id=…]` (`instance.read`) and
 //!   `DELETE /api/v1/network/tls-pins?instance_id=…[&host=…[&port=…]]` (or `?all=true`)
 //!   (owner token, `policy.manage`), and the Connect `NetworkService`.
 //! - MCP lists them (`oxidhome://network/tls-pins`), read-only.

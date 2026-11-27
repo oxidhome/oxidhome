@@ -25,80 +25,73 @@ share one axum listener, so a household hub only exposes one endpoint.
   browser at `evil.example.com` from `fetch()`-ing the daemon), NOT a
   peer-IP filter — a remote client can still send `Host: localhost` if the
   daemon is bound to a non-loopback address.
-- **Auth**: `Authorization: Bearer <token>`. The first-run daemon writes an
-  admin token (scope `*`, the owner) to `<state_dir>/admin-token` (mode
-  `0600`). Mint further tokens by **role** offline with
-  `oxidhome token create <label> --role <name> [--scope <scope>]...
-  [--sensitive <category>]... [--deny <action,...|*>[@<category,...>]]...`
-  (the secret is printed once), or as the owner over
-  `POST /api/v1/tokens` / Connect `TokensService.CreateToken`
-  (`{"label": "hall tablet", "roles": ["tablet"]}`, `201` with the
-  secret). `GET /api/v1/tokens`, Connect `ListTokens`, MCP `tokens.list`
-  and `oxidhome token list` list tokens without secrets; only the owner
-  reaches the API forms. Revocation is offline (`recover-admin-token
-  --revoke-all`). Missing or malformed bearer → `401`.
-- **Roles**: there are no built-in roles; the owner defines them. A role
-  is a name plus grants (actions; `device.list`, `device.read` and
-  `device.command` can be narrowed to device categories and device ids),
-  sensitive categories and deny entries:
-  `oxidhome role create tablet '{"grants": [{"actions": ["device.list",
-  "device.read", "device.command"], "category": ["light"]}]}'` offline, or
-  over `/api/v1/roles` (`GET`, `POST`, `PUT /{name}`, `DELETE
-  /{name}[?force=true]`) and Connect `RolesService`, owner only. A token
-  holds a role by id: editing the role changes every token holding it
-  from its next request, deleting a role that live tokens hold is refused
-  unless forced, and a reference to a deleted role grants nothing. A
-  token's roles add to its scopes; a `deny` entry refuses the actions it
-  names whatever grants them. A role grant narrowed to devices lists only
-  its devices and is refused whole-fleet reads (`GET
-  /api/v1/devices/state`, event history and tails).
-- **Scope model**: per-surface. `devices:list` reads the fleet;
-  `devices:command` sends actuation commands; `events:read` / `logs:read`
-  read history; `plugins:list` reads plugin metadata; `plugins:install` /
-  `plugins:start` / `plugins:stop` / `plugins:uninstall` drive the plugin
-  lifecycle. See `crates/oxidhome-core/src/api/scopes.rs` for the full list.
+- **Auth**: `Authorization: Bearer <token>`. The first-run daemon writes the
+  owner token (which may do everything) to `<state_dir>/admin-token` (mode
+  `0600`). Every other token holds **roles** and nothing else. Mint one
+  offline with `oxidhome token create <label> --role <name>...` (the
+  secret is printed once), or as the owner over `POST /api/v1/tokens` /
+  Connect `TokensService.CreateToken` (`{"label": "hall tablet",
+  "roles": ["guest"]}`, `201` with the secret). `GET /api/v1/tokens`,
+  Connect `ListTokens`, MCP `tokens.list` and `oxidhome token list` list
+  tokens without secrets; only the owner reaches the API forms.
+  Revocation is offline: `oxidhome token revoke <token-id>`, or
+  `recover-admin-token [--revoke-all]` for the owner. Missing or
+  malformed bearer → `401`.
+- **Roles**: a role is a list of grants, each naming actions
+  (`device.list`, `device.command`, `event.read`, `host.logs`,
+  `plugin.install`, …, or `*`) and optionally narrowing `device.list`,
+  `device.read`, `device.command` and `blob.read` to device categories and
+  device ids. Built in: `admin` (every action a role can hold and
+  every sensitive category; managing tokens, roles and host policy
+  stays the owner's), `member` (household use, sensitive devices included),
+  `guest` (everyday devices) and `agent` (an assistant: reads and
+  everyday commands); `oxidhome role list` shows their grants. The owner
+  adds custom roles: `oxidhome role create tablet '[{"actions":
+  ["device.list", "device.read", "device.command"], "category":
+  ["light"]}]'` offline, or over `/api/v1/roles` (`GET`, `POST`, `PUT
+  /{name}`, `DELETE /{name}`) and Connect `RolesService`, owner only. A
+  token holds roles by name: editing a role changes every token holding
+  it from its next request, and a role that live tokens hold can't be
+  deleted. A grant narrowed to devices lists only its devices and is
+  refused whole-fleet reads (`GET /api/v1/devices/state`, event history
+  and tails).
 - **Sensitive categories**: commands on `lock`, `opener` and `alarm`
-  devices and camera bytes need an explicit grant on top of the scope; no
-  scope reaches them, `*` included. The first-run (or recovered) admin
-  token, the owner, holds every category implicitly; any other token holds
-  a category through a grant of its own or through one of its roles. Grant one offline with
-  `oxidhome token grant-sensitive <token-id> <lock|opener|alarm|camera>
-  [--device <dev-id>]...` or at mint time (`--sensitive`);
-  allowed sensitive actions are audited at `warn`
-  (`GET /api/v1/audit?level=warn`) and, except for the owner's, rate
-  limited per token and category. The daemon warns at startup about
-  wildcard tokens that lost this access. `oxidhome mcp-stdio` reaches a
-  sensitive category only with `--allow-sensitive <category>`. The owner can
-  raise a device's category with `PUT /api/v1/devices/{id}/category`
-  (`{"category": "lock"}`) or offline with `oxidhome device set-category`.
+  devices and camera bytes need a grant whose `category` names them
+  (`{"actions": ["device.command"], "category": ["lock"]}`); `*` doesn't
+  reach them. `admin` and `member` hold them all, as does the owner.
+  Allowed sensitive actions are audited at `warn` (`GET
+  /api/v1/audit?level=warn`). `oxidhome mcp-stdio` runs as `--role
+  <name>` (`agent` by default). The owner can raise a device's category
+  with `PUT /api/v1/devices/{id}/category` (`{"category": "lock"}`) or
+  offline with `oxidhome device set-category`.
   **Upgrading:** this release adds the `lock`, `opener`, `alarm-panel` and
   `siren` capability cases to the WIT contract, so device plugins must be
   rebuilt against the new SDK and redeployed with the host.
 
 ### Surface at a glance
 
-| Kind | Name | Scope | Notes |
+| Kind | Name | Permission | Notes |
 | --- | --- | --- | --- |
-| Resource | `oxidhome://devices` [+ `/{id}`] | `devices:list` | Registered devices + registration detail, with the host-derived `category` and `sensitive` categories. |
-| Resource | `oxidhome://events` | `events:read` | Historical event log with filter URI params. |
-| Resource | `oxidhome://logs` | `logs:read` | Structured logs with `since`/`level`/`plugin`/… filters. |
-| Resource | `oxidhome://plugins` [+ `/{id}`] | `plugins:list` | Installed + running plugins, each installed one with its network rules (`requested`, `granted`, `effective`); per-plugin detail. |
-| Resource | `oxidhome://status` | `status:read` | Version, uptime, DB ping, counts. |
-| Resource | `oxidhome://config` | `status:read` | Daemon's effective configuration (state dir, listen address, retention, log filter, MCP limits), each value tagged with its source (`default` / `env` / `flag`), plus build, SDK and WIT versions. No secrets. REST: `GET /api/v1/config`. |
-| Resource | `oxidhome://blobs/{instance}/{name}` | `blobs:read` | Base64-encoded blob store entries. `blobs:read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. A camera instance's blobs and a camera's bytes also need the `camera` grant. |
-| Tool | `device.send_command` | `devices:command` | Dispatch a capability command; a lock, opener or alarm also needs the category grant. |
-| Tool | `logs.query` | `logs:read` | Tool-shape of `oxidhome://logs`. |
-| Tool | `events.history` | `events:read` | Tool-shape of `oxidhome://events`. |
-| Tool | `events.subscribe` | `events:read` | Long-poll for events past an `after_id` cursor (`timeout_ms` default 5 s, cap 30 s). |
-| Tool | `plugins.list` / `plugins.show` | `plugins:list` | Read-only. |
-| Tool | `plugins.install` | `plugins:install` | Takes an absolute `source_dir` (no `..` components) that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
-| Tool | `plugins.start` / `plugins.stop` | `plugins:start` / `plugins:stop` | Runtime lifecycle. |
-| Tool | `plugins.uninstall` | `plugins:uninstall` | Refuses if instances still running. |
+| Resource | `oxidhome://devices` [+ `/{id}`] | `device.list` | Registered devices + registration detail, with the host-derived `category` and `sensitive` categories. |
+| Resource | `oxidhome://events` | `event.read` | Historical event log with filter URI params. |
+| Resource | `oxidhome://logs` | `host.logs` | Structured logs with `since`/`level`/`plugin`/… filters. |
+| Resource | `oxidhome://plugins` [+ `/{id}`] | `plugin.read` | Installed + running plugins, each installed one with its network rules (`requested`, `granted`, `effective`); per-plugin detail. |
+| Resource | `oxidhome://status` | `host.status` | Version, uptime, DB ping, counts. |
+| Resource | `oxidhome://config` | `host.status` | Daemon's effective configuration (state dir, listen address, retention, log filter, MCP limits), each value tagged with its source (`default` / `env` / `flag`), plus build, SDK and WIT versions. No secrets. REST: `GET /api/v1/config`. |
+| Resource | `oxidhome://blobs/{instance}/{name}` | `blob.read` | Base64-encoded blob store entries. `blob.read` also unlocks raw `bytes-val` fields in events, device state, and command results on every surface; without it they come back as a `json-val` "withheld" marker. A camera instance's blobs and a camera's bytes also need the `camera` grant. |
+| Tool | `device.send_command` | `device.command` | Dispatch a capability command; a lock, opener or alarm also needs the category grant. |
+| Tool | `logs.query` | `host.logs` | Tool-shape of `oxidhome://logs`. |
+| Tool | `events.history` | `event.read` | Tool-shape of `oxidhome://events`. |
+| Tool | `events.subscribe` | `event.read` | Long-poll for events past an `after_id` cursor (`timeout_ms` default 5 s, cap 30 s). |
+| Tool | `plugins.list` / `plugins.show` | `plugin.read` | Read-only. |
+| Tool | `plugins.install` | `plugin.install` | Takes an absolute `source_dir` (no `..` components) that must exist on the daemon-local filesystem — the tool copies from there into `<state_dir>/plugins/`. |
+| Tool | `plugins.start` / `plugins.stop` | `instance.start` / `instance.stop` | Runtime lifecycle. |
+| Tool | `plugins.uninstall` | `plugin.uninstall` | Refuses if instances still running. |
 | Tool | `plugins.set_network_grant` / `plugins.reset_network_grant` | owner only | Narrow a plugin's network grant (every rule inside one its manifest requests) or reset it to the request; running instances restart under it. Audited with the old and new grant. |
-| Tool | `tokens.list` | owner only | Tokens with roles, scopes, sensitive grants and deny list; never a secret. No `tokens.create`: credentials never ride MCP responses. |
-| Prompt | `summarize_today` | `events:read` + `logs:read` | 24 h household summary. |
-| Prompt | `draft_automation` | `devices:list` | Composes `oxidhome://devices` + per-device detail. |
-| Prompt | `explain_recent_errors` | `logs:read` | 24 h error-log walk. |
+| Tool | `tokens.list` | owner only | Tokens with their owner flag and roles; never a secret. No `tokens.create`: credentials never ride MCP responses. |
+| Prompt | `summarize_today` | `event.read` + `host.logs` | 24 h household summary. |
+| Prompt | `draft_automation` | `device.list` | Composes `oxidhome://devices` + per-device detail. |
+| Prompt | `explain_recent_errors` | `host.logs` | 24 h error-log walk. |
 
 Every resource and tool body passes through the host's redaction pass
 (`crates/oxidhome-core/src/redact.rs`): values under credential-looking

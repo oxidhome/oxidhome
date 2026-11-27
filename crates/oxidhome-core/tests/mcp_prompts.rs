@@ -17,6 +17,7 @@
 #[path = "support.rs"]
 mod _support;
 
+use _support::Mint;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -42,14 +43,13 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 }
 
 fn mint_bearer(engine: &Engine) -> String {
-    mint_bearer_with_scopes(engine, "wildcard", &["*"])
+    mint_bearer_with_actions(engine, "wildcard", &["*"])
 }
 
-fn mint_bearer_with_scopes(engine: &Engine, id: &str, scopes: &[&str]) -> String {
-    let scope_json = serde_json::to_vec(scopes).expect("scopes serialize");
+fn mint_bearer_with_actions(engine: &Engine, id: &str, scopes: &[&str]) -> String {
     engine
         .auth_tokens()
-        .create(id, &scope_json)
+        .mint(id, scopes)
         .expect("mint bearer")
         .plaintext
 }
@@ -238,7 +238,7 @@ async fn list_prompts_advertises_all_three_with_metadata() {
 #[tokio::test(flavor = "current_thread")]
 async fn list_prompts_is_public_regardless_of_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "no-scopes", &[]);
+    let bearer = mint_bearer_with_actions(&engine, "no-scopes", &[]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -277,13 +277,13 @@ async fn get_prompt_unknown_name_returns_invalid_params() {
     );
 }
 
-/// 14.6: `summarize_today` requires `events:read` + `logs:read`.
+/// 14.6: `summarize_today` requires `event.read` + `host.logs`.
 /// A token holding only one lands as `-32001 SCOPE_DENIED` and
 /// the message names the missing scope so a caller can react.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_summarize_today_requires_both_scopes() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only", &["logs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "logs-only", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -298,21 +298,21 @@ async fn get_prompt_summarize_today_requires_both_scopes() {
     assert_eq!(response["error"]["code"], -32001);
     let message = response["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("events:read"),
+        message.contains("event.read"),
         "denied message must name the missing scope; got `{message}`",
     );
 }
 
-/// `summarize_today` checks `events:read` first, then `logs:read`:
+/// `summarize_today` checks `event.read` first, then `host.logs`:
 /// the denial names the first missing scope in that order.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_summarize_today_names_the_first_missing_scope() {
     let engine = Engine::new().expect("engine");
     for (label, scopes, missing) in [
-        ("events-only", &["events:read"][..], "logs:read"),
-        ("neither", &["devices:list"][..], "events:read"),
+        ("events-only", &["event.read"][..], "host.logs"),
+        ("neither", &["device.list"][..], "event.read"),
     ] {
-        let bearer = mint_bearer_with_scopes(&engine, label, scopes);
+        let bearer = mint_bearer_with_actions(&engine, label, scopes);
         let (router, session) = handshake(build_router(engine.clone()), &bearer).await;
         let response = call(
             &router,
@@ -326,16 +326,16 @@ async fn get_prompt_summarize_today_names_the_first_missing_scope() {
         let message = response["error"]["message"].as_str().expect("message");
         assert_eq!(
             message,
-            format!("scope `{missing}` required for prompt `summarize_today`"),
+            format!("permission `{missing}` required for prompt `summarize_today`"),
             "{label}",
         );
     }
 }
 
-/// 14.6: `draft_automation` requires `devices:list` AND both
+/// 14.6: `draft_automation` requires `device.list` AND both
 /// `trigger` + `action` arguments. Missing arguments land as
 /// `-32602`; missing scope as `-32001`. (Round-2 P1 on PR #135
-/// simplified the scope requirement to `devices:list` alone —
+/// simplified the scope requirement to `device.list` alone —
 /// see [`get_prompt_draft_automation_uses_only_devices_list_scope`].)
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_draft_automation_rejects_missing_args_and_scope() {
@@ -382,16 +382,16 @@ async fn get_prompt_draft_automation_rejects_missing_args_and_scope() {
 }
 
 /// 14.6: `draft_automation` under a token WITHOUT
-/// `devices:list` (but with valid arguments) lands as
+/// `device.list` (but with valid arguments) lands as
 /// `-32001` — argument shape is validated first, but the
-/// scope check is still enforced. Round-2 P1 on PR #135
-/// simplified requirements to `devices:list` alone (see
+/// permission check is still enforced. Round-2 P1 on PR #135
+/// simplified requirements to `device.list` alone (see
 /// [`get_prompt_draft_automation_uses_only_devices_list_scope`]);
 /// this test locks in the deny path.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_draft_automation_requires_devices_list_scope() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "no-devices", &["logs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "no-devices", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -411,11 +411,11 @@ async fn get_prompt_draft_automation_requires_devices_list_scope() {
         response["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("devices:list"),
+            .contains("device.list"),
     );
 }
 
-/// 14.6: `draft_automation` with wildcard scope + valid
+/// 14.6: `draft_automation` with a `*` role + valid
 /// arguments returns rendered messages. The interpolated
 /// `trigger` and `action` MUST appear verbatim in the user
 /// message, and the result carries a description.
@@ -502,19 +502,19 @@ async fn get_prompts_reference_the_composed_resources() {
 }
 
 /// Round-2 P1 on PR #135: `draft_automation` needs ONLY
-/// `devices:list` (both `oxidhome://devices` and
+/// `device.list` (both `oxidhome://devices` and
 /// `oxidhome://devices/{id}` are gated on it — round-2 F1 on
 /// PR #120 deliberately unified them). The round-1 fix
-/// over-required `plugins:list` + `devices:read` on top,
+/// over-required `plugin.read` + `device.read` on top,
 /// which rejected correctly-scoped least-privilege tokens.
-/// This test locks in that a `devices:list`-only token
+/// This test locks in that a `device.list`-only token
 /// succeeds AND that neither of the over-required scopes is
 /// mentioned in a denial message.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_draft_automation_uses_only_devices_list_scope() {
     let engine = Engine::new().expect("engine");
-    // Positive: devices:list alone succeeds.
-    let bearer = mint_bearer_with_scopes(&engine, "devices-only", &["devices:list"]);
+    // Positive: device.list alone succeeds.
+    let bearer = mint_bearer_with_actions(&engine, "devices-only", &["device.list"]);
     let router = build_router(engine.clone());
     let (router, session) = handshake(router, &bearer).await;
     let response = call(
@@ -530,12 +530,12 @@ async fn get_prompt_draft_automation_uses_only_devices_list_scope() {
     .await;
     assert!(
         response["error"].is_null(),
-        "devices:list alone must satisfy draft_automation; got {response}",
+        "device.list alone must satisfy draft_automation; got {response}",
     );
 
-    // Negative: a token missing `devices:list` gets denied on
-    // `devices:list` (not on some other over-required scope).
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only-draft", &["logs:read"]);
+    // Negative: a token missing `device.list` gets denied on
+    // `device.list` (not on some other over-required scope).
+    let bearer = mint_bearer_with_actions(&engine, "logs-only-draft", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
     let response = call(
@@ -552,12 +552,12 @@ async fn get_prompt_draft_automation_uses_only_devices_list_scope() {
     assert_eq!(response["error"]["code"], -32001);
     let message = response["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("devices:list"),
-        "denial must name devices:list; got `{message}`",
+        message.contains("device.list"),
+        "denial must name device.list; got `{message}`",
     );
     // The round-1 over-required scopes must NOT be enforced —
     // a future refactor that reintroduces them fails here.
-    for over_scope in ["devices:read", "plugins:list"] {
+    for over_scope in ["device.read", "plugin.read"] {
         assert!(
             !message.contains(over_scope),
             "denial must not name {over_scope} (over-requirement regressed); got `{message}`",
@@ -568,7 +568,7 @@ async fn get_prompt_draft_automation_uses_only_devices_list_scope() {
 /// Round-1 P1 + P2 on PR #135: the `draft_automation` template
 /// body must (a) direct the client to real devices via
 /// `oxidhome://devices` (P1: plugin metadata doesn't identify
-/// devices) and (b) name the correct scope `devices:command`
+/// devices) and (b) name the correct permission `device.command`
 /// for the executed action (P2: there is no `plugins:command`
 /// scope).
 #[tokio::test(flavor = "current_thread")]
@@ -597,8 +597,8 @@ async fn get_prompt_draft_automation_body_references_devices_and_correct_scope()
         "draft_automation must direct client to the devices resource; got:\n{text}",
     );
     assert!(
-        text.contains("devices:command"),
-        "draft_automation must name `devices:command` (not `plugins:command`); got:\n{text}",
+        text.contains("device.command"),
+        "draft_automation must name `device.command` (not `plugins:command`); got:\n{text}",
     );
     assert!(
         !text.contains("plugins:command"),
@@ -744,12 +744,12 @@ async fn get_prompt_explain_recent_errors_does_not_reference_events_for_failures
 }
 
 /// Round-1 P1 on PR #135: `explain_recent_errors` no longer
-/// needs `events:read` since it doesn't read events; scope
-/// requirement is `logs:read` alone.
+/// needs `event.read` since it doesn't read events; scope
+/// requirement is `host.logs` alone.
 #[tokio::test(flavor = "current_thread")]
 async fn get_prompt_explain_recent_errors_requires_only_logs_read() {
     let engine = Engine::new().expect("engine");
-    let bearer = mint_bearer_with_scopes(&engine, "logs-only-explain", &["logs:read"]);
+    let bearer = mint_bearer_with_actions(&engine, "logs-only-explain", &["host.logs"]);
     let router = build_router(engine);
     let (router, session) = handshake(router, &bearer).await;
 
@@ -763,7 +763,7 @@ async fn get_prompt_explain_recent_errors_requires_only_logs_read() {
     .await;
     assert!(
         response["error"].is_null(),
-        "logs:read alone must satisfy explain_recent_errors post-fix; got {response}",
+        "host.logs alone must satisfy explain_recent_errors post-fix; got {response}",
     );
     assert_ne!(
         response["result"]["messages"].as_array().unwrap(),

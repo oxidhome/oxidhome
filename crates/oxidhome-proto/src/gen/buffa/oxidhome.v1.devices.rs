@@ -633,9 +633,9 @@ pub struct Device {
     )]
     pub category: ::buffa::alloc::string::String,
     /// Sensitive categories the device falls under (`lock`, `opener`,
-    /// `alarm`, `camera`). A token needs an explicit grant for each: no
-    /// scope, the wildcard included, reaches a command on a lock, opener
-    /// or alarm, or a camera's bytes.
+    /// `alarm`, `camera`). A command on a lock, opener or alarm, or a
+    /// camera's bytes, needs a role grant whose `category` names it; `*`
+    /// doesn't reach them.
     ///
     /// Field 5: `sensitive`
     #[serde(

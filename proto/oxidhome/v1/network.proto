@@ -9,7 +9,7 @@ package oxidhome.v1;
 
 // NetworkService — trust-on-first-use certificate pins.
 service NetworkService {
-  // List pins, optionally for one instance. Gated on `instances:list`.
+  // List pins, optionally for one instance. Gated on `instance.read`.
   rpc ListTlsPins(ListTlsPinsRequest) returns (ListTlsPinsResponse);
   // Remove pins so the next request pins again. Owner token only
   // (`policy.manage`). Needs an instance, or `all` to reset every pin.

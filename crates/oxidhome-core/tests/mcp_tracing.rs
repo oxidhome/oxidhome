@@ -12,6 +12,7 @@
 #[path = "support.rs"]
 mod _support;
 
+use _support::Mint;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +46,7 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 fn mint_bearer(engine: &Engine) -> String {
     engine
         .auth_tokens()
-        .create("test", b"[\"*\"]")
+        .mint("test", &["*"])
         .expect("mint bearer")
         .plaintext
 }
@@ -338,10 +339,9 @@ fn error_paths_carry_stable_outcome_tags() {
     with_default(subscriber, || {
         rt.block_on(async {
             let engine = Engine::new().expect("engine");
-            let scope_json = serde_json::to_vec(&Vec::<String>::new()).unwrap();
             let bearer = engine
                 .auth_tokens()
-                .create("no-scope", &scope_json)
+                .mint("no-scope", &[])
                 .unwrap()
                 .plaintext;
             let router = build_router(engine);

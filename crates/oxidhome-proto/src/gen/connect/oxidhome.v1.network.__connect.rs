@@ -147,7 +147,7 @@ pub const NETWORK_SERVICE_RESET_TLS_PINS_SPEC: ::connectrpc::Spec = ::connectrpc
 /// example` doc.
 #[allow(clippy::type_complexity)]
 pub trait NetworkService: Send + Sync + 'static {
-    /// List pins, optionally for one instance. Gated on `instances:list`.
+    /// List pins, optionally for one instance. Gated on `instance.read`.
     ///
     /// `'a` lets the response body borrow from `&self` (e.g. server-resident state).
     ///

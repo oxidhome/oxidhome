@@ -1,68 +1,41 @@
-//! Owner-defined roles, resource selectors and the deny list (H6
-//! slice 3).
+//! Roles: what a token may do.
 //!
-//! A **role** is a named bundle the owner stores in the host
-//! (`auth_role`): grants (actions, optionally narrowed to
-//! device categories and device ids), sensitive categories and deny
-//! entries. A token policy names its roles by id (`"roles":
-//! ["role-…"]`); the bearer middleware resolves those ids to their
-//! current definitions on every request, and
-//! [`crate::auth::authorize()`] evaluates them. There is no second
-//! check path: scopes, roles, the 14.4 constraints, the deny list and
-//! the sensitive rule are all evaluated in that one function. Editing
-//! a role changes every token holding it from the next request on; a
-//! reference to a deleted role grants nothing.
-//!
-//! The host ships no roles. `owner` is not a role: it is the token the
-//! host recorded at bootstrap or `recover-admin-token`
-//! (`auth_token.owner`).
+//! A token holds roles by name and nothing else. A **role** is a list
+//! of [`RoleGrant`]s; a grant names actions and may narrow them to
+//! device categories and device ids. Four roles are built in
+//! ([`builtin`]): `admin`, `member`, `guest` and `agent`. The owner
+//! adds custom ones (`auth_role`, keyed by name). Access is absent
+//! unless a grant gives it; there is no deny list.
 //!
 //! # Grants
 //!
-//! A [`RoleGrant`] names actions (`*` is every action a scope can
-//! grant; `token.manage`, `policy.manage` and `state.read` can't be
-//! granted). Without selectors it covers every resource. A `services`
-//! selector (H6 slice 4) narrows `service.call`, the delegation grant
-//! every `call-service` hop of an invocation the token roots needs, to
-//! the services it names: `<plugin>` or `<plugin>/<local-id>`, each
-//! half literal or `prefix*`. It can't be combined with the device
-//! selectors. With a `category` and / or `devices` selector it covers a
-//! device whose display category is listed and whose id matches a
-//! pattern, and the *pre-check* on the device kind
-//! ([`crate::auth::Resource::PreCheck`]), since the per-device check
-//! follows; it never covers a whole collection (a list or stream that
-//! releases every device's data), a plugin, an instance, a blob, a
-//! dashboard or the host. List endpoints that filter per device
-//! (`GET /api/v1/devices`, Connect `ListDevices`, MCP
-//! `oxidhome://devices`) pre-check and then ask per row.
+//! [`RoleGrant::actions`] names actions; `*` is every action a role can
+//! hold ([`GRANTABLE`]: all but the owner's `token.manage` and
+//! `policy.manage`). A grant without selectors covers every resource
+//! that isn't sensitive. With a `category` and / or `devices` selector
+//! it names only [`NARROWABLE`] actions (a narrowed `*` means those)
+//! and covers a device whose display category (only while the device
+//! is registered: an offline device's display category is unknown) or
+//! sensitive set (the host's durable floor) is listed, and whose id
+//! matches a pattern (`dev-…`,
+//! literal or `prefix*`). A `category` grant also covers a camera
+//! instance's blob when it lists `camera`. A narrowed grant covers the
+//! pre-check on devices and blobs ([`crate::auth::Resource::PreCheck`]),
+//! since the per-target check follows, and never a whole collection.
 //!
-//! A role's sensitive categories add to the token's own sensitive
-//! grants: they still only apply on top of a grant for the action.
+//! # Sensitive categories
 //!
-//! # Deny list
-//!
-//! A [`DenyRule`] (on the token or on one of its roles) names actions
-//! (or `*`) and optionally narrows them to device categories and
-//! device ids. A matching deny refuses the action whatever grants it:
-//! a scope, a role, the wildcard, a sensitive grant, the owner flag.
-//! Matching is conservative: a category deny matches a device whose
-//! display category *or* sensitive set names the category (and every
-//! device not registered right now, whose display category is
-//! unknown); any rule with a selector matches a whole collection of
-//! devices, events or blobs (which may contain a denied device); a
-//! device-narrowed rule matches every blob (a blob names no device) and
-//! a category rule a camera instance's blob when it names `camera`. No
-//! rule with a selector matches a pre-check, so a deny on locks doesn't
-//! stop a token from commanding lights. A `services` deny matches only
-//! the services it names; a device selector never matches a service
-//! (services carry no category yet), so a deny of `service.call` on
-//! some services names them.
+//! A command on a `lock`, `opener` or `alarm` device, and reading a
+//! camera's bytes, need a grant whose `category` names every such
+//! category of the target: `{"actions": ["device.command"],
+//! "category": ["lock"]}`. A grant without `category` never reaches
+//! them, `*` included.
 
 use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 
-use super::authorize::{Action, Resource, ResourceKind, ServiceResource};
-use super::category::{DeviceCategory, SensitiveCategory};
-use super::policy::match_pattern;
+use super::authorize::{Action, Resource, ResourceKind};
+use super::category::{DeviceCategory, SensitiveCategory, SensitiveSet};
 
 /// A set of [`Action`]s, as a bit set over [`Action::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -78,7 +51,7 @@ impl ActionSet {
     /// Every action.
     pub const ALL: Self = Self::of(&Action::ALL);
 
-    /// The set of `actions`.
+    /// The set holding `actions`.
     #[must_use]
     pub const fn of(actions: &[Action]) -> Self {
         let mut bits = 0;
@@ -90,13 +63,13 @@ impl ActionSet {
         Self(bits)
     }
 
-    /// `self` with every action of `other` added.
+    /// Actions in either set.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
-    /// `self` without the actions of `other`.
+    /// Actions in `self` but not in `other`.
     #[must_use]
     pub const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
@@ -108,71 +81,25 @@ impl ActionSet {
         self.0 & action.bit() != 0
     }
 
-    /// `true` when every action of `other` is in the set.
-    #[must_use]
-    pub const fn contains_all(self, other: Self) -> bool {
-        other.0 & !self.0 == 0
-    }
-
-    /// `self` with only the actions also in `other`.
-    #[must_use]
-    pub const fn intersection(self, other: Self) -> Self {
-        Self(self.0 & other.0)
-    }
-
-    /// `true` for the empty set.
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// The actions in [`Action::ALL`] order.
+    /// The actions, in [`Action::ALL`] order.
     pub fn iter(self) -> impl Iterator<Item = Action> {
         Action::ALL.into_iter().filter(move |a| self.contains(*a))
     }
 
-    /// Wire names: `["*"]` for every action, else each `kind.verb`.
+    /// The actions' names.
     #[must_use]
     pub fn names(self) -> Vec<&'static str> {
-        if self == Self::ALL {
-            vec!["*"]
-        } else {
-            self.iter().map(Action::as_str).collect()
-        }
-    }
-
-    /// Parse wire names (`kind.verb` or `*`).
-    ///
-    /// # Errors
-    ///
-    /// The first unknown name.
-    pub fn parse<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, UnknownName> {
-        let mut set = Self::empty();
-        for name in names {
-            set = set.union(if name == "*" {
-                Self::ALL
-            } else {
-                Self::of(&[name.parse()?])
-            });
-        }
-        Ok(set)
+        self.iter().map(Action::as_str).collect()
     }
 }
 
-impl FromIterator<Action> for ActionSet {
-    fn from_iter<I: IntoIterator<Item = Action>>(iter: I) -> Self {
-        iter.into_iter()
-            .fold(Self::empty(), |set, a| set.union(Self::of(&[a])))
-    }
-}
-
-/// An unknown action name.
+/// An action name the host doesn't know.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind} `{name}`")]
 pub struct UnknownName {
-    /// `action`.
+    /// What was named (`action`).
     pub kind: &'static str,
-    /// The name as given.
+    /// The name.
     pub name: String,
 }
 
@@ -190,119 +117,281 @@ impl FromStr for Action {
     }
 }
 
-/// Every action some scope grants: what `*` reaches, and what a role
-/// grant may name.
-pub const SCOPED: ActionSet = ActionSet::ALL.without(ActionSet::of(&[
-    Action::TokenManage,
-    Action::PolicyManage,
-    Action::StateRead,
-]));
+/// Every action a role can grant: all but the owner's.
+pub const GRANTABLE: ActionSet =
+    ActionSet::ALL.without(ActionSet::of(&[Action::TokenManage, Action::PolicyManage]));
 
-/// The actions a `services` selector may narrow: a narrowed `*`
-/// means these.
-pub const SERVICE_NARROWABLE: ActionSet = ActionSet::of(&[Action::ServiceCall]);
+/// Most device patterns one grant lists.
+pub const MAX_GRANT_DEVICES: usize = 64;
 
-/// The actions a role grant may narrow to devices: the ones whose
-/// target is a device. A narrowed `*` means these.
+/// The actions a grant narrowed to categories or devices may name.
 pub const NARROWABLE: ActionSet = ActionSet::of(&[
     Action::DeviceList,
     Action::DeviceRead,
     Action::DeviceCommand,
+    Action::BlobRead,
 ]);
 
-/// One grant of a role: actions, optionally narrowed to devices or to
-/// services.
-///
-/// Wire shape: `{"actions": ["device.read"], "category": ["light"],
-/// "devices": ["dev-a1b2*"]}` or `{"actions": ["service.call"],
-/// "services": ["acme.notify/send"]}`; `category`, `devices` and
-/// `services` are optional and non-empty when present; `category` and
-/// `devices` must both match when both are given, and `services`
-/// stands alone.
+/// One grant of a role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleGrant {
-    /// Actions granted (a subset of [`SCOPED`]).
+    /// Actions granted.
     pub actions: ActionSet,
-    /// Display categories the grant is narrowed to.
+    /// `true` when the grant named `*`: it is stored as `*`, so it
+    /// covers actions a later release adds, while an explicit list
+    /// stays that list.
+    pub wildcard: bool,
+    /// Device categories the grant is narrowed to; `None` for every
+    /// non-sensitive target. Names the sensitive categories it reaches.
     pub categories: Option<Vec<DeviceCategory>>,
-    /// Device-id patterns (literal or `prefix*`) the grant is narrowed
-    /// to.
+    /// Device id patterns (`dev-…`, literal or `prefix*`); `None` for
+    /// every device.
     pub devices: Option<Vec<String>>,
-    /// Service patterns (`<plugin>[/<local-id>]`, see
-    /// [`service_pattern_matches`]) the grant is narrowed to.
-    pub services: Option<Vec<String>>,
 }
 
 impl RoleGrant {
-    /// `true` when this grant permits `action` on `resource`.
+    /// `true` when the grant covers `action` on `resource`, whose
+    /// sensitive categories `sensitive` it must name.
     #[must_use]
-    pub fn permits(&self, action: Action, resource: &Resource) -> bool {
+    pub fn permits(&self, action: Action, resource: &Resource, sensitive: SensitiveSet) -> bool {
         if !self.actions.contains(action) {
             return false;
         }
-        if let Some(services) = &self.services {
-            return matches!(resource, Resource::Service(svc) if services.iter().any(|p| service_pattern_matches(p, svc)));
-        }
-        if self.categories.is_none() && self.devices.is_none() {
-            return true;
-        }
+        let names_all = sensitive.iter().all(|s| {
+            self.categories
+                .as_ref()
+                .is_some_and(|c| c.contains(&s.category()))
+        });
         match resource {
-            // A category needs a device registered right now: an
-            // offline one's display category is unknown.
             Resource::Device(d) => {
-                self.categories
-                    .as_ref()
-                    .is_none_or(|c| d.class().is_registered() && c.contains(&d.class().category()))
+                let class = d.class();
+                // The display category is known only while the device
+                // is registered; its sensitive set is the host's durable
+                // floor, known offline too.
+                names_all
+                    && self.categories.as_ref().is_none_or(|c| {
+                        c.iter().any(|c| {
+                            (class.is_registered() && *c == class.category())
+                                || c.sensitive().is_some_and(|s| class.sensitive().contains(s))
+                        })
+                    })
                     && self
                         .devices
                         .as_ref()
                         .is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
             }
-            Resource::PreCheck(ResourceKind::Device) => true,
-            _ => false,
+            // A blob names no device; a camera instance's blob is
+            // reached by a grant naming `camera`.
+            Resource::Blob(b) => {
+                names_all
+                    && self.devices.is_none()
+                    && self
+                        .categories
+                        .as_ref()
+                        .is_none_or(|c| b.is_camera() && c.contains(&DeviceCategory::Camera))
+            }
+            Resource::PreCheck(ResourceKind::Device | ResourceKind::Blob) => true,
+            _ => self.categories.is_none() && self.devices.is_none(),
         }
     }
 
-    /// The wire form.
-    #[must_use]
-    pub fn to_json(&self) -> serde_json::Value {
-        selector_json(
-            self.actions,
-            self.categories.as_deref(),
-            self.devices.as_deref(),
-            self.services.as_deref(),
-        )
+    /// The action names as written: `["*"]` for a wildcard grant.
+    fn action_names(&self) -> Vec<&'static str> {
+        if self.wildcard {
+            vec!["*"]
+        } else {
+            self.actions.names()
+        }
     }
 
-    /// A short human form: `device.read,device.command@light[dev-a1*]`.
+    /// The grant as role-definition JSON.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("actions".into(), serde_json::json!(self.action_names()));
+        if let Some(c) = &self.categories {
+            obj.insert(
+                "category".into(),
+                serde_json::json!(c.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
+            );
+        }
+        if let Some(d) = &self.devices {
+            obj.insert("devices".into(), serde_json::json!(d));
+        }
+        serde_json::Value::Object(obj)
+    }
+
+    /// One-line form for listings: `actions[@categories][[devices]]`.
     #[must_use]
     pub fn describe(&self) -> String {
-        describe(
-            self.actions,
-            self.categories.as_deref(),
-            self.devices.as_deref(),
-            self.services.as_deref(),
-        )
+        let mut s = self.action_names().join(",");
+        if let Some(c) = &self.categories {
+            s.push('@');
+            s.push_str(&c.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","));
+        }
+        if let Some(d) = &self.devices {
+            s.push('[');
+            s.push_str(&d.join(" "));
+            s.push(']');
+        }
+        s
     }
 }
 
-/// An owner-defined role, resolved from `auth_role` for one request.
+/// A role: its name and grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDef {
-    /// Stable id (`role-<16 hex>`), what token policies reference.
-    pub id: String,
-    /// Operator-facing name, unique.
+    /// Unique name.
     pub name: String,
     /// What the role grants.
     pub grants: Vec<RoleGrant>,
-    /// Sensitive categories the role grants (on every device).
-    pub sensitive: Vec<SensitiveCategory>,
-    /// What the role denies.
-    pub deny: Vec<DenyRule>,
+}
+
+/// One grant as stored and sent: names, not parsed values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantWire {
+    /// Action names, or `*`.
+    pub actions: Vec<String>,
+    /// Device categories. Omitted for no narrowing; `null` is refused,
+    /// so it can't be mistaken for a narrowing that was dropped.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_list"
+    )]
+    pub category: Option<Vec<String>>,
+    /// Device id patterns. Omitted for no narrowing; `null` is refused.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_list"
+    )]
+    pub devices: Option<Vec<String>>,
+}
+
+/// A selector key that is present must hold a list: `null` doesn't
+/// read as "absent".
+fn present_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    <Vec<String> as serde::Deserialize>::deserialize(d).map(Some)
+}
+
+/// Why a grant was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("grant {index}: {reason}")]
+pub struct GrantError {
+    /// Position in the role's grant list.
+    pub index: usize,
+    /// What is wrong with it.
+    pub reason: String,
+}
+
+impl GrantWire {
+    fn parse(self) -> Result<RoleGrant, String> {
+        if self.actions.is_empty() {
+            return Err("names no action".into());
+        }
+        let narrowed = self.category.is_some() || self.devices.is_some();
+        let allowed = if narrowed { NARROWABLE } else { GRANTABLE };
+        let mut actions = ActionSet::empty();
+        let wildcard = self.actions.iter().any(|n| n == "*");
+        for name in &self.actions {
+            actions = actions.union(if name == "*" {
+                allowed
+            } else {
+                let action: Action = name.parse().map_err(|e: UnknownName| e.to_string())?;
+                if !allowed.contains(action) {
+                    return Err(if narrowed {
+                        format!("`{name}` can't be narrowed to categories or devices")
+                    } else {
+                        format!("`{name}` is the owner's alone")
+                    });
+                }
+                ActionSet::of(&[action])
+            });
+        }
+        let categories = match self.category {
+            None => None,
+            Some(c) if c.is_empty() => return Err("`category` is empty".into()),
+            Some(c) => {
+                let mut out: Vec<DeviceCategory> = Vec::with_capacity(c.len());
+                for name in &c {
+                    let c: DeviceCategory = name.parse().map_err(|e| format!("{e}"))?;
+                    if !out.contains(&c) {
+                        out.push(c);
+                    }
+                }
+                Some(out)
+            }
+        };
+        if let Some(d) = &self.devices {
+            if d.is_empty() {
+                return Err("`devices` is empty".into());
+            }
+            if d.len() > MAX_GRANT_DEVICES {
+                return Err(format!(
+                    "`devices` lists at most {MAX_GRANT_DEVICES} patterns"
+                ));
+            }
+            if let Some(bad) = d.iter().find(|p| !crate::state::is_device_pattern(p)) {
+                return Err(format!(
+                    "`{bad}` is not a device id or a `dev-…*` prefix pattern"
+                ));
+            }
+        }
+        let devices = self.devices.map(|d| {
+            let mut out: Vec<String> = Vec::with_capacity(d.len());
+            for p in d {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            out
+        });
+        Ok(RoleGrant {
+            actions,
+            wildcard,
+            categories,
+            devices,
+        })
+    }
 }
 
 impl RoleDef {
-    /// Every action any grant of this role names.
+    /// Build a role from wire grants.
+    ///
+    /// # Errors
+    ///
+    /// The first grant that doesn't parse.
+    pub fn from_wire(name: &str, grants: Vec<GrantWire>) -> Result<Self, GrantError> {
+        let grants = grants
+            .into_iter()
+            .enumerate()
+            .map(|(index, g)| g.parse().map_err(|reason| GrantError { index, reason }))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            name: name.to_owned(),
+            grants,
+        })
+    }
+
+    /// Parse a stored definition (a JSON array of grants). `None` when
+    /// it doesn't parse: the role then grants nothing.
+    #[must_use]
+    pub fn parse(name: &str, definition: &[u8]) -> Option<Self> {
+        let wire: Vec<GrantWire> = serde_json::from_slice(definition).ok()?;
+        Self::from_wire(name, wire).ok()
+    }
+
+    /// The stored form of [`Self::grants`].
+    #[must_use]
+    pub fn definition_json(&self) -> Vec<u8> {
+        serde_json::Value::Array(self.grants.iter().map(RoleGrant::to_json).collect())
+            .to_string()
+            .into_bytes()
+    }
+
+    /// Every action some grant names.
     #[must_use]
     pub fn actions(&self) -> ActionSet {
         self.grants
@@ -310,314 +399,25 @@ impl RoleDef {
             .fold(ActionSet::empty(), |set, g| set.union(g.actions))
     }
 
-    /// The first grant covering `action` on `resource`.
+    /// `true` when a grant covers `action` on `resource`.
     #[must_use]
-    pub fn permits(&self, action: Action, resource: &Resource) -> bool {
-        self.grants.iter().any(|g| g.permits(action, resource))
-    }
-
-    /// `true` when one of this role's denies refuses `action` on
-    /// `resource`.
-    #[must_use]
-    pub fn denies(&self, action: Action, resource: &Resource) -> bool {
-        self.deny.iter().any(|d| d.matches(action, resource))
-    }
-
-    /// The stored definition (`auth_role.definition`): everything but
-    /// the id and name.
-    #[must_use]
-    pub fn definition_json(&self) -> Vec<u8> {
-        serde_json::json!({
-            "grants": self.grants.iter().map(RoleGrant::to_json).collect::<Vec<_>>(),
-            "sensitive": self.sensitive.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "deny": self.deny.iter().map(DenyRule::to_json).collect::<Vec<_>>(),
-        })
-        .to_string()
-        .into_bytes()
-    }
-
-    /// Parse a stored definition. `None` when it is malformed (unknown
-    /// field, action, category or sensitive category; an action no
-    /// scope grants; an empty or unmatchable selector): the role then
-    /// grants nothing.
-    #[must_use]
-    pub fn parse(id: &str, name: &str, definition: &[u8]) -> Option<Self> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(default)]
-            grants: Vec<SelectorWire>,
-            #[serde(default)]
-            sensitive: Vec<String>,
-            #[serde(default)]
-            deny: Vec<SelectorWire>,
-        }
-        // An object only: serde would also read `[]` as an empty one.
-        if !matches!(
-            serde_json::from_slice(definition),
-            Ok(serde_json::Value::Object(_))
-        ) {
-            return None;
-        }
-        let wire: Wire = serde_json::from_slice(definition).ok()?;
-        let mut grants = Vec::with_capacity(wire.grants.len());
-        for g in wire.grants {
-            let wildcard = g.actions.iter().any(|a| a == "*");
-            let explicit =
-                ActionSet::parse(g.actions.iter().map(String::as_str).filter(|a| *a != "*"))
-                    .ok()?;
-            let (actions, categories, devices, services) = g.into_parts()?;
-            // `*` is every action a scope grants; naming one no scope
-            // grants refuses the definition.
-            let allowed = if services.is_some() {
-                SERVICE_NARROWABLE
-            } else if categories.is_some() || devices.is_some() {
-                NARROWABLE
-            } else {
-                SCOPED
-            };
-            if !allowed.contains_all(explicit) {
-                return None;
-            }
-            let actions = if wildcard {
-                actions.intersection(allowed)
-            } else {
-                actions
-            };
-            grants.push(RoleGrant {
-                actions,
-                categories,
-                devices,
-                services,
-            });
-        }
-        let mut sensitive = Vec::with_capacity(wire.sensitive.len());
-        for c in &wire.sensitive {
-            let c: SensitiveCategory = c.parse().ok()?;
-            if !sensitive.contains(&c) {
-                sensitive.push(c);
-            }
-        }
-        let mut deny = Vec::with_capacity(wire.deny.len());
-        for d in wire.deny {
-            deny.push(d.into_deny()?);
-        }
-        Some(Self {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            grants,
-            sensitive,
-            deny,
-        })
+    pub fn permits(&self, action: Action, resource: &Resource, sensitive: SensitiveSet) -> bool {
+        self.grants
+            .iter()
+            .any(|g| g.permits(action, resource, sensitive))
     }
 }
 
-/// Wire form of a grant or deny: `{actions, category?, devices?,
-/// services?}`.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SelectorWire {
-    actions: Vec<String>,
-    #[serde(default)]
-    category: Option<Vec<String>>,
-    #[serde(default)]
-    devices: Option<Vec<String>>,
-    #[serde(default)]
-    services: Option<Vec<String>>,
-}
-
-/// Parsed parts of a [`SelectorWire`]: actions, categories, device
-/// patterns, service patterns.
-pub(crate) type SelectorParts = (
-    ActionSet,
-    Option<Vec<DeviceCategory>>,
-    Option<Vec<String>>,
-    Option<Vec<String>>,
-);
-
-impl SelectorWire {
-    /// `None` for an unknown action or category, an empty list, a
-    /// device or service pattern nothing can match, or `services`
-    /// mixed with a device selector: a selector that names nothing
-    /// would silently match nothing.
-    /// A stored deny entry, refused (`None`) when it explicitly names an
-    /// action its selector could never match: a `services` selector
-    /// covers only `service.call`, and a device selector never matches
-    /// a service. A narrowed `*` means what the selector can match.
-    pub(crate) fn into_deny(self) -> Option<DenyRule> {
-        let names = self.actions.clone();
-        let (_, categories, devices, services) = self.into_parts()?;
-        let to_devices = categories.is_some() || devices.is_some();
-        let actions = deny_actions(&names, services.is_some(), to_devices)?;
-        Some(DenyRule {
-            actions,
-            categories,
-            devices,
-            services,
-        })
-    }
-
-    pub(crate) fn into_parts(self) -> Option<SelectorParts> {
-        if self.actions.is_empty()
-            || self.category.as_ref().is_some_and(Vec::is_empty)
-            || self.devices.as_ref().is_some_and(|d| {
-                d.is_empty() || !d.iter().all(|p| crate::state::is_device_pattern(p))
-            })
-            || self
-                .services
-                .as_ref()
-                .is_some_and(|s| s.is_empty() || !s.iter().all(|p| is_service_pattern(p)))
-            || (self.services.is_some() && (self.category.is_some() || self.devices.is_some()))
-        {
-            return None;
-        }
-        let actions = ActionSet::parse(self.actions.iter().map(String::as_str)).ok()?;
-        let categories = self
-            .category
-            .map(|c| {
-                let mut out: Vec<DeviceCategory> = Vec::with_capacity(c.len());
-                for c in &c {
-                    let c = c.parse().ok()?;
-                    if !out.contains(&c) {
-                        out.push(c);
-                    }
-                }
-                Some(out)
-            })
-            .map_or(Some(None), |c| c.map(Some))?;
-        Some((actions, categories, self.devices, self.services))
+/// `true` when `id` matches `pattern` (literal, or `prefix*`).
+pub(crate) fn match_pattern(pattern: &str, id: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => id.starts_with(prefix),
+        None => pattern == id,
     }
 }
 
-/// The actions a deny entry covers, or `None` when an action it names
-/// explicitly (not through `*`) can never match its selector (see
-/// [`SelectorWire::into_deny`]). `names` is the entry's action list;
-pub(crate) fn deny_actions(
-    names: &[String],
-    to_services: bool,
-    to_devices: bool,
-) -> Option<ActionSet> {
-    let actions = ActionSet::parse(names.iter().map(String::as_str)).ok()?;
-    let unmatchable = if to_services {
-        ActionSet::ALL.without(SERVICE_NARROWABLE)
-    } else if to_devices {
-        SERVICE_NARROWABLE
-    } else {
-        return Some(actions);
-    };
-    let explicit = ActionSet::parse(names.iter().map(String::as_str).filter(|n| *n != "*")).ok()?;
-    if !explicit.intersection(unmatchable).is_empty() {
-        return None;
-    }
-    Some(actions.without(unmatchable))
-}
-
-/// Longest plugin half of a service pattern: the longest plugin id,
-/// plus a trailing `*`.
-pub const MAX_SERVICE_PATTERN_PLUGIN_BYTES: usize = oxidhome_manifest::MAX_PLUGIN_ID_BYTES + 1;
-
-/// Longest service pattern a selector accepts: a plugin half of up to
-/// [`MAX_SERVICE_PATTERN_PLUGIN_BYTES`], `/`, and a local-id half of up
-/// to the longest local-id plus a trailing `*`, so every service with
-/// such a plugin id can be named exactly.
-pub const MAX_SERVICE_PATTERN_BYTES: usize =
-    MAX_SERVICE_PATTERN_PLUGIN_BYTES + 1 + oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES + 1;
-
-/// `true` for a service pattern: `<plugin>` or `<plugin>/<local-id>`,
-/// at most [`MAX_SERVICE_PATTERN_BYTES`]. Each half is literal or
-/// `prefix*` (`*` alone matches everything) and must be able to match
-/// a real id: a reverse-DNS plugin id, and a service local-id
-/// ([`oxidhome_manifest::is_service_local_id`], which excludes `*` and
-/// `/`, so every service can be named exactly).
-#[must_use]
-pub fn is_service_pattern(pattern: &str) -> bool {
-    let (plugin, service) = match pattern.split_once('/') {
-        Some((plugin, service)) => (plugin, Some(service)),
-        None => (pattern, None),
-    };
-    pattern.len() <= MAX_SERVICE_PATTERN_BYTES
-        && plugin.len() <= MAX_SERVICE_PATTERN_PLUGIN_BYTES
-        && could_name_plugin(plugin)
-        && service.is_none_or(could_name_local_id)
-}
-
-/// Can local-id pattern `half` (literal or `prefix*`) match some
-/// service local-id?
-fn could_name_local_id(half: &str) -> bool {
-    match half.strip_suffix('*') {
-        Some("") => true,
-        Some(prefix) => {
-            // The local-id itself (empty suffix) or a longer one.
-            oxidhome_manifest::is_service_local_id(prefix)
-        }
-        None => oxidhome_manifest::is_service_local_id(half),
-    }
-}
-
-/// Can plugin pattern `half` (literal or `prefix*`) match some plugin
-/// id? Plugin ids are reverse-DNS: two or more dot-separated labels,
-/// each `[a-z0-9][a-z0-9-]*`. A pattern that matches none would let a
-/// typo'd deny refuse nothing.
-fn could_name_plugin(half: &str) -> bool {
-    let label = |l: &str| {
-        let mut chars = l.chars();
-        chars
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    };
-    match half.strip_suffix('*') {
-        // A prefix: every complete label valid, the open one empty or
-        // the start of a valid label.
-        Some(prefix) => {
-            let mut labels: Vec<&str> = prefix.split('.').collect();
-            let open = labels.pop().unwrap_or_default();
-            // The shortest id it could complete to must fit: a dotless
-            // prefix still needs `.x`, an open empty label one character.
-            let needs = match (labels.is_empty(), open.is_empty()) {
-                (true, false) => 2,
-                (false, true) => 1,
-                (true, true) | (false, false) => 0,
-            };
-            labels.into_iter().all(label)
-                && (open.is_empty() || label(open))
-                && prefix.len() + needs <= oxidhome_manifest::MAX_PLUGIN_ID_BYTES
-        }
-        None => {
-            half.len() <= oxidhome_manifest::MAX_PLUGIN_ID_BYTES
-                && half.contains('.')
-                && half.split('.').all(label)
-        }
-    }
-}
-
-/// Does service pattern `pattern` cover `service`? The plugin half
-/// matches the owning plugin id and the optional `/<local-id>` half the
-/// service's immutable `local-id`; each is literal or `prefix*`.
-#[must_use]
-pub fn service_pattern_matches(pattern: &str, service: &ServiceResource) -> bool {
-    match pattern.split_once('/') {
-        Some((plugin, local)) => {
-            match_pattern(plugin, service.plugin_id()) && match_pattern(local, service.local_id())
-        }
-        None => match_pattern(pattern, service.plugin_id()),
-    }
-}
-
-/// `true` for a role id: `role-` and 16 lowercase hex digits.
-#[must_use]
-pub fn is_role_id(id: &str) -> bool {
-    id.strip_prefix("role-").is_some_and(|hex| {
-        hex.len() == 16
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
-
-/// `true` for a role name: 1–32 of `a-z`, `0-9`, `-`, `_`, starting
-/// with a letter, and not `owner` (which names the host's owner token
-/// in listings).
+/// `true` for a valid role name: 1 to 32 of `a-z0-9-_`, starting with
+/// a letter, and not `owner`.
 #[must_use]
 pub fn is_role_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
@@ -628,189 +428,88 @@ pub fn is_role_name(name: &str) -> bool {
         && name != OWNER_LABEL
 }
 
-/// What listings call the owner token's standing authority. Not a
-/// role and not assignable.
+/// The owner is not a role; this name is refused for one.
 pub const OWNER_LABEL: &str = "owner";
 
-fn selector_json(
-    actions: ActionSet,
-    categories: Option<&[DeviceCategory]>,
-    devices: Option<&[String]>,
-    services: Option<&[String]>,
-) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("actions".into(), serde_json::json!(actions.names()));
-    if let Some(c) = categories {
-        obj.insert(
-            "category".into(),
-            serde_json::json!(c.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
-        );
-    }
-    if let Some(d) = devices {
-        obj.insert("devices".into(), serde_json::json!(d));
-    }
-    if let Some(s) = services {
-        obj.insert("services".into(), serde_json::json!(s));
-    }
-    serde_json::Value::Object(obj)
-}
+/// Names of the built-in roles.
+pub const BUILTIN_ROLES: [&str; 4] = ["admin", "member", "guest", "agent"];
 
-fn describe(
-    actions: ActionSet,
-    categories: Option<&[DeviceCategory]>,
-    devices: Option<&[String]>,
-    services: Option<&[String]>,
-) -> String {
-    let mut s = actions.names().join(",");
-    if let Some(c) = categories {
-        s.push('@');
-        s.push_str(&c.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","));
-    }
-    if let Some(d) = devices {
-        s.push('[');
-        s.push_str(&d.join(" "));
-        s.push(']');
-    }
-    if let Some(svc) = services {
-        // Comma-separated, as `token create --deny` reads them back;
-        // the pattern grammar admits no comma, space or brace.
-        s.push('{');
-        s.push_str(&svc.join(","));
-        s.push('}');
-    }
-    s
-}
-
-/// One entry of a token's deny list.
-///
-/// Wire shape (`"deny"` in the token policy):
-///
-/// ```json
-/// {"actions": ["device.command"], "category": ["lock", "alarm"], "devices": ["dev-a1b2*"]}
-/// ```
-///
-/// `actions` is required and non-empty (`"*"` is every action);
-/// `category`, `devices` and `services` are optional and non-empty when
-/// present; `category` and `devices` must both match when both are
-/// given, and `services` (`["zwave.*/door"]`) stands alone. See the
-/// module docs for how a deny matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DenyRule {
-    /// Actions denied.
-    pub actions: ActionSet,
-    /// Device categories the deny is narrowed to.
-    pub categories: Option<Vec<DeviceCategory>>,
-    /// Device-id patterns (literal or `prefix*`) the deny is narrowed
-    /// to.
-    pub devices: Option<Vec<String>>,
-    /// Service patterns the deny is narrowed to
-    /// ([`service_pattern_matches`]).
-    pub services: Option<Vec<String>>,
-}
-
-impl DenyRule {
-    /// `true` when this rule refuses `action` on `resource`.
-    #[must_use]
-    pub fn matches(&self, action: Action, resource: &Resource) -> bool {
-        deny_matches(
-            self.actions,
-            self.categories.as_deref(),
-            self.devices.as_deref(),
-            self.services.as_deref(),
-            action,
-            resource,
-        )
-    }
-
-    /// The wire form.
-    #[must_use]
-    pub fn to_json(&self) -> serde_json::Value {
-        selector_json(
-            self.actions,
-            self.categories.as_deref(),
-            self.devices.as_deref(),
-            self.services.as_deref(),
-        )
-    }
-
-    /// A short human form: `device.command@lock,alarm[dev-a1*]`.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        describe(
-            self.actions,
-            self.categories.as_deref(),
-            self.devices.as_deref(),
-            self.services.as_deref(),
-        )
-    }
-}
-
-/// Does a device of `category` with sensitive set `sensitive` fall
-/// under any of `selected`?
-fn falls_under(
-    selected: &[DeviceCategory],
-    category: DeviceCategory,
-    sensitive: super::category::SensitiveSet,
-) -> bool {
-    selected
-        .iter()
-        .any(|c| *c == category || c.sensitive().is_some_and(|s| sensitive.contains(s)))
-}
-
-/// The shared deny matcher. See the module docs.
-fn deny_matches(
-    actions: ActionSet,
-    categories: Option<&[DeviceCategory]>,
-    devices: Option<&[String]>,
-    services: Option<&[String]>,
-    action: Action,
-    resource: &Resource,
-) -> bool {
-    if !actions.contains(action) {
-        return false;
-    }
-    if let Some(services) = services {
-        return matches!(resource, Resource::Service(svc) if services.iter().any(|p| service_pattern_matches(p, svc)));
-    }
-    if categories.is_none() && devices.is_none() {
-        return true;
-    }
-    match resource {
-        Resource::Device(d) => {
-            let class = d.class();
-            // An unregistered device's display category is unknown:
-            // every category deny matches it.
-            categories.is_none_or(|c| {
-                !class.is_registered() || falls_under(c, class.category(), class.sensitive())
-            }) && devices.is_none_or(|p| p.iter().any(|p| match_pattern(p, d.id())))
+static BUILTINS: LazyLock<Vec<Arc<RoleDef>>> = LazyLock::new(|| {
+    #[allow(clippy::enum_glob_use)]
+    use Action::*;
+    let sensitive = Some(
+        SensitiveCategory::ALL
+            .iter()
+            .map(|c| c.category())
+            .collect::<Vec<_>>(),
+    );
+    let role = |name: &str, actions: ActionSet, reaches_sensitive: bool| {
+        let mut grants = vec![RoleGrant {
+            actions,
+            wildcard: actions == GRANTABLE,
+            categories: None,
+            devices: None,
+        }];
+        if reaches_sensitive {
+            grants.push(RoleGrant {
+                actions: ActionSet::of(&[DeviceCommand, BlobRead]),
+                wildcard: false,
+                categories: sensitive.clone(),
+                devices: None,
+            });
         }
-        Resource::Blob(b) => {
-            // A blob names no device: a device-narrowed deny refuses
-            // it (whatever else it narrows to); a category deny refuses
-            // a camera instance's blob when it names `camera`.
-            devices.is_some()
-                || categories.is_none_or(|c| {
-                    b.is_camera() && falls_under(c, DeviceCategory::Camera, camera_set())
-                })
-        }
-        // Every device, event or blob: may include a denied device.
-        Resource::Collection(ResourceKind::Device | ResourceKind::Event | ResourceKind::Blob) => {
-            true
-        }
-        // A pre-check: the per-target check that follows decides.
-        Resource::PreCheck(_)
-        | Resource::Collection(_)
-        | Resource::Host
-        | Resource::Plugin(_)
-        | Resource::Instance(_)
-        | Resource::Dashboard(_)
-        // A service carries no device attributes (yet).
-        | Resource::Service(_) => false,
-    }
+        Arc::new(RoleDef {
+            name: name.to_owned(),
+            grants,
+        })
+    };
+    let devices = ActionSet::of(&[DeviceList, DeviceRead, DeviceCommand, EventSubscribe]);
+    vec![
+        role("admin", GRANTABLE, true),
+        role(
+            "member",
+            devices.union(ActionSet::of(&[
+                EventRead,
+                BlobRead,
+                InstanceRead,
+                PluginRead,
+                PluginUi,
+                DashboardRead,
+                DashboardWrite,
+                HostStatus,
+                ServiceCall,
+            ])),
+            true,
+        ),
+        role(
+            "guest",
+            devices.union(ActionSet::of(&[DashboardRead, PluginUi, ServiceCall])),
+            false,
+        ),
+        role(
+            "agent",
+            devices.union(ActionSet::of(&[
+                EventRead,
+                InstanceRead,
+                PluginRead,
+                HostStatus,
+                ServiceCall,
+            ])),
+            false,
+        ),
+    ]
+});
+
+/// The built-in role `name`, if there is one.
+#[must_use]
+pub fn builtin(name: &str) -> Option<Arc<RoleDef>> {
+    BUILTINS.iter().find(|r| r.name == name).cloned()
 }
 
-fn camera_set() -> super::category::SensitiveSet {
-    [SensitiveCategory::Camera].into_iter().collect()
+/// Every built-in role, in [`BUILTIN_ROLES`] order.
+#[must_use]
+pub fn builtins() -> &'static [Arc<RoleDef>] {
+    &BUILTINS
 }
 
 #[cfg(test)]
@@ -818,325 +517,191 @@ mod tests {
     use super::*;
     use crate::auth::DeviceClass;
 
-    fn device(category: DeviceCategory) -> Resource {
-        Resource::device("dev-a1b2c3d4e5f60718", DeviceClass::of(category))
-    }
-
-    /// An offline device's display category is unknown, so every
-    /// category deny matches it; a light whose bytes are camera bytes
-    /// keeps `light` for a deny on lights.
-    #[test]
-    fn category_denies_cover_offline_devices_and_camera_bytes() {
-        let deny = |action: Action, c: DeviceCategory| DenyRule {
-            actions: ActionSet::of(&[action]),
-            categories: Some(vec![c]),
-            devices: None,
-            services: None,
-        };
-        let offline = Resource::device("dev-a1b2c3d4e5f60718", DeviceClass::unregistered());
-        assert!(
-            deny(Action::DeviceRead, DeviceCategory::Sensor).matches(Action::DeviceRead, &offline)
-        );
-        let registered_other = device(DeviceCategory::Other);
-        assert!(
-            !deny(Action::DeviceRead, DeviceCategory::Sensor)
-                .matches(Action::DeviceRead, &registered_other)
-        );
-        let camera_light = Resource::device(
-            "dev-a1b2c3d4e5f60718",
-            DeviceClass::of(DeviceCategory::Light).with_camera_bytes(),
-        );
-        assert!(
-            deny(Action::BlobRead, DeviceCategory::Light).matches(Action::BlobRead, &camera_light)
-        );
-        assert!(
-            deny(Action::BlobRead, DeviceCategory::Camera).matches(Action::BlobRead, &camera_light)
-        );
+    fn grant(json: serde_json::Value) -> Result<RoleGrant, String> {
+        serde_json::from_value::<GrantWire>(json).unwrap().parse()
     }
 
     #[test]
-    fn service_patterns_and_selectors_parse() {
-        for good in [
-            "*",
-            "acme.notify",
-            "acme.*",
-            "acm*",
-            "acme.no*",
-            "acme.notify/send",
-            "acme.*/s*",
-            "a.b/*",
-        ] {
-            assert!(is_service_pattern(good), "{good}");
-        }
-        // The longest names, exactly or as a prefix.
-        let max = oxidhome_manifest::MAX_PLUGIN_ID_BYTES;
-        let plugin = format!("{}.b", "a".repeat(max - 2));
-        let local = "s".repeat(oxidhome_manifest::MAX_SERVICE_LOCAL_ID_BYTES);
-        assert!(is_service_pattern(&format!("{plugin}/{local}")));
-        assert!(is_service_pattern(&format!("{plugin}*/{local}*")));
-        assert!(!is_service_pattern(&format!("{plugin}/{local}s")));
-        assert!(!is_service_pattern(&format!("a{plugin}/x")));
-        // A prefix no id of the longest length can complete.
-        assert!(is_service_pattern(&format!("{}*", "a".repeat(max - 2))));
-        assert!(!is_service_pattern(&format!("{}*", "a".repeat(max - 1))));
-        assert!(!is_service_pattern(&format!("{}.*", "a".repeat(max - 1))));
-        let long = "a".repeat(MAX_SERVICE_PATTERN_BYTES + 1);
+    fn wildcard_is_every_grantable_action_or_every_narrowable_one() {
+        let g = grant(serde_json::json!({"actions": ["*"]})).unwrap();
+        assert_eq!(g.actions, GRANTABLE);
+        assert_eq!(g.to_json(), serde_json::json!({"actions": ["*"]}));
+        // An explicit full list stays explicit: a later action isn't
+        // added to it.
+        let all: Vec<&str> = GRANTABLE.names();
+        let g = grant(serde_json::json!({ "actions": all })).unwrap();
+        assert_eq!(g.actions, GRANTABLE);
+        assert_eq!(g.to_json(), serde_json::json!({ "actions": all }));
+        assert!(!g.actions.contains(Action::TokenManage));
+        let g = grant(serde_json::json!({"actions": ["*"], "category": ["light"]})).unwrap();
+        assert_eq!(g.actions, NARROWABLE);
+        assert_eq!(g.to_json()["actions"], serde_json::json!(["*"]));
+        let narrowable: Vec<&str> = NARROWABLE.names();
+        let g = grant(serde_json::json!({"actions": narrowable, "category": ["light"]})).unwrap();
+        assert_eq!(g.to_json()["actions"], serde_json::json!(narrowable));
+    }
+
+    #[test]
+    fn bad_grants_are_refused() {
         for bad in [
-            "",
-            "/",
-            "acme/",
-            "/send",
-            "a*b",
-            "**",
-            "acme/x*y",
-            "acme/inst/bouncer",
-            "acme.notify /send",
-            "Acme/send",
-            "acme..notify/send",
-            "acme",
-            ".acme*",
-            "acme.-x",
-            "a\nb",
-            long.as_str(),
+            serde_json::json!({"actions": []}),
+            serde_json::json!({"actions": ["nope"]}),
+            serde_json::json!({"actions": ["token.manage"]}),
+            serde_json::json!({"actions": ["host.status"], "category": ["lock"]}),
+            serde_json::json!({"actions": ["device.read"], "category": []}),
+            serde_json::json!({"actions": ["device.read"], "category": ["toaster"]}),
+            serde_json::json!({"actions": ["device.read"], "devices": ["x*"]}),
         ] {
-            assert!(!is_service_pattern(bad), "{bad}");
+            assert!(grant(bad.clone()).is_err(), "{bad}");
         }
-        let def = role(
-            r#"{"grants":[{"actions":["*"],"services":["acme.notify/send"]}],
-                "deny":[{"actions":["service.call"],"services":["zwave.*"]}]}"#,
-        )
-        .expect("parses");
-        assert_eq!(def.grants[0].actions, SERVICE_NARROWABLE);
-        assert_eq!(
-            def.grants[0].services,
-            Some(vec!["acme.notify/send".to_string()])
+        let devices =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("dev-{i:016x}")).collect() };
+        assert!(grant(serde_json::json!({"actions": ["device.read"], "devices": devices(MAX_GRANT_DEVICES)})).is_ok());
+        assert!(grant(serde_json::json!({"actions": ["device.read"], "devices": devices(MAX_GRANT_DEVICES + 1)})).is_err());
+        assert!(
+            serde_json::from_value::<GrantWire>(serde_json::json!({"actions": ["*"], "deny": []}))
+                .is_err()
         );
-        assert_eq!(def.grants[0].describe(), "service.call{acme.notify/send}");
-        let two = RoleGrant {
-            services: Some(vec!["acme.notify/send".into(), "zwave.*".into()]),
-            ..def.grants[0].clone()
-        };
-        assert_eq!(two.describe(), "service.call{acme.notify/send,zwave.*}");
-        assert_eq!(def.deny[0].services, Some(vec!["zwave.*".to_string()]));
-        assert_eq!(
-            RoleDef::parse(&def.id, &def.name, &def.definition_json()).as_ref(),
-            Some(&def)
-        );
-        // `services` stands alone, narrows only `service.call`, and
-        // names something.
-        for bad in [
-            r#"{"grants":[{"actions":["service.call"],"services":["a.b"],"category":["light"]}]}"#,
-            r#"{"deny":[{"actions":["service.call"],"services":["a.b"],"devices":["dev-a*"]}]}"#,
-            r#"{"grants":[{"actions":["device.read"],"services":["a.b"]}]}"#,
-            r#"{"grants":[{"actions":["service.call"],"services":[]}]}"#,
-            r#"{"grants":[{"actions":["service.call"],"services":["a*b"]}]}"#,
-            r#"{"grants":[{"actions":["service.call"],"category":["light"]}]}"#,
+        for null in [
+            serde_json::json!({"actions": ["device.command"], "devices": null}),
+            serde_json::json!({"actions": ["*"], "category": null}),
         ] {
-            assert!(role(bad).is_none(), "{bad}");
-        }
-        // `service.call` is scoped now: an unnarrowed `*` includes it.
-        let all = role(r#"{"grants":[{"actions":["*"]}]}"#).expect("parses");
-        assert!(all.grants[0].actions.contains(Action::ServiceCall));
-    }
-
-    #[test]
-    fn names_round_trip() {
-        for a in Action::ALL {
-            assert_eq!(a.as_str().parse::<Action>(), Ok(a));
-        }
-        assert!("device.unlock".parse::<Action>().is_err());
-        assert!(is_role_id("role-0123456789abcdef"));
-        assert!(!is_role_id("role-0123"));
-        assert!(is_role_name("hall-tablet_2"));
-        for bad in ["", "owner", "Tablet", "2nd", "a b", &"x".repeat(33)] {
-            assert!(!is_role_name(bad), "{bad}");
+            assert!(
+                serde_json::from_value::<GrantWire>(null.clone()).is_err(),
+                "{null}"
+            );
         }
     }
 
     #[test]
-    fn action_set_parses_and_prints() {
-        assert_eq!(ActionSet::parse(["*"]), Ok(ActionSet::ALL));
-        assert_eq!(ActionSet::ALL.names(), vec!["*"]);
-        let s = ActionSet::parse(["device.command", "service.call"]).unwrap();
-        assert_eq!(s.names(), vec!["device.command", "service.call"]);
-        assert!(ActionSet::parse(["device.command", "nope"]).is_err());
-        assert_eq!(ActionSet::ALL.iter().count(), Action::ALL.len());
-        assert!(SCOPED.contains_all(ActionSet::of(&[Action::DeviceRead])));
-        assert!(!SCOPED.contains_all(ActionSet::of(&[Action::DeviceRead, Action::TokenManage])));
-    }
-
-    fn role(definition: &str) -> Option<RoleDef> {
-        RoleDef::parse("role-0123456789abcdef", "r", definition.as_bytes())
+    fn sensitive_targets_need_a_grant_naming_their_category() {
+        let lock = Resource::device("dev-a1", DeviceClass::of(DeviceCategory::Lock));
+        let locks = [SensitiveCategory::Lock].into_iter().collect();
+        let all = grant(serde_json::json!({"actions": ["*"]})).unwrap();
+        assert!(!all.permits(Action::DeviceCommand, &lock, locks));
+        assert!(all.permits(Action::DeviceRead, &lock, SensitiveSet::empty()));
+        let g = grant(serde_json::json!({"actions": ["device.command"], "category": ["lock"]}))
+            .unwrap();
+        assert!(g.permits(Action::DeviceCommand, &lock, locks));
+        let light = Resource::device("dev-b2", DeviceClass::of(DeviceCategory::Light));
+        assert!(!g.permits(Action::DeviceCommand, &light, SensitiveSet::empty()));
+        let camera_blob = Resource::blob("cam", "x", true);
+        let camera = [SensitiveCategory::Camera].into_iter().collect();
+        assert!(!all.permits(Action::BlobRead, &camera_blob, camera));
+        let g =
+            grant(serde_json::json!({"actions": ["blob.read"], "category": ["camera"]})).unwrap();
+        assert!(g.permits(Action::BlobRead, &camera_blob, camera));
+        assert!(!g.permits(
+            Action::BlobRead,
+            &Resource::blob("x", "y", false),
+            SensitiveSet::empty()
+        ));
     }
 
     #[test]
-    fn definitions_parse_round_trip_and_refuse_what_no_scope_grants() {
-        let def = role(
-            r#"{"grants":[{"actions":["device.read","device.command"],"category":["light","light"],"devices":["dev-a1*"]}],
-                "sensitive":["lock","lock"],
-                "deny":[{"actions":["device.command"],"category":["alarm"]}]}"#,
+    fn narrowed_grants_cover_matching_devices_and_pre_checks_only() {
+        let g =
+            grant(serde_json::json!({"actions": ["device.read"], "devices": ["dev-a1*"]})).unwrap();
+        let none = SensitiveSet::empty();
+        assert!(g.permits(
+            Action::DeviceRead,
+            &Resource::device("dev-a1ff", DeviceClass::other()),
+            none
+        ));
+        assert!(!g.permits(
+            Action::DeviceRead,
+            &Resource::device("dev-b2", DeviceClass::other()),
+            none
+        ));
+        assert!(g.permits(
+            Action::DeviceRead,
+            &Resource::pre_check(ResourceKind::Device),
+            none
+        ));
+        assert!(!g.permits(Action::DeviceRead, &Resource::devices(), none));
+        let cat =
+            grant(serde_json::json!({"actions": ["device.read"], "category": ["light"]})).unwrap();
+        assert!(!cat.permits(
+            Action::DeviceRead,
+            &Resource::device("dev-a1", DeviceClass::unregistered()),
+            none
+        ));
+        // An offline device's sensitive floor is still known: a grant
+        // naming it reaches it, a display-category grant still doesn't.
+        let offline_lock = DeviceClass::unregistered()
+            .with_sensitive([SensitiveCategory::Lock].into_iter().collect());
+        assert!(!offline_lock.is_registered());
+        let locks = [SensitiveCategory::Lock].into_iter().collect();
+        let lock = grant(serde_json::json!({"actions": ["device.command"], "category": ["lock"]}))
+            .unwrap();
+        assert!(lock.permits(
+            Action::DeviceCommand,
+            &Resource::device("dev-a1", offline_lock),
+            locks
+        ));
+        assert!(builtin("member").unwrap().permits(
+            Action::DeviceCommand,
+            &Resource::device("dev-a1", offline_lock),
+            locks
+        ));
+        let offline_cam = DeviceClass::unregistered().with_camera_bytes();
+        let cams = [SensitiveCategory::Camera].into_iter().collect();
+        assert!(builtin("admin").unwrap().permits(
+            Action::BlobRead,
+            &Resource::device("dev-a1", offline_cam),
+            cams
+        ));
+        assert!(!cat.permits(
+            Action::DeviceRead,
+            &Resource::device("dev-a1", offline_lock),
+            none
+        ));
+    }
+
+    #[test]
+    fn definitions_round_trip() {
+        let def = RoleDef::parse(
+            "kiosk",
+            br#"[{"actions":["device.read","device.command"],"category":["light"],"devices":["dev-a1*"]},{"actions":["*"]}]"#,
         )
-        .expect("parses");
-        assert_eq!(def.grants[0].categories, Some(vec![DeviceCategory::Light]));
-        assert_eq!(def.sensitive, vec![SensitiveCategory::Lock]);
+        .unwrap();
+        assert_eq!(
+            RoleDef::parse("kiosk", &def.definition_json()),
+            Some(def.clone())
+        );
         assert_eq!(
             def.grants[0].describe(),
             "device.read,device.command@light[dev-a1*]"
         );
-        let again = RoleDef::parse(&def.id, &def.name, &def.definition_json()).unwrap();
-        assert_eq!(again, def);
-        assert_eq!(role("{}").unwrap().grants, vec![]);
-        assert_eq!(
-            role(r#"{"grants":[{"actions":["*"]}]}"#).unwrap().actions(),
-            SCOPED
-        );
-        for bad in [
-            r#"{"grants":[{"actions":["token.manage"]}]}"#,
-            r#"{"grants":[{"actions":["state.read"]}]}"#,
-            r#"{"grants":[{"actions":[]}]}"#,
-            r#"{"grants":[{"actions":["device.read"],"category":[]}]}"#,
-            r#"{"grants":[{"actions":["device.read"],"category":["door"]}]}"#,
-            r#"{"grants":[{"actions":["device.read"],"devices":["lamp"]}]}"#,
-            r#"{"sensitive":["door"]}"#,
-            r#"{"deny":[{"actions":["nope"]}]}"#,
-            r#"{"deny":[{"actions":["device.command"],"services":["acme.notify"]}]}"#,
-            r#"{"grants":[{"actions":["*","device.command"],"services":["acme.notify"]}]}"#,
-            r#"{"grants":[{"actions":["*","token.manage"]}]}"#,
-            r#"{"scopes":["*"]}"#,
-            r#"{"deny":[{"actions":["service.call","device.command"],"category":["lock"]}]}"#,
-            r#"{"grants":[{"actions":["service.call"],"services":["acme.notify/send*x"]}]}"#,
-            r#"{"grants":[{"actions":["service.call"],"services":["acme.notify/Send"]}]}"#,
+        assert!(RoleDef::parse("x", b"{}").is_none());
+    }
+
+    #[test]
+    fn builtins_match_the_plan() {
+        assert_eq!(builtins().len(), BUILTIN_ROLES.len());
+        let lock = Resource::device("dev-a1", DeviceClass::of(DeviceCategory::Lock));
+        let locks = [SensitiveCategory::Lock].into_iter().collect();
+        for (name, sensitive) in [
+            ("admin", true),
+            ("member", true),
+            ("guest", false),
+            ("agent", false),
         ] {
-            assert!(role(bad).is_none(), "{bad}");
+            let r = builtin(name).unwrap();
+            assert_eq!(
+                r.permits(Action::DeviceCommand, &lock, locks),
+                sensitive,
+                "{name}"
+            );
+            assert!(!r.actions().contains(Action::TokenManage));
         }
-    }
-
-    #[test]
-    fn narrowed_grants_cover_devices_and_device_pre_checks_only() {
-        let g = RoleGrant {
-            actions: ActionSet::of(&[
-                Action::DeviceList,
-                Action::DeviceRead,
-                Action::DeviceCommand,
-            ]),
-            categories: Some(vec![DeviceCategory::Light]),
-            devices: None,
-            services: None,
-        };
-        assert!(g.permits(Action::DeviceCommand, &device(DeviceCategory::Light)));
-        assert!(!g.permits(Action::DeviceCommand, &device(DeviceCategory::Switch)));
-        assert!(!g.permits(Action::DeviceCommand, &device(DeviceCategory::Lock)));
-        assert!(g.permits(
-            Action::DeviceList,
-            &Resource::PreCheck(ResourceKind::Device)
-        ));
-        assert!(!g.permits(Action::DeviceRead, &Resource::devices()));
-        assert!(!g.permits(Action::DeviceRead, &Resource::Host));
-        assert!(!g.permits(Action::DeviceRead, &Resource::PreCheck(ResourceKind::Event)));
-        assert!(!g.permits(Action::EventRead, &Resource::events()));
-        let by_id = RoleGrant {
-            categories: None,
-            devices: Some(vec!["dev-a1*".into()]),
-            ..g.clone()
-        };
-        assert!(by_id.permits(Action::DeviceRead, &device(DeviceCategory::Switch)));
-        assert!(!by_id.permits(
-            Action::DeviceRead,
-            &Resource::device(
-                "dev-ff00000000000000",
-                DeviceClass::of(DeviceCategory::Light)
-            )
-        ));
-        let open = RoleGrant {
-            categories: None,
-            devices: None,
-            ..g
-        };
-        assert!(open.permits(Action::DeviceRead, &Resource::devices()));
-    }
-
-    #[test]
-    fn deny_matching_is_conservative() {
-        let lock = DenyRule {
-            actions: ActionSet::of(&[Action::DeviceCommand]),
-            categories: Some(vec![DeviceCategory::Lock]),
-            devices: None,
-            services: None,
-        };
-        assert!(lock.matches(Action::DeviceCommand, &device(DeviceCategory::Lock)));
-        // A light that the host has ever seen as a lock still falls
-        // under `lock` through its sensitive set.
-        let raised = Resource::device(
-            "dev-a1b2c3d4e5f60718",
-            DeviceClass::of(DeviceCategory::Light).raised(DeviceCategory::Lock),
+        assert!(
+            !builtin("agent")
+                .unwrap()
+                .actions()
+                .contains(Action::BlobRead)
         );
-        assert!(lock.matches(Action::DeviceCommand, &raised));
-        assert!(!lock.matches(Action::DeviceCommand, &device(DeviceCategory::Light)));
-        assert!(!lock.matches(Action::DeviceRead, &device(DeviceCategory::Lock)));
-        assert!(!lock.matches(
-            Action::DeviceCommand,
-            &Resource::PreCheck(ResourceKind::Device)
-        ));
-        assert!(lock.matches(Action::DeviceCommand, &Resource::devices()));
-        assert!(!lock.matches(Action::DeviceCommand, &Resource::Host));
-
-        let cam = DenyRule {
-            actions: ActionSet::ALL,
-            categories: Some(vec![DeviceCategory::Camera]),
-            devices: None,
-            services: None,
-        };
-        assert!(cam.matches(Action::BlobRead, &Resource::blob("c", "s", true)));
-        assert!(!cam.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
-        assert!(cam.matches(Action::BlobRead, &Resource::blobs()));
-        assert!(!cam.matches(Action::BlobRead, &Resource::PreCheck(ResourceKind::Blob)));
-
-        let ids = DenyRule {
-            actions: ActionSet::ALL,
-            categories: None,
-            devices: Some(vec!["dev-a1*".into()]),
-            services: None,
-        };
-        assert!(ids.matches(Action::DeviceRead, &device(DeviceCategory::Other)));
-        assert!(!ids.matches(
-            Action::DeviceRead,
-            &Resource::device("dev-ff00000000000000", DeviceClass::other())
-        ));
-        assert!(ids.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
-        // Narrowed to devices and a category: still every blob.
-        let both = DenyRule {
-            categories: Some(vec![DeviceCategory::Light]),
-            ..ids.clone()
-        };
-        assert!(both.matches(Action::BlobRead, &Resource::blob("c", "s", false)));
-        assert!(!ids.matches(Action::PluginRead, &Resource::plugin("acme.lamp")));
-
-        let all = DenyRule {
-            actions: ActionSet::of(&[Action::HostLogs]),
-            categories: None,
-            devices: None,
-            services: None,
-        };
-        assert!(all.matches(Action::HostLogs, &Resource::Host));
-        assert!(!all.matches(Action::HostStatus, &Resource::Host));
-    }
-
-    #[test]
-    fn deny_rule_describes_and_serializes() {
-        let d = DenyRule {
-            actions: ActionSet::of(&[Action::DeviceCommand]),
-            categories: Some(vec![DeviceCategory::Lock, DeviceCategory::Alarm]),
-            devices: Some(vec!["dev-a1*".into()]),
-            services: None,
-        };
-        assert_eq!(d.describe(), "device.command@lock,alarm[dev-a1*]");
-        assert_eq!(
-            d.to_json(),
-            serde_json::json!({
-                "actions": ["device.command"],
-                "category": ["lock", "alarm"],
-                "devices": ["dev-a1*"],
-            })
-        );
+        assert!(builtin("owner").is_none());
+        assert!(!is_role_name("owner"));
     }
 }

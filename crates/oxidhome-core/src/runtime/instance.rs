@@ -1166,6 +1166,12 @@ impl PluginInstance {
         .await
     }
 
+    /// The engine's audit ledger, where a sensitive command's `warn`
+    /// row goes.
+    pub(crate) fn audit_log(&self) -> Option<Arc<crate::state::AuditLog>> {
+        self.store.data().audit_log.clone()
+    }
+
     /// H5: the engine's pending-command table, which also records the
     /// `COMMAND` rows of results its callers no longer wait for.
     pub(crate) fn pending_commands(&self) -> Option<Arc<super::PendingCommands>> {

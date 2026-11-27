@@ -11,29 +11,29 @@
 //! Tools shipped so far:
 //!
 //! - `device.send_command` (14.3a — sensitive, gated on
-//!   `devices:command`; runs two-phase audit for forensic
+//!   `device.command`; runs two-phase audit for forensic
 //!   protection).
-//! - `logs.query` (14.3b — read-only, gated on `logs:read`;
+//! - `logs.query` (14.3b — read-only, gated on `host.logs`;
 //!   tool-shape of the `oxidhome://logs` resource).
 //! - `events.history` (14.3c — read-only, gated on
-//!   `events:read`; tool-shape of the `oxidhome://events`
+//!   `event.read`; tool-shape of the `oxidhome://events`
 //!   resource).
 //! - `plugins.list` + `plugins.show` (14.3d — read-only,
-//!   gated on `plugins:list`; tool-shape of the
+//!   gated on `plugin.read`; tool-shape of the
 //!   `oxidhome://plugins` + `oxidhome://plugins/{id}`
 //!   resources).
 //! - `plugins.stop` (14.3e — mutating admin, gated on
-//!   `plugins:stop`; tool-shape of `POST
+//!   `instance.stop`; tool-shape of `POST
 //!   /api/v1/plugins/{id}/stop`).
 //! - `plugins.set_network_grant` / `plugins.reset_network_grant`
 //!   (Phase 8.5 — owner-only `policy.manage`; narrow a plugin's
 //!   network grant or reset it to the request, restarting its running
 //!   instances).
 //! - `plugins.uninstall` (14.3e — mutating admin,
-//!   destructive, gated on `plugins:uninstall`; tool-shape
+//!   destructive, gated on `plugin.uninstall`; tool-shape
 //!   of `DELETE /api/v1/plugins/{id}`).
 //! - `plugins.start` (14.3f — mutating admin, gated on
-//!   `plugins:start`; tool-shape of `POST
+//!   `instance.start`; tool-shape of `POST
 //!   /api/v1/plugins/{id}/start`).
 //! - `tokens.list` (H6 slice 3 — the owner token only,
 //!   `token.manage`; tool-shape of `GET /api/v1/tokens`). There is
@@ -41,7 +41,7 @@
 //!   response (an LLM's context), so tokens are minted over the CLI,
 //!   REST or Connect.
 //! - `plugins.install` (14.3g — mutating admin, destructive,
-//!   gated on `plugins:install`; tool-shape of `POST
+//!   gated on `plugin.install`; tool-shape of `POST
 //!   /api/v1/plugins`). Loopback-only (14.1 Origin+Host
 //!   guard), so the `source_dir` path is the same trust
 //!   surface REST uses.
@@ -87,8 +87,8 @@ use crate::state::audit_log::AuditEntry;
 
 use super::resources::{
     AUDIT_QUEUE_MAX, AUDIT_QUEUE_SEMAPHORE, EncodedBody, MAX_TOOL_BODY_BYTES, MCP_ACTOR_KIND,
-    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, SENSITIVE_RATE_LIMITED_CODE,
-    STORE_QUERY_MAX, STORE_QUERY_SEMAPHORE,
+    RESOURCE_BUSY_CODE, RESOURCE_TOO_LARGE_CODE, SCOPE_DENIED_CODE, STORE_QUERY_MAX,
+    STORE_QUERY_SEMAPHORE,
 };
 
 /// Publicly-visible catalogue of tools this handler exposes.
@@ -112,7 +112,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              (typed `error`; nothing happened), `timed_out` (did not run) or \
              `outcome_unknown` (may have run: read the device state before retrying). \
              `retry_safe` is true only for `rejected` and `timed_out`. SENSITIVE: gated on \
-             the `devices:command` scope — physical actuation (locks, garage doors, \
+             the `device.command` permission — physical actuation (locks, garage doors, \
              alarms) rides this same path.",
             Arc::new(device_send_command_schema()),
         )
@@ -121,7 +121,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
             "logs.query",
             "Historical log query against the durable `LogStore`. Returns a JSON list of \
              `HistoricalLogEvent` rows matching the filters. Read-only; gated on \
-             `logs:read`. Same wire shape as `oxidhome://logs` — a client that reads the \
+             `host.logs`. Same wire shape as `oxidhome://logs` — a client that reads the \
              resource and one that calls this tool see identical row bodies. Durations \
              (`since`, `until`) use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, `2h`, `1d`) and \
              resolve relative to `now`. `level` filters to entries at or above the named \
@@ -151,7 +151,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `instance_count`, and `network` (when installed): the rules the \
              manifest `requested`, the operator `granted`, and the `effective` \
              rules instances get (the grant narrowed by containment). \
-             Read-only; gated on `plugins:list`. Same wire \
+             Read-only; gated on `plugin.read`. Same wire \
              shape as `oxidhome://plugins` — a client that reads the resource \
              and one that calls this tool see identical row bodies.",
             Arc::new(plugins_list_schema()),
@@ -174,7 +174,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              currently-running instances with their state. \
              `content_digest`, `installation_uuid` and `network` are \
              `None` for a dev-time argv-driven start with no installation \
-             row. Read-only; gated on `plugins:list`. Same wire shape as \
+             row. Read-only; gated on `plugin.read`. Same wire shape as \
              `oxidhome://plugins/{plugin_id}`. Returns `INVALID_PARAMS` if \
              `plugin_id` is missing and an application-level error if the \
              plugin is neither installed nor running.",
@@ -194,7 +194,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              empty `stopped` list. If `instance_id` is supplied, only that one instance \
              is stopped; otherwise every instance of `plugin_id` is stopped. Waits for \
              the supervisor's shutdown ack + a brief registry-clear poll so a follow-up \
-             call sees a consistent post-stop state. SENSITIVE: gated on `plugins:stop` \
+             call sees a consistent post-stop state. SENSITIVE: gated on `instance.stop` \
              — a plugin driving physical actuation (locks, alarms) rides this same \
              lifecycle.",
             Arc::new(plugins_stop_schema()),
@@ -216,7 +216,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              instance reaches `Running` (or fails to). Optional `instance_id` (defaults \
              to `plugin_id`) lets multiple instances of the same plugin coexist. \
              Optional `config_overrides` is a TOML-shaped JSON blob that layers over \
-             the manifest's `[config]` table. SENSITIVE: gated on `plugins:start` — \
+             the manifest's `[config]` table. SENSITIVE: gated on `instance.start` — \
              starting a plugin activates its declared capabilities (device drivers, \
              services, HTTP listeners), so the same admin surface admin operators \
              consider before enabling a plugin at the CLI.",
@@ -242,8 +242,8 @@ pub(super) fn list_tools() -> Vec<Tool> {
              `<source_dir>/manifest.toml` for the canonical `plugin_id`, then \
              recursively copies `source_dir` into `<state_dir>/plugins/<plugin_id>/`. \
              Does NOT start the plugin — the operator follows up with \
-             `plugins.start`. SENSITIVE + DESTRUCTIVE: gated on `plugins:install` — a \
-             token holding this scope can effectively load arbitrary `.wasm` onto the \
+             `plugins.start`. SENSITIVE + DESTRUCTIVE: gated on `plugin.install` — a \
+             token holding this permission can effectively load arbitrary `.wasm` onto the \
              host. `source_dir` MUST already exist on the daemon-local filesystem; \
              the MCP endpoint is loopback-only, so this mirrors REST's trust model \
              for the same operation.",
@@ -268,7 +268,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              every per-instance KV row + blob for the plugin, and tombstone the \
              `plugin_installation` registry row. REFUSES if any supervised instance is \
              still running — call `plugins.stop` first. SENSITIVE + DESTRUCTIVE: gated \
-             on `plugins:uninstall`; reinstall of the same `plugin_id` starts with an \
+             on `plugin.uninstall`; reinstall of the same `plugin_id` starts with an \
              empty per-instance keyspace and a fresh `installation_uuid`.",
             Arc::new(plugins_uninstall_schema()),
         )
@@ -321,7 +321,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
             "Historical event query against the durable `EventLog`. Returns a JSON list \
              of `HistoricalEvent` rows matching the filters (state changes, button \
              presses, inference results, custom plugin events). Read-only; gated on \
-             `events:read`. Same wire shape as `oxidhome://events` — a client that \
+             `event.read`. Same wire shape as `oxidhome://events` — a client that \
              reads the resource and one that calls this tool see identical row bodies. \
              Durations (`since`, `until`) use `Ns|Nm|Nh|Nd` suffixes (`60s`, `5m`, \
              `2h`, `1d`) and resolve relative to `now`. `topic` matches exactly; \
@@ -347,8 +347,8 @@ pub(super) fn list_tools() -> Vec<Tool> {
              arrived. On timeout, returns an empty batch — the client polls again \
              with the same `after_id`. Omitting `after_id` starts at the oldest \
              retained matching row; to tail only new events, seed the cursor with \
-             the newest `id` from `events.history` (`limit: 1`). Same `events:read` \
-             scope as `events.history`.",
+             the newest `id` from `events.history` (`limit: 1`). Same `event.read` \
+             permission as `events.history`.",
             Arc::new(events_subscribe_schema()),
         )
         .with_title("Long-poll for new events")
@@ -363,7 +363,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "tokens.list",
-            "List every API token with its roles, scopes, sensitive grants and deny list. \
+            "List every API token with its owner flag and roles. \
              Never returns a secret. The owner token only (`token.manage`). Same shape as \
              `GET /api/v1/tokens`.",
             Arc::new(plugins_list_schema()),
@@ -381,8 +381,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
 /// Hand-authored JSON Schema for [`device_send_command_args`].
 /// We're not pulling in `schemars` just for one tool's input
 /// shape — the schema is small enough to keep in sync by
-/// eye, and 14.4 (tool policy) will need a hand-authored
-/// per-tool policy blob anyway.
+/// eye.
 fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
     let schema = json!({
         "type": "object",
@@ -809,9 +808,7 @@ pub(super) async fn call(
             plugins_uninstall_call(engine.clone(), request.arguments, &invocation).await
         }
         "plugins.start" => plugins_start_call(engine.clone(), request.arguments, &invocation).await,
-        "plugins.install" => {
-            plugins_install_call(engine.clone(), request.arguments, &invocation).await
-        }
+        "plugins.install" => plugins_install_call(engine.clone(), request.arguments).await,
         "tokens.list" => tokens_list_call(engine.clone(), request.arguments).await,
         "plugins.set_network_grant" => {
             network_grant_call(engine.clone(), request.arguments, &invocation, false).await
@@ -952,7 +949,7 @@ fn audit_meta_value(intent_id: u64, family: &str) -> JsonValue {
 }
 
 /// Single-shot audit path for outcomes decided BEFORE any
-/// dispatch — unknown-tool, scope-denied. Uses
+/// dispatch — unknown-tool, permission-denied. Uses
 /// `record_completed` (`intent_ms == finalized_ms`) since
 /// there's no physical actuation to protect against.
 async fn finalize_synchronous(
@@ -1016,7 +1013,7 @@ impl FinalizeInput {
         // - `None` — execution never reached the plugin
         //   (unknown-device fell out inside the tool body
         //   before `execute_command`; unknown-tool / bad
-        //   args / scope-denied never even enter here).
+        //   args / permission-denied never even enter here).
         //
         // Round-1 F3 shipped `"ok"` and stamped `"failed"`
         // on the unknown-device path too — both wrong per
@@ -1142,28 +1139,10 @@ enum ToolOutcome {
     /// Tool name isn't in the catalogue. Maps to `-32601`
     /// method-not-found.
     UnknownTool(String),
-    /// Scope check failed. Maps to [`SCOPE_DENIED_CODE`].
+    /// Permission check failed. Maps to [`SCOPE_DENIED_CODE`].
     Denied { required: &'static str },
-    /// H6 slice 2: a sensitive action over the principal's per-category
-    /// allowance. Maps to [`SENSITIVE_RATE_LIMITED_CODE`] and audits as
-    /// HTTP 429.
-    RateLimited(String),
     /// Server-side failure. Maps to `-32603`.
     Internal(String),
-}
-
-impl ToolOutcome {
-    /// H6 slice 2: a sensitive action whose obligations weren't met.
-    fn from_obligation(err: &crate::auth::sensitive::ObligationError) -> Self {
-        use crate::auth::sensitive::ObligationError;
-        match err {
-            ObligationError::RateLimited { .. } => Self::RateLimited(err.to_string()),
-            ObligationError::Audit(_) | ObligationError::Join(_) => {
-                tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
-                Self::Internal("sensitive action refused".into())
-            }
-        }
-    }
 }
 
 impl ToolOutcome {
@@ -1223,9 +1202,6 @@ impl ToolOutcome {
             Self::InvalidParams(reason) => Err(McpError::invalid_params(reason, None)),
             Self::TooLarge(reason) => Err(McpError::new(RESOURCE_TOO_LARGE_CODE, reason, None)),
             Self::Busy(reason) => Err(McpError::new(RESOURCE_BUSY_CODE, reason, None)),
-            Self::RateLimited(reason) => {
-                Err(McpError::new(SENSITIVE_RATE_LIMITED_CODE, reason, None))
-            }
             Self::UnknownTool(reason) => Err(McpError::new(
                 rmcp::model::ErrorCode::METHOD_NOT_FOUND,
                 reason,
@@ -1235,7 +1211,7 @@ impl ToolOutcome {
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see the
                 // resource-side `SCOPE_DENIED_CODE` doc.
-                "scope denied for MCP tool",
+                "permission denied for MCP tool",
                 None,
             )),
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
@@ -1254,7 +1230,6 @@ impl ToolOutcome {
             Self::InvalidParams(_) => 400,
             Self::TooLarge(_) => 413,
             Self::Busy(_) => 503,
-            Self::RateLimited(_) => 429,
             Self::Denied { .. } => 403,
             Self::Internal(_) => 500,
         }
@@ -1266,15 +1241,14 @@ impl ToolOutcome {
             Self::UnknownTool(_)
             | Self::Denied { .. }
             | Self::InvalidParams(_)
-            | Self::TooLarge(_)
-            | Self::RateLimited(_) => "deny",
+            | Self::TooLarge(_) => "deny",
             // Match the REST auth classifier: 5xx → "error"
             // (Busy is 503; Internal is 500).
             Self::Internal(_) | Self::Busy(_) => "error",
         }
     }
 
-    /// Scope name to record on the audit row's
+    /// Action name to record on the audit row's
     /// `required_scope` column. `Some` only for
     /// [`Self::Denied`], matching resources' shape.
     fn required_scope(&self) -> Option<&'static str> {
@@ -1288,12 +1262,7 @@ impl ToolOutcome {
 // ── device.send_command ─────────────────────────────────────────
 
 /// Authorize `action` on one target the tool has parsed out of its
-/// arguments. The flat scope already passed the pre-check in
-/// [`call`]; this adds the token's 14.4 constraint for the target, if
-/// it carries one. A refusal is a scope-shape denial whose
-/// `required_scope` is the constraint sentinel
-/// (`constraint:<tool>:<field>`), distinct from a flat-scope refusal
-/// so operators can slice constraint enforcement separately.
+/// arguments (the collection pre-check already passed in [`call`]).
 fn authorize_target(
     invocation: &InvocationContext,
     action: Action,
@@ -1325,33 +1294,18 @@ async fn device_send_command_call(
         }
     };
 
-    // Phase 14.4b: enforce the token policy's per-device
-    // allowlist on `device.send_command`. `None` = no
-    // constraint on this tool (unrestricted, subject to the
-    // flat scope check above); `Some(cx)` with
-    // `allows_device` false refuses the call as a scope-shape
-    // denial so the audit ledger records
-    // `required_scope = "constraint:device.send_command:devices"`
-    // — distinct from a flat `devices:command` refusal so
-    // operators can slice constraint enforcement separately.
-    //
-    // Check happens BEFORE the device lookup so a token whose
-    // allowlist doesn't cover the id can't learn whether the
-    // id exists — the constraint is a pure string match on
-    // caller input and independent of registry state.
-    //
-    // H6: `device.command` on the addressed device, through
-    // `crate::auth::authorize` like the REST and Connect handlers.
-    // Slice 2: the device's class decides whether a sensitive
-    // category grant is needed too.
-    let decision = match authorize_target(
+    // `device.command` on the addressed device, through
+    // `crate::auth::authorize` like the REST and Connect handlers, before
+    // the device lookup so a refused token can't learn whether the id
+    // exists. The device's class decides whether a grant naming a
+    // sensitive category is needed.
+    if let Err(denied) = authorize_target(
         &invocation,
         Action::DeviceCommand,
         &engine.devices().resource(&args.device_id),
     ) {
-        Ok(decision) => decision,
-        Err(denied) => return denied,
-    };
+        return denied;
+    }
 
     // Resolve device → owning instance the same way the REST
     // handler does. `NotFound` is deliberately indistinct
@@ -1372,18 +1326,6 @@ async fn device_send_command_call(
         };
     };
 
-    // H6 slice 2: a sensitive command takes its rate-limit charge
-    // now; its `warn` row is written when it is dispatched.
-    let charge = match engine.sensitive().reserve(
-        &invocation,
-        Action::DeviceCommand,
-        &args.device_id,
-        &decision,
-    ) {
-        Ok(charge) => charge,
-        Err(e) => return ToolOutcome::from_obligation(&e),
-    };
-
     // The supervisor handle mints `id` (H5).
     let cmd = Command {
         id: String::new(),
@@ -1401,7 +1343,7 @@ async fn device_send_command_call(
 
     let gate = BytesGate::new(&invocation, &engine);
     let report = handle
-        .execute_command_admitted(invocation, args.device_id.clone(), cmd, charge)
+        .execute_command_in(invocation, args.device_id.clone(), cmd)
         .await;
     let blobs = gate.release_report(&args.device_id, &owner, &report);
 
@@ -2435,10 +2377,7 @@ fn plugins_show_call(
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
-    // detail lookup so the not-installed / not-installed
-    // paths can't be used to probe an id the operator's
-    // policy hides.
+    // Authorize the target BEFORE the detail lookup.
     if let Err(denied) = authorize_target(
         invocation,
         Action::PluginRead,
@@ -2566,9 +2505,8 @@ async fn plugins_stop_call(
         );
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE
-    // touching the instance registry so a disallowed id
-    // can't infer running-state through timing / semantics.
+    // Authorize the target BEFORE touching the instance
+    // registry, so a refused caller learns nothing about it.
     if let Err(denied) = authorize_target(
         invocation,
         Action::InstanceStop,
@@ -2835,9 +2773,8 @@ async fn plugins_uninstall_call(
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE
-    // acquiring the lifecycle lock so a disallowed id can't
-    // starve a concurrent lookup for the same key.
+    // Authorize the target BEFORE acquiring the lifecycle
+    // lock, so a refused caller can't hold it.
     if let Err(denied) = authorize_target(
         invocation,
         Action::PluginUninstall,
@@ -3073,10 +3010,9 @@ async fn plugins_start_call(
         );
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
-    // manifest scan / supervisor spawn — a disallowed id
-    // shouldn't observably touch the FS or the process
-    // table.
+    // Authorize the target BEFORE the manifest scan /
+    // supervisor spawn: a refused caller shouldn't touch the
+    // FS or the process table.
     if let Err(denied) = authorize_target(
         invocation,
         Action::InstanceStart,
@@ -3230,7 +3166,6 @@ struct PluginsInstallBody {
 async fn plugins_install_call(
     engine: Engine,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-    invocation: &InvocationContext,
 ) -> ToolOutcome {
     let Some(arguments) = arguments else {
         return ToolOutcome::InvalidParams(
@@ -3263,49 +3198,17 @@ async fn plugins_install_call(
         ));
     }
 
-    // Phase 14.4d: the gate authorizes `plugin.install` on the
-    // manifest-derived plugin id, which applies the token's
-    // `plugins.install` constraint if it carries one. It runs
-    // inside `install_gated` BEFORE any FS/SQL side effect, so a
-    // refuse leaves no orphan state.
-    //
-    // The context is cloned into the spawn_blocking below because
-    // the whole closure must be 'static + Send (an `Arc` clone).
-    let gate_ctx = invocation.clone();
-
     // REST wraps the sync install in `spawn_blocking` so a slow
     // disk doesn't stall the axum runtime — same reasoning
     // holds for MCP's rmcp task. The registry itself does the
     // FS + SQL work.
     let installed_registry = engine.installed_plugins();
-    let join = tokio::task::spawn_blocking(move || {
-        installed_registry.install_gated(&source, |plugin_id| {
-            authorize(
-                &gate_ctx,
-                Action::PluginInstall,
-                &Resource::plugin(plugin_id),
-            )
-            .into_result()
-            .map(drop)
-        })
+    let install_result = match tokio::task::spawn_blocking(move || {
+        installed_registry.install(&source)
     })
-    .await;
-
-    // Phase 14.4d: `install_gated` returns a crate-private
-    // `GatedInstallError` wrapper. Peel the constraint-refuse
-    // variant off first (that's what this tool added); the
-    // remaining `Install(InstallError)` variants are the
-    // pre-14.4d public shape and get the same treatment REST
-    // + Connect give them.
-    let install_result = match join {
-        Ok(Ok(installed)) => Ok(installed),
-        Ok(Err(crate::state::GatedInstallError::ConstraintDenied {
-            plugin_id: _,
-            required,
-        })) => {
-            return ToolOutcome::Denied { required };
-        }
-        Ok(Err(crate::state::GatedInstallError::Install(err))) => Err(err),
+    .await
+    {
+        Ok(result) => result,
         Err(join_err) => {
             tracing::error!(target: "mcp.tool.plugins.install", %join_err, "install task panicked");
             return ToolOutcome::Internal("install task panicked".into());
@@ -3449,7 +3352,7 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
 
 /// [`AuditEntry`] for [`AuditLog::record_completed`] — used
 /// on outcomes decided BEFORE any dispatch (unknown tool,
-/// scope-denied). Populates status + decision from the
+/// permission-denied). Populates status + decision from the
 /// outcome; `execution_outcome` / `domain_error` stay `None`
 /// because no tool body ran.
 fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> AuditEntry {

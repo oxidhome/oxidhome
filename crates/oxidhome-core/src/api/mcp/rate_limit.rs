@@ -587,7 +587,7 @@ mod tests {
     fn store_with_one_token() -> (Arc<TokenStore>, String, String) {
         let db = Arc::new(Db::open_in_memory().expect("in-memory db"));
         let store = Arc::new(TokenStore::new(db));
-        let issued = store.create("test", b"[\"*\"]").expect("mint");
+        let issued = store.create("test", &["admin"]).expect("mint");
         (store, issued.id, issued.plaintext)
     }
 

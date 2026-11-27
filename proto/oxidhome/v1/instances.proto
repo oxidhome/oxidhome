@@ -2,7 +2,7 @@
 //
 // Read side of the plugin-instance surface: mirrors
 // `GET /api/v1/instances` on the JSON API. Gated on the
-// `instances:list` scope (enforced inside the handler through
+// `instance.read` permission (enforced inside the handler through
 // `authorize`, not the middleware).
 syntax = "proto3";
 

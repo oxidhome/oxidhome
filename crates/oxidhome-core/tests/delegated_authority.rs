@@ -1,13 +1,11 @@
-//! H6 slice 4 — delegation and events.
+//! Delegation and events.
 //!
 //! Drives `service-bouncer` instances through the dispatcher under
 //! external roots: every `call-service` hop needs the root's own
-//! `service.call` permit (the `services:call` scope, or a role grant
-//! naming the service) on top of the calling plugin's
-//! `consumes_services` grant, and the root's denies refuse it. Events a
-//! request causes carry its call id (live, and in `event_log`), and a
-//! subscriber's `on-event` reaction records it as `caused_by` on its
-//! own hop rows.
+//! `service.call` permit (a role granting it) on top of the calling
+//! plugin's `consumes_services` grant. Events a request causes carry
+//! its call id (live, and in `event_log`), and a subscriber's
+//! `on-event` reaction records it as `caused_by` on its own hop rows.
 
 #[path = "support.rs"]
 mod support;
@@ -15,10 +13,7 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxidhome_core::auth::{
-    Action, ActionSet, ActorKind, DenyRule, InvocationContext, Principal, RoleDef, RoleGrant,
-    TokenPolicy, Transport,
-};
+use oxidhome_core::auth::{ActorKind, InvocationContext, Principal, RoleDef, Transport};
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::devices::CommandResult;
 use oxidhome_core::host_impl::plugin::oxidhome::plugin::types::{
     Error as WitError, ServiceId, Value,
@@ -154,34 +149,22 @@ fn by_call(call_id: &str) -> AuditQuery {
     }
 }
 
-fn role(name: &str, grants: Vec<RoleGrant>, deny: Vec<DenyRule>) -> Arc<RoleDef> {
-    Arc::new(RoleDef {
-        id: "role-0123456789abcdef".into(),
-        name: name.into(),
-        grants,
-        sensitive: Vec::new(),
-        deny,
-    })
+/// An actor whose one role grants `actions`.
+fn actor(id: &str, actions: &[&str]) -> Actor {
+    let grants = serde_json::json!([{ "actions": actions }]).to_string();
+    let role = RoleDef::parse("r", grants.as_bytes()).expect("role");
+    Actor::api(id, vec![Arc::new(role)])
 }
 
-fn service_grant(services: &[&str]) -> RoleGrant {
-    RoleGrant {
-        actions: ActionSet::of(&[Action::ServiceCall]),
-        categories: None,
-        devices: None,
-        services: Some(services.iter().map(|s| (*s).to_owned()).collect()),
-    }
-}
-
-/// A token without `services:call` can't have any hop made for it,
-/// even though the calling plugin's grant allows the call; with the
-/// scope (or the wildcard) both hops of the chain run.
+/// A token without `service.call` can't have any hop made for it,
+/// even though the calling plugin's grant allows the call; with it (or
+/// `*`) both hops of the chain run.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_hop_needs_the_roots_service_call_permit() {
     let b = Bouncers::start(&["alpha", "beta"]).await;
     b.set("alpha", "bounce_to", b.service("beta"));
 
-    let narrow = Actor::api("tok-narrow", vec!["devices:command".into()]);
+    let narrow = actor("tok-narrow", &["device.command"]);
     let (call_id, outcome) = b.kick_as(&narrow, "alpha").await;
     assert!(
         matches!(&outcome, Err(WitError::PermissionDenied(m)) if m.contains("root principal")),
@@ -191,92 +174,16 @@ async fn every_hop_needs_the_roots_service_call_permit() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].decision, "deny");
     assert_eq!(rows[0].status, 403);
-    assert_eq!(rows[0].required_scope.as_deref(), Some("services:call"));
+    assert_eq!(rows[0].required_scope.as_deref(), Some("service.call"));
     assert_eq!(rows[0].token_id, "tok-narrow");
 
-    for scopes in [vec!["services:call".to_string()], vec!["*".to_string()]] {
-        let actor = Actor::api("tok-calls", scopes);
+    for actions in [&["service.call"], &["*"]] {
+        let actor = actor("tok-calls", actions);
         let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
         assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
         let rows = b.hop_rows(by_call(&call_id), 2).await;
         assert!(rows.iter().all(|r| r.decision == "allow"), "{rows:?}");
     }
-    b.stop().await;
-}
-
-/// A role grant narrows the delegation grant to the services it names;
-/// the root's deny list refuses a hop whatever grants it. (Every hop
-/// here targets the same service, so refusals land on the first one;
-/// the dispatcher's unit tests cover a refused inner hop.)
-#[tokio::test(flavor = "multi_thread")]
-async fn role_grants_and_denies_follow_the_chain() {
-    let b = Bouncers::start(&["alpha", "beta"]).await;
-    b.set("alpha", "bounce_to", b.service("beta"));
-    let base = Actor::api("tok-role", vec!["devices:read".into()]);
-
-    // Named service: allowed on both hops.
-    let actor = base.with_roles(vec![role(
-        "scenes",
-        vec![service_grant(&["example.service-*/bouncer"])],
-        Vec::new(),
-    )]);
-    let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
-    assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
-    assert_eq!(b.hop_rows(by_call(&call_id), 2).await.len(), 2);
-
-    // Another plugin's services only: refused with `no-permit`.
-    let actor = base.with_roles(vec![role(
-        "other",
-        vec![service_grant(&["acme.notify"])],
-        Vec::new(),
-    )]);
-    let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
-    assert!(
-        matches!(outcome, Err(WitError::PermissionDenied(_))),
-        "got {outcome:?}"
-    );
-    let rows = b.hop_rows(by_call(&call_id), 1).await;
-    assert_eq!(rows[0].required_scope.as_deref(), Some("no-permit"));
-
-    // The wildcard with a deny on the service: refused with `deny`.
-    let policy = TokenPolicy {
-        scopes: vec!["*".into()],
-        deny: vec![DenyRule {
-            actions: ActionSet::of(&[Action::ServiceCall]),
-            categories: None,
-            devices: None,
-            services: Some(vec![format!("{PLUGIN}/bouncer")]),
-        }],
-        ..TokenPolicy::default()
-    };
-    let actor = Actor::from_token_policy("tok-deny", policy, false);
-    let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
-    assert!(
-        matches!(outcome, Err(WitError::PermissionDenied(_))),
-        "got {outcome:?}"
-    );
-    let rows = b.hop_rows(by_call(&call_id), 1).await;
-    assert_eq!(rows[0].required_scope.as_deref(), Some("deny"));
-
-    // A deny that comes with a role refuses it too, even for the
-    // wildcard.
-    let actor = Actor::api("tok-role-deny", vec!["*".into()]).with_roles(vec![role(
-        "no-bounce",
-        Vec::new(),
-        vec![DenyRule {
-            actions: ActionSet::of(&[Action::ServiceCall]),
-            categories: None,
-            devices: None,
-            services: None,
-        }],
-    )]);
-    let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
-    assert!(
-        matches!(outcome, Err(WitError::PermissionDenied(_))),
-        "got {outcome:?}"
-    );
-    let rows = b.hop_rows(by_call(&call_id), 1).await;
-    assert_eq!(rows[0].required_scope.as_deref(), Some("deny"));
     b.stop().await;
 }
 
@@ -291,7 +198,7 @@ async fn reactions_record_what_caused_them() {
     b.set("alpha", "announce", "yes".into());
     b.set("beta", "relay_to", b.service("gamma"));
 
-    let actor = Actor::api("tok-events", vec!["services:call".into()]);
+    let actor = actor("tok-events", &["service.call"]);
     let (call_id, outcome) = b.kick_as(&actor, "alpha").await;
     assert!(matches!(outcome, Ok(CommandResult::Ok)), "got {outcome:?}");
 

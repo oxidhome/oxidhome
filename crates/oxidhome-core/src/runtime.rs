@@ -101,9 +101,6 @@ pub struct Engine {
     sandboxes: Arc<SandboxRegistry>,
     /// H5: accepted-but-unfinished device commands.
     pending_commands: Arc<PendingCommands>,
-    /// H6 slice 2: rate limits and `warn` audit rows for allowed
-    /// sensitive actions, shared by every transport.
-    sensitive: Arc<crate::auth::sensitive::SensitiveGuard>,
     /// ADR-0001: KV / blob operations in flight per instance, which a
     /// removed sandbox's purge waits out.
     storage_ops: Arc<sandbox_purge::StorageOps>,
@@ -437,9 +434,6 @@ impl Engine {
         // overrides, before any plugin registers a device.
         let device_meta = crate::state::DeviceMetaStore::open(Arc::clone(&db))
             .context("loading device categories")?;
-        let sensitive = Arc::new(crate::auth::sensitive::SensitiveGuard::new(Arc::clone(
-            &audit_log,
-        )));
         let kv = Arc::new(KvStore::new(Arc::clone(&db)));
         let blobs = Arc::new(BlobStore::new(Arc::clone(&db), blobs_root));
         // ADR-0001: finish the sandbox purges a previous process left
@@ -455,7 +449,6 @@ impl Engine {
             dns: None,
             inner,
             pending_commands,
-            sensitive,
             storage_ops: Arc::default(),
             devices: Arc::new(DeviceRegistry::with_meta(Arc::new(device_meta))),
             device_state,
@@ -552,7 +545,7 @@ impl Engine {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// C6: HMAC secret for `plugins:ui` tickets. See
+    /// C6: HMAC secret for `plugin.ui` tickets. See
     /// `crate::api::ui_ticket`. Rotated on daemon restart.
     #[must_use]
     pub fn ui_ticket_secret(&self) -> Arc<[u8; 32]> {
@@ -595,13 +588,6 @@ impl Engine {
     #[must_use]
     pub fn devices(&self) -> Arc<DeviceRegistry> {
         Arc::clone(&self.devices)
-    }
-
-    /// H6 slice 2: obligations (rate limit, `warn` audit row) of
-    /// allowed sensitive actions.
-    #[must_use]
-    pub fn sensitive(&self) -> Arc<crate::auth::sensitive::SensitiveGuard> {
-        Arc::clone(&self.sensitive)
     }
 
     /// H9 host-owned device-state projection. Consumers (API/UI,
@@ -654,7 +640,7 @@ impl Engine {
     /// of diagnostic logs. The API's auth middleware records here
     /// through the two-phase write contract (see the
     /// `state::audit_log` module doc); the external query surface
-    /// is `GET /api/v1/audit` (scoped on `audit:read`).
+    /// is `GET /api/v1/audit` (scoped on `host.audit`).
     #[must_use]
     pub fn audit_log(&self) -> Arc<AuditLog> {
         Arc::clone(&self.audit_log)

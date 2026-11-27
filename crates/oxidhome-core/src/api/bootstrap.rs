@@ -74,18 +74,6 @@ use anyhow::Context;
 use crate::auth::ActorKind;
 use crate::state::{AuditEntry, AuditLog, IssuedToken, TokenError, TokenStore};
 
-/// Default scope blob for the bootstrap token: a JSON array
-/// containing the single wildcard `"*"` element. The array shape
-/// is what [`crate::api::parse_scopes`](crate::api) (and 12-API-b's
-/// scope-policy enforcer that builds on it) expects — a bare
-/// `"\"*\""` string would silently degrade to deny-all on the
-/// fail-closed parser path and silently lock the break-glass token
-/// out of every scoped route. The wildcard contract: 12-API-b's
-/// enforcer treats a scope entry equal to `"*"` as "any scope".
-/// `bootstrap_blob_parses_as_wildcard_scope` pins this so the two
-/// halves can't drift.
-pub(crate) const ADMIN_SCOPE_JSON: &[u8] = br#"["*"]"#;
-
 /// Label of the bootstrap / recovery-minted admin token.
 pub const ADMIN_TOKEN_LABEL: &str = "admin";
 
@@ -120,6 +108,25 @@ pub const AUDIT_PATH_RECOVER: &str = "cli.auth.recover";
 /// Audit path: offline recovery revoked a token.
 pub const AUDIT_PATH_RECOVER_REVOKE: &str = "cli.auth.revoke";
 
+/// Startup check: warn when tokens exist but none is a live owner, so
+/// nothing can manage tokens or roles until `recover-admin-token` mints
+/// a new owner.
+fn warn_if_no_live_owner(tokens: &TokenStore) {
+    match tokens.list() {
+        Ok(records) if !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) => {
+            tracing::warn!(
+                target: "api.bootstrap",
+                "no live owner token: nothing can manage tokens or roles; mint one offline \
+                 with `oxidhome recover-admin-token` (it revokes the current admin tokens)",
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(target: "api.bootstrap", error = %err, "listing tokens for the owner check failed");
+        }
+    }
+}
+
 /// If `tokens` is empty, mint an `admin` token and deliver its
 /// plaintext to `<state_dir>/admin-token`. Returns `Some(token)` if
 /// this call minted the admin, `None` if the store already had
@@ -150,6 +157,7 @@ pub fn ensure_admin_token(
     // already-provisioned host. The insert below re-checks inside
     // its own transaction, so this read isn't load-bearing.
     if tokens.count().context("counting tokens")? > 0 {
+        warn_if_no_live_owner(tokens);
         return Ok(None);
     }
 
@@ -166,7 +174,7 @@ pub fn ensure_admin_token(
         }
     };
 
-    match tokens.insert_owner_if_empty(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON) {
+    match tokens.insert_owner_if_empty(&issued, ADMIN_TOKEN_LABEL) {
         Ok(true) => {}
         Ok(false) => {
             remove_quietly(&pending);
@@ -429,12 +437,7 @@ pub fn recover_admin_token(
         return Err(err.context("recording recovery audit intent"));
     }
 
-    let revoked = match tokens.insert_owner_and_revoke(
-        &issued,
-        ADMIN_TOKEN_LABEL,
-        ADMIN_SCOPE_JSON,
-        &to_revoke,
-    ) {
+    let revoked = match tokens.insert_owner_and_revoke(&issued, ADMIN_TOKEN_LABEL, &to_revoke) {
         Ok(revoked) => revoked,
         Err(err) => {
             // Keep the pending file — see the matching branch in
@@ -700,27 +703,7 @@ pub(super) fn audited_call<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::parse_scopes;
     use crate::state::{AuditQuery, Db};
-
-    /// Pins the wildcard contract: `ADMIN_SCOPE_JSON` must parse
-    /// through `parse_scopes` to a non-empty scope list containing
-    /// the wildcard sentinel `"*"`. Pre-fix this PR shipped the
-    /// blob as `b"\"*\""` (a JSON string, not an array), which
-    /// silently failed parsing → empty scopes → 12-API-b would
-    /// have locked the break-glass admin token out of every scoped
-    /// route. This test makes the bootstrap blob and the parser
-    /// impossible to drift independently.
-    #[test]
-    fn bootstrap_blob_parses_as_wildcard_scope() {
-        let scopes = parse_scopes(ADMIN_SCOPE_JSON)
-            .expect("ADMIN_SCOPE_JSON must parse through the scope parser");
-        assert_eq!(
-            scopes,
-            vec!["*".to_string()],
-            "bootstrap blob must surface the wildcard sentinel verbatim",
-        );
-    }
 
     struct Fixture {
         db: Arc<Db>,
@@ -795,7 +778,7 @@ mod tests {
     #[test]
     fn bootstrap_is_no_op_when_store_has_tokens() {
         let fx = fixture();
-        fx.tokens.create("preexisting", b"{}").unwrap();
+        fx.tokens.create("preexisting", &["guest"]).unwrap();
         assert!(fx.bootstrap().unwrap().is_none());
         assert!(!fx.admin_file().exists());
         assert_eq!(
@@ -894,7 +877,7 @@ mod tests {
         let issued = TokenStore::generate();
         write_new_secret(&pending_path(fx.dir.path(), &issued.id), &issued.plaintext).unwrap();
         fx.tokens
-            .insert_owner_and_revoke(&issued, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON, &[])
+            .insert_owner_and_revoke(&issued, ADMIN_TOKEN_LABEL, &[])
             .unwrap();
         fx.reconcile().unwrap();
         assert_eq!(
@@ -957,7 +940,7 @@ mod tests {
         write_new_secret(&pending_path(fx.dir.path(), &live.id), &live.plaintext).unwrap();
         assert!(
             fx.tokens
-                .insert_owner_if_empty(&live, ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
+                .insert_owner_if_empty(&live, ADMIN_TOKEN_LABEL)
                 .unwrap()
         );
         // Crash before the insert: never committed.
@@ -1031,11 +1014,8 @@ mod tests {
     #[test]
     fn recovery_replaces_lost_admin_token() {
         let fx = fixture();
-        let lost = fx
-            .tokens
-            .create(ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
-            .unwrap();
-        let other = fx.tokens.create("ci", b"[]").unwrap();
+        let lost = fx.tokens.create(ADMIN_TOKEN_LABEL, &["admin"]).unwrap();
+        let other = fx.tokens.create("ci", &["guest"]).unwrap();
         assert!(
             fx.bootstrap().unwrap().is_none(),
             "store non-empty: no re-mint"
@@ -1049,10 +1029,7 @@ mod tests {
         let rec = fx.tokens.verify_read_only(&secret).unwrap();
         assert_eq!(rec.id, report.token_id);
         assert_eq!(rec.label, ADMIN_TOKEN_LABEL);
-        assert_eq!(
-            parse_scopes(&rec.scope_json).unwrap(),
-            vec!["*".to_string()]
-        );
+        assert!(rec.owner);
         assert!(matches!(
             fx.tokens.verify_read_only(&lost.plaintext),
             Err(TokenError::Revoked)
@@ -1074,11 +1051,8 @@ mod tests {
     #[test]
     fn recovery_revoke_all_revokes_every_token() {
         let fx = fixture();
-        let a = fx
-            .tokens
-            .create(ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
-            .unwrap();
-        let b = fx.tokens.create("ci", b"[]").unwrap();
+        let a = fx.tokens.create(ADMIN_TOKEN_LABEL, &["admin"]).unwrap();
+        let b = fx.tokens.create("ci", &["guest"]).unwrap();
         let report =
             recover_admin_token(&fx.tokens, &fx.audit, fx.dir.path(), RevokeScope::All).unwrap();
         let mut revoked = report.revoked.clone();
@@ -1092,10 +1066,7 @@ mod tests {
     #[test]
     fn recovery_db_failure_changes_no_tokens_and_keeps_pending() {
         let fx = fixture();
-        let old = fx
-            .tokens
-            .create(ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
-            .unwrap();
+        let old = fx.tokens.create(ADMIN_TOKEN_LABEL, &["admin"]).unwrap();
         fx.sql(
             "CREATE TRIGGER no_tokens BEFORE INSERT ON auth_token \
              BEGIN SELECT RAISE(ABORT, 'db down'); END;",
@@ -1124,10 +1095,7 @@ mod tests {
     #[test]
     fn recovery_audit_failure_changes_nothing() {
         let fx = fixture();
-        let old = fx
-            .tokens
-            .create(ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
-            .unwrap();
+        let old = fx.tokens.create(ADMIN_TOKEN_LABEL, &["admin"]).unwrap();
         fx.sql(
             "CREATE TRIGGER no_audit BEFORE INSERT ON audit_event \
              BEGIN SELECT RAISE(ABORT, 'audit down'); END;",
@@ -1177,7 +1145,7 @@ mod tests {
             // M4 lockout: a row exists, the secret is gone.
             engine
                 .auth_tokens()
-                .create(ADMIN_TOKEN_LABEL, ADMIN_SCOPE_JSON)
+                .create(ADMIN_TOKEN_LABEL, &["admin"])
                 .unwrap()
                 .id
         };

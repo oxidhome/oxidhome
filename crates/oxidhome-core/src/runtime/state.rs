@@ -2926,7 +2926,7 @@ mod tests {
                 .expect_event()
                 .call_id
         };
-        let actor = Actor::api("tok", vec!["*".into()]);
+        let actor = Actor::api("tok", vec![crate::auth::role::builtin("admin").unwrap()]);
         let root =
             InvocationContext::external(Principal::token(ActorKind::Api, &actor, Transport::Rest));
         let root_id = root.call_id().to_owned();

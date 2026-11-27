@@ -309,10 +309,9 @@ interface capabilities {
   ///
   /// The host derives a device's category from its capabilities.
   /// `lock`, `opener`, `alarm-panel` and `siren` make a device
-  /// sensitive: commanding it needs an explicit grant for its
-  /// category, and a wildcard token scope does not cover it.
-  /// `video-stream` makes the device a camera, whose bytes need an
-  /// explicit grant. A plugin cannot lower a category it once
+  /// sensitive: commanding it needs a role grant naming its
+  /// category; `*` does not cover it. `video-stream` makes the
+  /// device a camera, whose bytes need a grant naming `camera`. A plugin cannot lower a category it once
   /// reported for a device by dropping the capability later.
   variant capability-spec {
     switch,
@@ -525,7 +524,7 @@ interface services {
     /// Plugin-instance-local id, echoed back so the plugin can map the
     /// host-assigned `service-id` to its own bookkeeping. The
     /// service's immutable key: grants (`consumes_services.service`)
-    /// and role selectors (`<plugin>/<local-id>`) name it. 1-64 of
+    /// name it. 1-64 of
     /// `a-z`, `0-9`, `.`, `_`, `-`, starting with a letter or digit
     /// (so never `*` or `/`); `register-service` refuses anything
     /// else with `invalid-argument`.
@@ -1297,8 +1296,8 @@ interface host-services {
   /// **Root authority (H6).** When the invocation making the call
   /// is rooted at an external request (a token's command or service
   /// call, and every call-service hop it leads to), the call also
-  /// needs that request's own permission for `service.call` on the
-  /// target, and none of its denies may match. A plugin's grant
+  /// needs that request's own `service.call` permission (a role
+  /// granting it, or the owner). A plugin's grant
   /// never extends what the requester may do. Work the host started
   /// (`init`, `tick`, and every `on-event`, including a reaction to
   /// an event whose `call-id` names a request) is decided by the

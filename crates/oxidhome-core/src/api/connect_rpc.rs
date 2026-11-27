@@ -75,8 +75,8 @@ use oxidhome_proto::proto::oxidhome::v1::{
 };
 use oxidhome_proto::proto::oxidhome::v1::{
     CreateRoleRequest, CreateRoleResponse, CreateTokenRequest, CreateTokenResponse,
-    DeleteRoleRequest, DeleteRoleResponse, ListRolesRequest, ListRolesResponse, ListTokensRequest,
-    ListTokensResponse, Role as ProtoRole, RoleDefinition, Selector as ProtoSelector,
+    DeleteRoleRequest, DeleteRoleResponse, Grant as ProtoGrant, ListRolesRequest,
+    ListRolesResponse, ListTokensRequest, ListTokensResponse, Role as ProtoRole,
     Token as ProtoToken, UpdateRoleRequest, UpdateRoleResponse,
 };
 
@@ -94,8 +94,8 @@ use crate::state::{
 use super::auth::{
     AuthState, actor_from_record, extract_bearer, finalize_audit, record_anonymous_probe,
 };
+use super::authz::{Forbidden, require};
 use super::bytes::BytesGate;
-use super::scopes::{ScopeDenied, require};
 
 /// The device pre-check: a per-device decision always follows.
 const DEVICE_PRE_CHECK: Resource = Resource::pre_check(ResourceKind::Device);
@@ -145,7 +145,7 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
     }
 }
 
-// ── Scope-check + outcome-record helpers ────────────────────────
+// ── Permission-check + outcome-record helpers ────────────────────────
 
 /// What a Connect handler recorded as it returned. Serves the
 /// middleware's audit classifier — see [`connect_auth_middleware`].
@@ -166,12 +166,11 @@ struct HandlerOutcome {
     /// authorization and execution outcomes must not share the
     /// same audit field.
     status: Option<axum::http::StatusCode>,
-    /// The deny's audit label (missing scope or constraint
-    /// sentinel), if this outcome was a `PermissionDenied` recorded by
+    /// The deny's audit label (the refused action), if this outcome was a `PermissionDenied` recorded by
     /// [`require_connect`]. Middleware populates the `required_scope`
-    /// audit field from this — mirrors the JSON side's `DeniedScope`
+    /// audit field from this — mirrors the JSON side's `DeniedAction`
     /// smuggle.
-    denied_scope: Option<&'static str>,
+    denied_action: Option<&'static str>,
     /// H5: the dispatched device command's id and explicit outcome.
     /// Populated by [`record_domain_outcome`]; the middleware forwards
     /// it to the audit ledger's command / execution columns (F4).
@@ -227,7 +226,7 @@ fn ctx_bytes_gate(ctx: &RequestContext, engine: &Engine) -> BytesGate {
 
 /// Wrap a [`ConnectError`] on the error-return site so the audit
 /// row picks up the outcome. Idiomatic use — at every `return Err(...)`
-/// inside a Connect handler that isn't a scope denial:
+/// inside a Connect handler that isn't a permission denial:
 ///
 /// ```ignore
 /// return Err(rpc_err(&ctx, ConnectError::not_found("device x")));
@@ -240,7 +239,7 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
     if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
         slot.set(HandlerOutcome {
             status: Some(err.http_status()),
-            denied_scope: None,
+            denied_action: None,
             command: None,
         });
     }
@@ -249,10 +248,10 @@ fn rpc_err(ctx: &RequestContext, err: ConnectError) -> ConnectError {
 
 /// Handler-side authorization for Connect RPCs. Mirrors the JSON
 /// [`require`] but returns a [`ConnectError::permission_denied`]
-/// instead of a `ScopeDenied` axum response, and records the deny's
+/// instead of a `Forbidden` axum response, and records the deny's
 /// audit label on the request's [`HandlerOutcomeSlot`] so the
 /// middleware populates `required_scope` on the audit row (same
-/// field shape as the JSON `DeniedScope` extension smuggle).
+/// field shape as the JSON `DeniedAction` extension smuggle).
 ///
 /// The [`InvocationContext`] is read out of `ctx.extensions()`. Its
 /// presence is a contract with the middleware (which stamps it during
@@ -280,36 +279,18 @@ fn require_connect(
         Err(denied) => denied,
     };
     {
-        let ScopeDenied { required } = denied;
+        let Forbidden { required } = denied;
         if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
             slot.set(HandlerOutcome {
                 status: Some(axum::http::StatusCode::FORBIDDEN),
-                denied_scope: Some(required),
+                denied_action: Some(required),
                 command: None,
             });
         }
         Err(ConnectError::permission_denied(format!(
-            "scope {required} required"
+            "permission `{required}` required"
         )))
     }
-}
-
-/// H6 slice 2: the error for a sensitive action whose obligations
-/// weren't met — `resource_exhausted` when rate limited, `internal`
-/// when the `warn` audit row couldn't be written.
-fn obligation_err(
-    ctx: &RequestContext,
-    err: &crate::auth::sensitive::ObligationError,
-) -> ConnectError {
-    use crate::auth::sensitive::ObligationError;
-    let e = match err {
-        ObligationError::RateLimited { .. } => ConnectError::resource_exhausted(err.to_string()),
-        ObligationError::Audit(_) | ObligationError::Join(_) => {
-            tracing::error!(target: "auth.sensitive", error = %err, "sensitive action refused");
-            ConnectError::internal("sensitive action refused")
-        }
-    };
-    rpc_err(ctx, e)
 }
 
 // ── Read-service implementations (Instances / Devices / Plugins / Logs) ──
@@ -502,13 +483,12 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         request: ServiceRequest<'_, ExecuteCommandRequest>,
     ) -> ServiceResult<impl Encodable<ExecuteCommandResponse> + Send + use<'a>> {
         // Pre-check before the request is copied, then H6:
-        // `device.command` on the addressed device — the token's
-        // per-device allowlist, role and deny list, shared with REST
-        // and MCP — before the lookup so a refused token can't probe
+        // `device.command` on the addressed device, shared with REST
+        // and MCP, before the lookup so a refused token can't probe
         // ids.
         require_connect(&ctx, Action::DeviceCommand, &DEVICE_PRE_CHECK)?;
         let req = request.to_owned_message();
-        let decision = require_connect(
+        require_connect(
             &ctx,
             Action::DeviceCommand,
             &self.engine.devices().resource(&req.device_id),
@@ -542,18 +522,6 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             .get(&owner)
             .ok_or_else(|| rpc_err(&ctx, ConnectError::not_found("device not found")))?;
 
-        // H6 slice 2: a sensitive command takes its rate-limit charge
-        // now; its `warn` row is written when it is dispatched.
-        let charge = self
-            .engine
-            .sensitive()
-            .reserve(
-                &invocation,
-                Action::DeviceCommand,
-                &req.device_id,
-                &decision,
-            )
-            .map_err(|e| obligation_err(&ctx, &e))?;
         let gate = BytesGate::new(&invocation, &self.engine);
 
         // The supervisor handle mints `id` (H5).
@@ -576,7 +544,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
             None => invocation,
         };
         let report = handle
-            .execute_command_admitted(invocation, req.device_id.clone(), cmd, charge)
+            .execute_command_in(invocation, req.device_id.clone(), cmd)
             .await;
         // F4 + H5: every routed command is an RPC success carrying
         // its explicit outcome. Record the command id and outcome on
@@ -597,7 +565,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         let device_id = request.to_owned_message().device_id;
         // Host-minted ids are short; don't copy a huge one under the
         // projection lock. The target check below decides for the
-        // device (a role narrowed to categories, a deny list).
+        // device (a role narrowed to categories or devices).
         if device_id.len() > MAX_DEVICE_ID_LEN {
             return Err(rpc_err(
                 &ctx,
@@ -760,7 +728,7 @@ fn record_domain_outcome(ctx: &RequestContext, report: &CommandReport) {
     if let Some(slot) = ctx.extensions().get::<HandlerOutcomeSlot>() {
         slot.set(HandlerOutcome {
             status: None,
-            denied_scope: None,
+            denied_action: None,
             command: Some(super::auth::DomainOutcome::from_report(report)),
         });
     }
@@ -1543,11 +1511,11 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         request: ServiceRequest<'_, TailEventsRequest>,
     ) -> ServiceResult<connectrpc::ServiceStream<impl Encodable<TailEventsResponse> + Send + use<>>>
     {
-        // Auth + scope check runs BEFORE the stream is established
+        // Auth + permission check runs BEFORE the stream is established
         // — a denied caller sees a clean Connect error, no wasted
         // stream setup, and the audit row lands with the right
         // decision via the outcome slot. A cursor replays history,
-        // so it also needs `events:read`.
+        // so it also needs `event.read`.
         require_connect(&ctx, Action::EventSubscribe, &Resource::events())?;
         let after_id = request.to_owned_message().after_id;
         if after_id.is_some() {
@@ -1575,7 +1543,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         // The tail (and its `SubscriberToken`) lives in the unfold
         // state, so the bus slot is freed when the stream ends.
         // M7: live and replayed events alike withhold `bytes-val`
-        // payloads unless the caller holds `blobs:read`.
+        // payloads unless the caller holds `blob.read`.
         let gate = std::sync::Arc::new(ctx_bytes_gate(&ctx, &self.engine));
         let response_stream = futures_util::stream::unfold(Some(tail), move |tail| {
             let gate = std::sync::Arc::clone(&gate);
@@ -1725,48 +1693,48 @@ fn wit_key_value_to_proto(kv: KeyValue) -> ProtoKeyValue {
     }
 }
 
-/// H6 slice 3: `TokensService`, mirroring `POST` / `GET /api/v1/tokens`.
+/// `TokensService`, mirroring `POST` / `GET /api/v1/tokens`.
 /// Both RPCs need `token.manage`: the owner token only.
 struct OxidHomeTokens {
     engine: Engine,
 }
 
-/// H6 slice 3: `RolesService`, mirroring `/api/v1/roles`. Every RPC
+/// `RolesService`, mirroring `/api/v1/roles`. Every RPC
 /// needs `policy.manage`: the owner token only.
 struct OxidHomeRoles {
     engine: Engine,
 }
 
-fn selector_spec(s: ProtoSelector) -> super::token_admin::SelectorSpec {
-    let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
-    super::token_admin::SelectorSpec {
-        actions: s.actions,
-        category: none_if_empty(s.category),
-        devices: none_if_empty(s.devices),
-        services: none_if_empty(s.services),
-    }
+/// A role request's `grants`, which must be set: proto3 can't tell an
+/// omitted list from an empty one, and an omitted one must not wipe a
+/// role.
+fn required_grants(
+    ctx: &RequestContext,
+    grants: Option<oxidhome_proto::proto::oxidhome::v1::Grants>,
+) -> Result<Vec<crate::auth::GrantWire>, ConnectError> {
+    grants
+        .map(|g| g.grants.into_iter().map(grant_wire).collect())
+        .ok_or_else(|| rpc_err(ctx, ConnectError::invalid_argument("`grants` is required")))
 }
 
-fn role_spec(d: Option<RoleDefinition>) -> super::token_admin::RoleSpec {
-    let d = d.unwrap_or_default();
-    super::token_admin::RoleSpec {
-        grants: d.grants.into_iter().map(selector_spec).collect(),
-        sensitive: d.sensitive,
-        deny: d.deny.into_iter().map(selector_spec).collect(),
+/// A Connect grant as JSON's: an unset selector is no narrowing, a set
+/// one is kept even when empty, so validation refuses it on both.
+fn grant_wire(g: ProtoGrant) -> crate::auth::GrantWire {
+    crate::auth::GrantWire {
+        actions: g.actions,
+        category: g.category.into_option().map(|n| n.names),
+        devices: g.devices.into_option().map(|n| n.names),
     }
 }
 
 fn proto_role(s: super::token_admin::RoleSummary) -> ProtoRole {
     ProtoRole {
-        role_id: s.role_id,
         name: s.name,
+        builtin: s.builtin,
         grants: s.grants,
-        sensitive: s.sensitive,
-        deny: s.deny,
         tokens: s.tokens,
         created_ms: s.created_ms,
         updated_ms: s.updated_ms,
-        definition_valid: s.definition_valid,
         ..Default::default()
     }
 }
@@ -1839,7 +1807,7 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
         let req = request.to_owned_message();
         let new = super::token_admin::NewRole {
             name: req.name,
-            spec: role_spec(req.definition.into_option()),
+            grants: required_grants(&ctx, req.grants.into_option())?,
         };
         let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
         let call_id = call_id_of(&ctx);
@@ -1865,15 +1833,7 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
     ) -> ServiceResult<impl Encodable<UpdateRoleResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
         let req = request.to_owned_message();
-        // A replacement needs a definition: an unset one must not
-        // clear the role (`{}` does that explicitly).
-        if req.definition.is_unset() {
-            return Err(rpc_err(
-                &ctx,
-                ConnectError::invalid_argument("`definition` is required"),
-            ));
-        }
-        let spec = role_spec(req.definition.into_option());
+        let grants = required_grants(&ctx, req.grants.into_option())?;
         let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
         let call_id = call_id_of(&ctx);
         let name = req.name;
@@ -1883,7 +1843,7 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
                 &audit,
                 connect_audited(call_id.as_deref()),
                 &name,
-                &spec,
+                &grants,
             )
         })
         .await?;
@@ -1908,7 +1868,6 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
                 &audit,
                 connect_audited(call_id.as_deref()),
                 &req.name,
-                req.force,
             )
         })
         .await?;
@@ -1926,12 +1885,8 @@ fn proto_token(s: super::token_admin::TokenSummary) -> ProtoToken {
         owner: s.owner,
         revoked: s.revoked,
         roles: s.roles,
-        scopes: s.scopes,
-        sensitive: s.sensitive,
-        deny: s.deny,
         created_ms: s.created_ms,
         last_used_ms: s.last_used_ms,
-        policy_valid: s.policy_valid,
         ..Default::default()
     }
 }
@@ -1947,9 +1902,6 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
         let mint = super::token_admin::MintRequest {
             label: req.label,
             roles: req.roles,
-            scopes: req.scopes,
-            sensitive: req.sensitive,
-            deny: req.deny.into_iter().map(selector_spec).collect(),
         };
         let tokens = self.engine.auth_tokens();
         let audit = self.engine.audit_log();
@@ -1961,11 +1913,13 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
             super::token_admin::mint(&tokens, &audit, "connect", "api", call_id.as_deref(), &mint)
         })
         .await?;
-        Response::ok(CreateTokenResponse {
+        // The secret is shown once: never cached, as on REST.
+        Ok(Response::new(CreateTokenResponse {
             secret: minted.secret,
             token: proto_token(minted.summary).into(),
             ..Default::default()
         })
+        .with_header(axum::http::header::CACHE_CONTROL, "no-store"))
     }
 
     async fn list_tokens<'a>(
@@ -2061,11 +2015,6 @@ pub fn axum_service(engine: Engine) -> axum::Router {
     let auth_state = AuthState {
         tokens: engine.auth_tokens(),
         audit_log: engine.audit_log(),
-        // H6: `DevicesService.ExecuteCommand` applies the
-        // `device.send_command` per-device allowlist through
-        // `crate::auth::authorize`, same as REST and MCP. Every other
-        // constraint key is still refused here.
-        enforced_constraints: &[crate::auth::DEVICE_COMMAND_ENFORCED],
         transport: crate::auth::Transport::Connect,
     };
     let inner = router(engine).into_axum_service();
@@ -2122,56 +2071,6 @@ async fn connect_auth_middleware(
     let (token_id, actor_kind, invocation) = match state.tokens.verify(&bearer) {
         Ok(rec) => {
             let actor = actor_from_record(&rec, &state.tokens);
-            // Round-3 P1 on PR #147: same reasoning as
-            // [`crate::api::auth::require_token`] — a
-            // constraint-bearing token has no meaning on
-            // Connect-RPC, so refusing it here prevents the
-            // MCP-only restriction from being bypassed via an
-            // equivalent Connect RPC.
-            if let Some(refusal) =
-                super::auth::first_constraint_refusal(&actor, state.enforced_constraints)
-            {
-                let sentinel = refusal.audit_sentinel();
-                tracing::warn!(
-                    target: "api.auth",
-                    token_id = %actor.id(),
-                    refusal = %refusal.as_display(),
-                    "token carries a constraint Connect-RPC does not enforce; refusing (14.4a)",
-                );
-                // Round-4 P2 / round-6 P2 on PR #147:
-                // authenticated denial with the specific
-                // offending key (and field, on a field-level
-                // refusal) in `required_scope`.
-                let entry = crate::state::AuditEntry {
-                    caused_by: None,
-                    id: 0,
-                    intent_ms: 0,
-                    finalized_ms: None,
-                    token_id: actor.id().to_string(),
-                    actor_kind: actor.kind().as_str().to_string(),
-                    method: method.clone(),
-                    path: path.clone(),
-                    status: axum::http::StatusCode::FORBIDDEN.as_u16(),
-                    decision: "deny".into(),
-                    required_scope: Some(sentinel),
-                    execution_outcome: None,
-                    domain_error: None,
-                    credential_fp: None,
-                    call_id: None,
-                    invocation: None,
-                    command_id: None,
-                    command_outcome: None,
-
-                    level: None,
-                };
-                super::auth::record_authenticated_denial(&state.audit_log, None, entry).await;
-                return connect_error_response(
-                    ConnectError::permission_denied(
-                        "token carries a constraint this transport does not enforce",
-                    ),
-                    req.headers(),
-                );
-            }
             let token_id = actor.id().to_string();
             let actor_kind = actor.kind().as_str().to_string();
             // H6: one invocation per authenticated RPC; see the JSON
@@ -2182,14 +2081,19 @@ async fn connect_auth_middleware(
             req.extensions_mut().insert(invocation.clone());
             req.extensions_mut().insert(actor);
             // Give the handler a way to smuggle back its outcome
-            // (scope-deny name + a synthesized HTTP status for the
+            // (permission-deny name + a synthesized HTTP status for the
             // audit classifier). See the `HandlerOutcomeSlot`
             // docstring for why we can't just read the response
             // status on gRPC / gRPC-Web transports.
             req.extensions_mut().insert(outcome_slot.clone());
             (token_id, actor_kind, invocation)
         }
-        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+        Err(
+            TokenError::Malformed
+            | TokenError::Unknown
+            | TokenError::Revoked
+            | TokenError::UnknownRole(_),
+        ) => {
             let fp = crate::state::credential_fingerprint(&bearer);
             record_anonymous_probe(&state.audit_log, &method, &path, 401, Some(fp)).await;
             return connect_error_response(
@@ -2284,7 +2188,7 @@ async fn connect_auth_middleware(
     // a real gap appears.
     let outcome = outcome_slot.take();
     // Authorization / transport status. `outcome.status` is `Some`
-    // for handler-returned errors (`rpc_err` / scope-deny), and
+    // for handler-returned errors (`rpc_err` / permission-deny), and
     // `None` for successful RPCs — including the F4 case where
     // `record_domain_outcome` stamped a `domain_error` but no
     // synthesized status. Falling back to `response.status()` on
@@ -2294,7 +2198,7 @@ async fn connect_auth_middleware(
         .as_ref()
         .and_then(|o| o.status)
         .unwrap_or_else(|| response.status());
-    let denied_scope = outcome.as_ref().and_then(|o| o.denied_scope);
+    let denied_action = outcome.as_ref().and_then(|o| o.denied_action);
     // F4 + H5: a dispatched command's id and outcome. Lives on the
     // same slot but is orthogonal to the transport status — see
     // `super::auth::DomainOutcome` for the split. The JSON side
@@ -2308,7 +2212,7 @@ async fn connect_auth_middleware(
         &method,
         &path,
         audit_status,
-        denied_scope,
+        denied_action,
         domain_outcome,
     )
     .await;
@@ -2369,22 +2273,36 @@ mod command_report_tests {
         assert_eq!(wit_event_to_proto(event(None), &gate).call_id, None);
     }
 
-    /// H6 slice 4: a Connect role or token selector keeps its
-    /// `services` narrowing (dropping it would widen the grant).
+    /// An unset Connect selector is no narrowing; a set, empty one is
+    /// kept, and refused like JSON's `[]`.
     #[test]
-    fn selectors_carry_services() {
-        let spec = selector_spec(ProtoSelector {
-            actions: vec!["service.call".into()],
-            services: vec!["acme.notify/push".into()],
-            ..ProtoSelector::default()
+    fn grants_keep_selector_presence() {
+        let names = |v: &[&str]| {
+            oxidhome_proto::runtime::MessageField::some(
+                oxidhome_proto::proto::oxidhome::v1::Names {
+                    names: v.iter().map(|s| (*s).to_owned()).collect(),
+                    ..Default::default()
+                },
+            )
+        };
+        let g = grant_wire(ProtoGrant {
+            actions: vec!["device.command".into()],
+            category: names(&["lock"]),
+            ..ProtoGrant::default()
         });
-        assert_eq!(spec.services, Some(vec!["acme.notify/push".to_owned()]));
-        assert_eq!(spec.category, None);
-        assert_eq!(selector_spec(ProtoSelector::default()).services, None);
+        assert_eq!(g.category, Some(vec!["lock".to_owned()]));
+        assert_eq!(g.devices, None);
+        let g = grant_wire(ProtoGrant {
+            actions: vec!["device.command".into()],
+            devices: names(&[]),
+            ..ProtoGrant::default()
+        });
+        assert_eq!(g.devices, Some(Vec::new()));
+        assert!(crate::auth::RoleDef::from_wire("r", vec![g]).is_err());
     }
 
     /// M7 + H5: Connect withholds a `completed` report's `bytes-val`
-    /// state from a caller without `blobs:read`.
+    /// state from a caller without `blob.read`.
     #[test]
     fn command_report_withholds_bytes_without_blobs_read() {
         let report = || CommandReport {

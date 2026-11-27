@@ -9,9 +9,8 @@
 //! - the supervisor's `tick_interval_ms` schedule, and the gap before a
 //!   streaming instance's early tick (`runtime::io_wakeup`);
 //! - the `accepted`-command TTL (H5);
-//! - the event bus's per-instance publish rate buckets, the
-//!   per-instance plugin log rate bucket, and the sensitive-action
-//!   (H6) rate buckets;
+//! - the event bus's per-instance publish rate buckets and the
+//!   per-instance plugin log rate bucket;
 //! - the network policy's resolved-address grant TTL and its
 //!   denial-audit rate bucket (streaming worlds);
 //! - the liveness watchdog's epoch counter.

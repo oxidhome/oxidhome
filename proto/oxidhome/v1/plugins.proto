@@ -3,7 +3,7 @@
 // Read side of the plugin catalogue: mirrors `GET /api/v1/plugins`
 // on the JSON API. Aggregates the installed-plugin registry (added
 // in 12-API-f) with the count of running instances per plugin id.
-// Gated on `plugins:list`. Write-side (install / start / stop /
+// Gated on `plugin.read`. Write-side (install / start / stop /
 // uninstall) lands in the next slice.
 syntax = "proto3";
 
@@ -21,24 +21,24 @@ service PluginsService {
   rpc ListPlugins(ListPluginsRequest) returns (ListPluginsResponse);
 
   // Install a plugin from a local source directory. Sensitive
-  // (`plugins:install` scope) — copies operator-supplied code
+  // (`plugin.install` permission) — copies operator-supplied code
   // into `<state_dir>/plugins/<plugin_id>/`. Same shape as
   // `POST /api/v1/plugins` on the JSON API.
   rpc InstallPlugin(InstallPluginRequest) returns (InstallPluginResponse);
 
   // Start a supervised instance of an installed plugin. Gated on
-  // `plugins:start`. Same shape as
+  // `instance.start`. Same shape as
   // `POST /api/v1/plugins/{plugin_id}/start`; blocks until the
   // instance reaches `Running` before returning.
   rpc StartPlugin(StartPluginRequest) returns (StartPluginResponse);
 
   // Stop one or all running instances of a plugin. Gated on
-  // `plugins:stop`. Idempotent — returns an empty `stopped_ids`
+  // `instance.stop`. Idempotent — returns an empty `stopped_ids`
   // when nothing was running.
   rpc StopPlugin(StopPluginRequest) returns (StopPluginResponse);
 
   // Uninstall a plugin — removes `<state_dir>/plugins/<plugin_id>/`.
-  // Sensitive (`plugins:uninstall` scope). Refuses with FAILED_PRECONDITION
+  // Sensitive (`plugin.uninstall` permission). Refuses with FAILED_PRECONDITION
   // if any instance of the plugin is running.
   rpc UninstallPlugin(UninstallPluginRequest) returns (UninstallPluginResponse);
 

@@ -199,8 +199,8 @@ pub struct TailEventsRequest {
     /// the subscription opens). Set = replay history rows with
     /// `row_id > after_id`, then continue live; every row id is
     /// delivered exactly once and in increasing order. `0` starts at
-    /// the oldest retained row. Requires the `events:read` scope in
-    /// addition to `events:tail`. An accepted cursor is acknowledged by
+    /// the oldest retained row. Requires the `event.read` permission in
+    /// addition to `event.subscribe`. An accepted cursor is acknowledged by
     /// the `oxidhome-resume-after-id` response header (the resolved
     /// cursor). When `after_id` is set and the header is missing, the
     /// cursor expired (the first message is `CursorExpired`).
