@@ -6,8 +6,8 @@
 //!   `GET`/`POST /api/v1/roles`, `PUT`/`DELETE /api/v1/roles/{name}`
 //!   and Connect `RolesService`, which [`crate::auth::authorize()`]
 //!   allows for `policy.manage`, i.e. for the owner token only;
-//! - tokens: `oxidhome token create <label> --role <name> ...`
-//!   (offline CLI), `POST /api/v1/tokens` and Connect
+//! - tokens: `oxidhome token create <label> --role <name> ...` and
+//!   `oxidhome token revoke <token-id>` (offline CLI), `POST /api/v1/tokens` and Connect
 //!   `TokensService.CreateToken` (`token.manage`, the owner only). MCP
 //!   has no mint tool: M7 keeps credentials out of MCP responses.
 //!
@@ -501,6 +501,9 @@ pub fn revoke(
             "the owner token is replaced, not revoked: use `oxidhome recover-admin-token`",
         ));
     }
+    if record.revoked_ms.is_some() {
+        return Ok(TokenSummary::of(&record));
+    }
     let path = format!("{}.auth.revoke:{token_id}", by.surface);
     audited_call(audit, by.actor_kind, token_id, &path, by.call_id, || {
         Ok(tokens.revoke(token_id)?)
@@ -510,6 +513,7 @@ pub fn revoke(
         .get(token_id)
         .map_err(|e| AdminError::Store(e.to_string()))?
         .ok_or_else(|| AdminError::Store(format!("token `{token_id}` vanished")))?;
+    tracing::warn!(target: "auth.token", token_id, surface = by.surface, "token revoked");
     Ok(TokenSummary::of(&record))
 }
 
@@ -560,8 +564,19 @@ mod tests {
             revoke(&tokens, &audit, by, "tok-none"),
             Err(AdminError::Invalid(_))
         ));
-        let owner = TokenStore::generate();
-        assert!(tokens.insert_owner_if_empty(&owner, "admin").is_ok());
+        let rows = audit
+            .query(&crate::state::AuditQuery::default(), 1000)
+            .unwrap()
+            .len();
+        revoke(&tokens, &audit, by, &held.id).unwrap();
+        assert_eq!(
+            audit
+                .query(&crate::state::AuditQuery::default(), 1000)
+                .unwrap()
+                .len(),
+            rows,
+            "a repeat revoke writes no row"
+        );
         let issued = TokenStore::generate();
         tokens
             .insert_owner_and_revoke(&issued, "admin", &[])

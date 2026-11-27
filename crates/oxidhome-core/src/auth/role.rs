@@ -93,11 +93,11 @@ impl ActionSet {
     }
 }
 
-/// An action, category or role name the host doesn't know.
+/// An action name the host doesn't know.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown {kind} `{name}`")]
 pub struct UnknownName {
-    /// What was named (`action`, `role`).
+    /// What was named (`action`).
     pub kind: &'static str,
     /// The name.
     pub name: String,

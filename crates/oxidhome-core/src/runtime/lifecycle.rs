@@ -2303,19 +2303,7 @@ fn recheck_after_record(
     instance_id: &str,
     recorded: crate::auth::SensitiveSet,
 ) -> Option<CommandOutcome> {
-    let refusal = match instance.device_resource(device) {
-        Some(resource) => match dispatch_check(ctx, &resource) {
-            Err(why) => Some(why),
-            Ok(Some(d)) if !d.sensitive.is_subset(recorded) => Some(
-                "the device gained a sensitive category while the command was being \
-                 recorded; it did not run"
-                    .to_owned(),
-            ),
-            Ok(_) => None,
-        },
-        None => Some("the device is no longer registered; the command did not run".to_owned()),
-    };
-    if let Some(why) = refusal {
+    if let Some(why) = recheck_class(ctx, instance.device_resource(device).as_ref(), recorded) {
         return Some(CommandOutcome::Rejected {
             error: WitError::PermissionDenied(why),
         });
@@ -2327,6 +2315,28 @@ fn recheck_after_record(
             ctx.call_id(),
         ),
     })
+}
+
+/// Why a recorded sensitive command must not run now: its device is
+/// gone, the caller is no longer allowed on it, or it falls under a
+/// sensitive category the `warn` row (`recorded`) doesn't name.
+fn recheck_class(
+    ctx: &InvocationContext,
+    resource: Option<&crate::auth::Resource>,
+    recorded: crate::auth::SensitiveSet,
+) -> Option<String> {
+    let Some(resource) = resource else {
+        return Some("the device is no longer registered; the command did not run".to_owned());
+    };
+    match dispatch_check(ctx, resource) {
+        Err(why) => Some(why),
+        Ok(Some(d)) if !d.sensitive.is_subset(recorded) => Some(
+            "the device gained a sensitive category while the command was being recorded; \
+             it did not run"
+                .to_owned(),
+        ),
+        Ok(_) => None,
+    }
 }
 
 /// Write a started sensitive command's `warn` row, durably; the
@@ -2732,6 +2742,30 @@ mod tests {
 
         let host = InvocationContext::host_origin("inst");
         assert_eq!(dispatch_check(&host, &lock), Ok(None));
+    }
+
+    /// After the row: a device that gained a sensitive category the row
+    /// doesn't name refuses the command, even for the owner; a gone
+    /// device too.
+    #[test]
+    fn the_row_must_name_every_category_the_command_touches() {
+        use crate::auth::{
+            Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Resource, SensitiveCategory,
+            SensitiveSet, Transport,
+        };
+        let owner = Actor::token("tok-o", true, Vec::new());
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &owner, Transport::Rest));
+        let lock: SensitiveSet = [SensitiveCategory::Lock].into_iter().collect();
+        let lock_only = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Lock));
+        let lock_alarm = Resource::device(
+            "dev-1",
+            DeviceClass::of(DeviceCategory::Lock)
+                .with_sensitive([SensitiveCategory::Alarm].into_iter().collect()),
+        );
+        assert_eq!(recheck_class(&ctx, Some(&lock_only), lock), None);
+        assert!(recheck_class(&ctx, Some(&lock_alarm), lock).is_some());
+        assert!(recheck_class(&ctx, None, lock).is_some());
     }
 
     /// No `warn` row, no run: a sensitive command whose row can't be

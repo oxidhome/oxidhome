@@ -41,8 +41,9 @@ share one axum listener, so a household hub only exposes one endpoint.
   (`device.list`, `device.command`, `event.read`, `host.logs`,
   `plugin.install`, …, or `*`) and optionally narrowing `device.list`,
   `device.read`, `device.command` and `blob.read` to device categories and
-  device ids. Built in: `admin` (everything but token and role
-  management), `member` (household use, sensitive devices included),
+  device ids. Built in: `admin` (every action a role can hold and
+  every sensitive category; managing tokens, roles and host policy
+  stays the owner's), `member` (household use, sensitive devices included),
   `guest` (everyday devices) and `agent` (an assistant: reads and
   everyday commands); `oxidhome role list` shows their grants. The owner
   adds custom roles: `oxidhome role create tablet '[{"actions":

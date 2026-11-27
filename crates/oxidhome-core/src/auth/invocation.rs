@@ -134,7 +134,7 @@ impl Eq for Principal {}
 impl Principal {
     /// Principal for a caller that authenticated with a bearer token.
     /// `kind` is the audit actor kind the transport records (`api` for
-    /// REST / Connect, `mcp` for MCP tool calls). The token.s owner flag and
+    /// REST / Connect, `mcp` for MCP tool calls). The token's owner flag and
     /// roles become the principal's [`Authority`].
     #[must_use]
     pub fn token(kind: ActorKind, actor: &Actor, transport: Transport) -> Self {

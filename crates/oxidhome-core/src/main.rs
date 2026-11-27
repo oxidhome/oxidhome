@@ -768,6 +768,9 @@ fn parse_token_create(
         }
     }
     req.label = label.ok_or_else(|| anyhow::anyhow!("missing <label>"))?;
+    if req.roles.is_empty() {
+        anyhow::bail!("at least one `--role <name>` is required");
+    }
     Ok(req)
 }
 
@@ -1474,6 +1477,7 @@ mod tests {
         for bad in [
             &["kiosk", "--scope", "*"][..],
             &["kiosk", "--role"],
+            &["kiosk"],
             &["--role", "guest"],
         ] {
             let args: Vec<String> = bad.iter().map(|a| (*a).to_owned()).collect();

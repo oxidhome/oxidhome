@@ -398,14 +398,9 @@ pub(crate) async fn call_service(
     let decision = authorize_hop(
         &callee_ctx,
         Action::ServiceCall,
-        // The command is caller-supplied and unchecked until after
-        // authorization: bound it before it's copied or echoed.
-        &Resource::service(
-            target_plugin_id.as_str(),
-            target_instance.as_str(),
-            target_local_id.as_str(),
-            audit_cap(&command),
-        ),
+        // A role grants `service.call` on every service; the target
+        // is matched against the plugin's own grant above.
+        &Resource::Collection(crate::auth::ResourceKind::Service),
         CONSUMES_SERVICES_GRANT,
         matches_requested && matches_granted,
     );

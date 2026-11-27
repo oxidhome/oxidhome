@@ -252,13 +252,26 @@ async fn lock_commands_need_a_grant_naming_lock() {
     )
     .unwrap();
     let state_uri = format!("/api/v1/devices/{device}/state");
-    let (_, before) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    let switch_on = |body: &Value| -> Option<Value> {
+        body["capabilities"]
+            .as_array()?
+            .iter()
+            .flat_map(|c| c["fields"].as_array().cloned().unwrap_or_default())
+            .find(|f| f["key"] == "state")
+            .map(|f| f["value"].clone())
+    };
+    let (status, before) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let on_before = switch_on(&before).unwrap_or_else(|| panic!("switch field in {before}"));
     let rows_before = warn_rows(&engine).len();
     let (status, body) = send(&router, "POST", &command_uri, &granted.plaintext, TOGGLE).await;
-    assert_ne!(status, StatusCode::OK, "{body}");
-    let (_, after) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["outcome"], "rejected", "{body}");
+    let (status, after) = send(&router, "GET", &state_uri, &owner.plaintext, "").await;
+    assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(
-        before["state"], after["state"],
+        switch_on(&after),
+        Some(on_before),
         "the plugin was not entered"
     );
     assert_eq!(warn_rows(&engine).len(), rows_before);

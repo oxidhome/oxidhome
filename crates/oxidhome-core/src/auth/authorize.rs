@@ -209,9 +209,6 @@ pub enum Resource {
     Blob(BlobResource),
     /// One dashboard.
     Dashboard(DashboardResource),
-    /// One command of one plugin service: the target of a delegated
-    /// `call-service` hop.
-    Service(ServiceResource),
 }
 
 impl Resource {
@@ -262,24 +259,6 @@ impl Resource {
     #[must_use]
     pub fn dashboard(id: i64) -> Self {
         Self::Dashboard(DashboardResource { id })
-    }
-
-    /// One command of a registered service, from the service
-    /// registry's owner tuple (never from what the caller passed
-    /// beyond the host-minted service id and the command name).
-    #[must_use]
-    pub fn service(
-        plugin_id: impl Into<String>,
-        instance_id: impl Into<String>,
-        local_id: impl Into<String>,
-        command: impl Into<String>,
-    ) -> Self {
-        Self::Service(ServiceResource {
-            plugin_id: plugin_id.into(),
-            instance_id: instance_id.into(),
-            local_id: local_id.into(),
-            command: command.into(),
-        })
     }
 
     /// The pre-check for `kind`, before a per-target check.
@@ -409,42 +388,6 @@ impl BlobResource {
     #[must_use]
     pub fn is_camera(&self) -> bool {
         self.camera
-    }
-}
-
-/// Service attributes the host decides on: the owner and the
-/// immutable `local-id` (not the renamable `name`), and the command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceResource {
-    plugin_id: String,
-    instance_id: String,
-    local_id: String,
-    command: String,
-}
-
-impl ServiceResource {
-    /// Plugin that owns the service.
-    #[must_use]
-    pub fn plugin_id(&self) -> &str {
-        &self.plugin_id
-    }
-
-    /// Instance that registered the service.
-    #[must_use]
-    pub fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    /// The service's immutable `local-id`.
-    #[must_use]
-    pub fn local_id(&self) -> &str {
-        &self.local_id
-    }
-
-    /// The command called.
-    #[must_use]
-    pub fn command(&self) -> &str {
-        &self.command
     }
 }
 
@@ -845,7 +788,7 @@ mod tests {
 
     #[test]
     fn hops_need_the_plugin_grant_and_an_external_roots_permit() {
-        let svc = Resource::service("acme.notify", "n", "notify", "send");
+        let svc = Resource::Collection(ResourceKind::Service);
         let host = InvocationContext::host_origin("alpha");
         assert!(
             authorize_hop(

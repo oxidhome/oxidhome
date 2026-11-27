@@ -432,7 +432,7 @@ struct DeviceSummary {
     /// `other`), after any operator raise.
     category: &'static str,
     /// Sensitive categories the device falls under (`lock`, `opener`,
-    /// `alarm`, `camera`); a token needs an explicit grant for each.
+    /// `alarm`, `camera`); one role grant must name them all.
     sensitive: Vec<&'static str>,
 }
 
@@ -3517,7 +3517,7 @@ fn run_logs_query(
     store.query(query, limit)
 }
 
-/// Composite error for `query_logs` so a 403 (scope) and a 500
+/// Composite error for `query_logs` so a 403 (permission) and a 500
 /// (storage) flow through the same `?` chain without a custom
 /// trait juggling.
 enum LogsError {
