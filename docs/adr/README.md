@@ -20,3 +20,4 @@ free number.
 | [0008](0008-sqlite-connection-model.md)               | One SQLite writer with pooled readers and writer priority (M6)      | accepted | 2026-11-22 |
 | [0009](0009-durable-device-state.md)                  | Durable device-state projection and plugin state reads (H2)         | accepted | 2026-11-22 |
 | [0010](0010-network-policy.md)                        | Network policy for streaming plugins                                | accepted | 2026-11-23 |
+| [0011](0011-tokens-hold-roles.md)                     | Tokens hold roles; sensitive categories live in role grants         | accepted | 2026-11-26 |

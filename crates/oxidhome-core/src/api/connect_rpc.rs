@@ -145,7 +145,7 @@ impl oxidhome_proto::connect::oxidhome::v1::HealthService for OxidHomeHealth {
     }
 }
 
-// ── Scope-check + outcome-record helpers ────────────────────────
+// ── Permission-check + outcome-record helpers ────────────────────────
 
 /// What a Connect handler recorded as it returned. Serves the
 /// middleware's audit classifier — see [`connect_auth_middleware`].
@@ -1705,6 +1705,18 @@ struct OxidHomeRoles {
     engine: Engine,
 }
 
+/// A role request's `grants`, which must be set: proto3 can't tell an
+/// omitted list from an empty one, and an omitted one must not wipe a
+/// role.
+fn required_grants(
+    ctx: &RequestContext,
+    grants: Option<oxidhome_proto::proto::oxidhome::v1::Grants>,
+) -> Result<Vec<crate::auth::GrantWire>, ConnectError> {
+    grants
+        .map(|g| g.grants.into_iter().map(grant_wire).collect())
+        .ok_or_else(|| rpc_err(ctx, ConnectError::invalid_argument("`grants` is required")))
+}
+
 /// A Connect grant as JSON's: an unset selector is no narrowing, a set
 /// one is kept even when empty, so validation refuses it on both.
 fn grant_wire(g: ProtoGrant) -> crate::auth::GrantWire {
@@ -1795,7 +1807,7 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
         let req = request.to_owned_message();
         let new = super::token_admin::NewRole {
             name: req.name,
-            grants: req.grants.into_iter().map(grant_wire).collect(),
+            grants: required_grants(&ctx, req.grants.into_option())?,
         };
         let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
         let call_id = call_id_of(&ctx);
@@ -1821,7 +1833,7 @@ impl oxidhome_proto::connect::oxidhome::v1::RolesService for OxidHomeRoles {
     ) -> ServiceResult<impl Encodable<UpdateRoleResponse> + Send + use<'a>> {
         require_connect(&ctx, Action::PolicyManage, &Resource::Host)?;
         let req = request.to_owned_message();
-        let grants: Vec<_> = req.grants.into_iter().map(grant_wire).collect();
+        let grants = required_grants(&ctx, req.grants.into_option())?;
         let (tokens, audit) = (self.engine.auth_tokens(), self.engine.audit_log());
         let call_id = call_id_of(&ctx);
         let name = req.name;

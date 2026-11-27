@@ -26,7 +26,7 @@
 //!   ledger, which the MCP surface does not yet expose), so
 //!   this prompt sticks to log evidence.
 //!
-//! # Scope gating
+//! # Permission gating
 //!
 //! `prompts/list` is public — every session sees the full
 //! catalogue regardless of scope. `prompts/get` authorizes the
@@ -115,7 +115,7 @@ pub(super) fn list_prompts() -> Vec<Prompt> {
 /// map to `-32602` (`INVALID_PARAMS`) — `prompts/get` itself
 /// is a supported method, so `method_not_found` would be the
 /// wrong shape; the *arguments* (specifically `name`) were
-/// what didn't validate. Scope failures map to `-32001`
+/// what didn't validate. Permission failures map to `-32001`
 /// mirroring the tool + resource surfaces.
 /// Map a caller-supplied prompt name to the routing table's
 /// canonical static string, or `"unknown"` when the name isn't

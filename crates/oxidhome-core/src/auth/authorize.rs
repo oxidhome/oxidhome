@@ -759,6 +759,7 @@ mod tests {
             name: "all".into(),
             grants: vec![crate::auth::RoleGrant {
                 actions: crate::auth::ActionSet::ALL,
+                wildcard: false,
                 categories: None,
                 devices: None,
             }],
@@ -802,6 +803,34 @@ mod tests {
                 .sensitive
                 .is_empty()
         );
+    }
+
+    /// A device under two sensitive categories needs one grant naming
+    /// both; two grants naming one each don't add up.
+    #[test]
+    fn one_grant_must_name_every_sensitive_category() {
+        let both = Resource::device(
+            "dev-1",
+            DeviceClass::of(DeviceCategory::Lock)
+                .with_sensitive([SensitiveCategory::Alarm].into_iter().collect()),
+        );
+        let split = ctx_for(&Actor::api(
+            "tok-s",
+            vec![role(
+                r#"[{"actions":["device.command"],"category":["lock"]},
+                    {"actions":["device.command"],"category":["alarm"]}]"#,
+            )],
+        ));
+        assert!(!authorize(&split, Action::DeviceCommand, &both).allow);
+        let one = ctx_for(&Actor::api(
+            "tok-o",
+            vec![role(
+                r#"[{"actions":["device.command"],"category":["lock","alarm"]}]"#,
+            )],
+        ));
+        let d = authorize(&one, Action::DeviceCommand, &both);
+        assert!(d.allow);
+        assert_eq!(d.sensitive.to_csv(), "lock,alarm");
     }
 
     #[test]

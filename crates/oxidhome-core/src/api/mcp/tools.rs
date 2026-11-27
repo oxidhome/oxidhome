@@ -1248,7 +1248,7 @@ impl ToolOutcome {
         }
     }
 
-    /// Scope name to record on the audit row's
+    /// Action name to record on the audit row's
     /// `required_scope` column. `Some` only for
     /// [`Self::Denied`], matching resources' shape.
     fn required_scope(&self) -> Option<&'static str> {

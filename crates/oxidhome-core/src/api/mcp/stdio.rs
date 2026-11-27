@@ -107,8 +107,9 @@ pub const STDIO_TOKEN_ID: &str = "mcp-stdio-parent-process";
 ///
 /// # Errors
 ///
-/// [`ServeStdioError::UnknownRole`] when no role has that name or its
-/// definition can't be read.
+/// [`ServeStdioError::UnknownRole`] when no role has that name,
+/// [`ServeStdioError::BadRole`] when its stored definition doesn't
+/// parse, [`ServeStdioError::RoleStore`] when reading it fails.
 pub fn stdio_actor(engine: &Engine, options: &StdioOptions) -> Result<Actor, ServeStdioError> {
     let name = &options.role;
     if let Some(role) = crate::auth::role::builtin(name) {

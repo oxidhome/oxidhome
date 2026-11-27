@@ -530,7 +530,7 @@ struct CategoryResponse {
 }
 
 enum CategoryError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     BadRequest(String),
     Internal,
 }
@@ -538,7 +538,7 @@ enum CategoryError {
 impl IntoResponse for CategoryError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
@@ -569,7 +569,7 @@ async fn set_device_category(
         Action::PolicyManage,
         &state.engine.devices().resource(&device_id),
     )
-    .map_err(CategoryError::Scope)?;
+    .map_err(CategoryError::Denied)?;
     if !crate::state::is_device_id(&device_id) {
         return Err(CategoryError::BadRequest("malformed device id".into()));
     }
@@ -615,7 +615,7 @@ async fn set_device_category(
 
 /// Errors of the `/api/v1/tokens` and `/api/v1/roles` handlers.
 enum TokensError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     BadRequest(String),
     NotFound(String),
     Conflict(String),
@@ -625,7 +625,7 @@ enum TokensError {
 impl IntoResponse for TokensError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
@@ -691,7 +691,7 @@ async fn create_token(
     State(state): State<ApiState>,
     body: Result<Json<super::token_admin::MintRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, TokensError> {
-    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Denied)?;
     let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let tokens = state.engine.auth_tokens();
     let audit = state.engine.audit_log();
@@ -721,7 +721,7 @@ async fn list_tokens(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<TokensBody>, TokensError> {
-    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::TokenManage, &Resource::Host).map_err(TokensError::Denied)?;
     let tokens = state.engine.auth_tokens();
     let list = admin_blocking(move || super::token_admin::summaries(&tokens)).await?;
     Ok(Json(TokensBody { tokens: list }))
@@ -743,7 +743,7 @@ async fn list_roles(
     Extension(ctx): Extension<InvocationContext>,
     State(state): State<ApiState>,
 ) -> Result<Json<RolesBody>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let tokens = state.engine.auth_tokens();
     let roles = admin_blocking(move || super::token_admin::role_summaries(&tokens)).await?;
     Ok(Json(RolesBody { roles }))
@@ -763,7 +763,7 @@ async fn create_role(
     State(state): State<ApiState>,
     body: Result<Json<super::token_admin::NewRole>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let Json(req) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
@@ -789,7 +789,7 @@ async fn update_role(
     Path(name): Path<String>,
     body: Result<Json<super::token_admin::RoleUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let Json(body) = body.map_err(|e| TokensError::BadRequest(format!("invalid body: {e}")))?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
@@ -813,7 +813,7 @@ async fn delete_role(
     State(state): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<super::token_admin::RoleSummary>, TokensError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TokensError::Denied)?;
     let (tokens, audit) = (state.engine.auth_tokens(), state.engine.audit_log());
     let call_id = ctx.call_id().to_owned();
     let role = admin_blocking(move || {
@@ -844,7 +844,7 @@ struct NetworkGrantBody {
 
 /// Why a grant change failed, as REST answers it.
 enum NetworkGrantApiError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     BadRequest(String),
     Grant(super::network_admin::NetworkGrantError),
 }
@@ -860,7 +860,7 @@ impl IntoResponse for NetworkGrantApiError {
                 .into_response()
         };
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(reason) => bad("bad_request", reason),
             Self::Grant(e @ E::NotInstalled(_)) => (
                 StatusCode::NOT_FOUND,
@@ -901,7 +901,7 @@ async fn set_network_grant(
         Action::PolicyManage,
         &Resource::plugin(plugin_id.as_str()),
     )
-    .map_err(NetworkGrantApiError::Scope)?;
+    .map_err(NetworkGrantApiError::Denied)?;
     let Json(body) =
         body.map_err(|e| NetworkGrantApiError::BadRequest(format!("invalid body: {e}")))?;
     let rules = super::network_admin::parse_grant_rules(&body.rules)
@@ -934,7 +934,7 @@ async fn reset_network_grant(
         Action::PolicyManage,
         &Resource::plugin(plugin_id.as_str()),
     )
-    .map_err(NetworkGrantApiError::Scope)?;
+    .map_err(NetworkGrantApiError::Denied)?;
     let view = super::network_admin::change_network_grant(
         state.engine.clone(),
         super::network_admin::GrantActor::of("api", &ctx),
@@ -996,7 +996,7 @@ struct TlsPinsRemovedBody {
 }
 
 enum TlsPinError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     BadRequest(String),
     Internal,
 }
@@ -1004,7 +1004,7 @@ enum TlsPinError {
 impl IntoResponse for TlsPinError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
@@ -1023,7 +1023,7 @@ async fn list_tls_pins(
     State(state): State<ApiState>,
     Query(params): Query<TlsPinParams>,
 ) -> Result<Json<TlsPinsBody>, TlsPinError> {
-    require(&ctx, Action::InstanceRead, &Resource::instances()).map_err(TlsPinError::Scope)?;
+    require(&ctx, Action::InstanceRead, &Resource::instances()).map_err(TlsPinError::Denied)?;
     let filter = params.filter()?;
     let pins = state.engine.tls_pins().list(&filter);
     Ok(Json(TlsPinsBody {
@@ -1049,7 +1049,7 @@ async fn reset_tls_pins(
     State(state): State<ApiState>,
     Query(params): Query<TlsPinParams>,
 ) -> Result<Json<TlsPinsRemovedBody>, TlsPinError> {
-    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Scope)?;
+    require(&ctx, Action::PolicyManage, &Resource::Host).map_err(TlsPinError::Denied)?;
     let filter = params.reset_filter()?;
     let scope = filter.scope();
     let pins = state.engine.tls_pins();
@@ -1367,7 +1367,7 @@ struct AllDevicesStateSnapshot {
 /// Handler-local error type covering permission denial, malformed
 /// cursor, and epoch drift. See [`get_all_device_state`].
 enum AllDevicesStateError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     BadCursor,
     EpochChanged,
 }
@@ -1375,7 +1375,7 @@ enum AllDevicesStateError {
 impl IntoResponse for AllDevicesStateError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::BadCursor => (
                 StatusCode::BAD_REQUEST,
                 "invalid `cursor` — expected the opaque value returned as \
@@ -1394,7 +1394,7 @@ impl IntoResponse for AllDevicesStateError {
 
 impl From<Forbidden> for AllDevicesStateError {
     fn from(value: Forbidden) -> Self {
-        Self::Scope(value)
+        Self::Denied(value)
     }
 }
 
@@ -1842,7 +1842,7 @@ async fn send_command(
         Action::DeviceCommand,
         &state.engine.devices().resource(&device_id),
     )
-    .map_err(CommandError::Scope)?;
+    .map_err(CommandError::Denied)?;
 
     // Resolve device → owning instance via the registry's
     // cross-instance owner-only lookup (mirrors the dispatcher's
@@ -1895,14 +1895,14 @@ async fn send_command(
 }
 
 enum CommandError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     NotFound,
 }
 
 impl IntoResponse for CommandError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            CommandError::Scope(s) => s.into_response(),
+            CommandError::Denied(s) => s.into_response(),
             CommandError::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
         }
     }
@@ -2108,7 +2108,7 @@ async fn get_plugin_schema(
 /// install" apart from generic 500s and act on it
 /// (reinstall via the API).
 enum PluginSchemaError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     NotFound,
     DigestMismatch {
         plugin_id: String,
@@ -2120,14 +2120,14 @@ enum PluginSchemaError {
 
 impl From<Forbidden> for PluginSchemaError {
     fn from(value: Forbidden) -> Self {
-        Self::Scope(value)
+        Self::Denied(value)
     }
 }
 
 impl IntoResponse for PluginSchemaError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::DigestMismatch {
                 plugin_id,
@@ -2442,7 +2442,7 @@ async fn uninstall_plugin(
 /// status so a caller can tell "plugin not installed" from
 /// "instances still running" from "transient IO error".
 enum PluginLifecycleError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     /// Plugin not installed (start, uninstall) or — for install —
     /// the source dir doesn't exist.
     NotFound,
@@ -2478,7 +2478,7 @@ enum PluginLifecycleError {
 
 impl From<Forbidden> for PluginLifecycleError {
     fn from(s: Forbidden) -> Self {
-        Self::Scope(s)
+        Self::Denied(s)
     }
 }
 
@@ -2519,7 +2519,7 @@ impl From<UninstallError> for PluginLifecycleError {
 impl IntoResponse for PluginLifecycleError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::AlreadyInstalled(id) => (
                 StatusCode::CONFLICT,
@@ -2944,7 +2944,7 @@ where
 
 /// C6: handler-local error type for the two UI endpoints.
 enum PluginUiError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     NotFound,
     TicketBad,
     TicketExpired,
@@ -2952,7 +2952,7 @@ enum PluginUiError {
 
 impl From<Forbidden> for PluginUiError {
     fn from(value: Forbidden) -> Self {
-        Self::Scope(value)
+        Self::Denied(value)
     }
 }
 
@@ -2964,7 +2964,7 @@ impl IntoResponse for PluginUiError {
             // Cache-Control stamp — they aren't
             // ticket-authenticated and don't leak
             // anything cacheable-across-request either.
-            Self::Scope(s) => return s.into_response(),
+            Self::Denied(s) => return s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             // Round-3 finding 3: recovery is `POST
             // /api/v1/plugins/{id}/ui-session` (bearer + the
@@ -3482,7 +3482,7 @@ async fn query_logs(
     State(state): State<ApiState>,
     Query(params): Query<LogsParams>,
 ) -> Result<Json<LogsBody>, LogsError> {
-    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Scope)?;
+    require(&ctx, Action::HostLogs, &Resource::Host).map_err(LogsError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(LOGS_QUERY_DEFAULT_LIMIT)
@@ -3521,14 +3521,14 @@ fn run_logs_query(
 /// (storage) flow through the same `?` chain without a custom
 /// trait juggling.
 enum LogsError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     Storage(crate::state::LogStoreError),
 }
 
 impl IntoResponse for LogsError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            LogsError::Scope(s) => s.into_response(),
+            LogsError::Denied(s) => s.into_response(),
             LogsError::Storage(err) => {
                 tracing::error!(target: "api.logs", error = %err, "logs query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -3638,7 +3638,7 @@ async fn query_events(
     State(state): State<ApiState>,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<EventsBody>, EventsError> {
-    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Scope)?;
+    require(&ctx, Action::EventRead, &Resource::events()).map_err(EventsError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(EVENTS_QUERY_DEFAULT_LIMIT)
@@ -3703,7 +3703,7 @@ async fn query_events(
 }
 
 enum EventsError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     Storage(EventLogError),
     Join,
     Busy,
@@ -3713,7 +3713,7 @@ enum EventsError {
 impl IntoResponse for EventsError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            EventsError::Scope(s) => s.into_response(),
+            EventsError::Denied(s) => s.into_response(),
             EventsError::Storage(err) => {
                 tracing::error!(target: "api.events", error = %err, "events query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -3853,7 +3853,7 @@ async fn query_audit(
     State(state): State<ApiState>,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditBody>, AuditError> {
-    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Scope)?;
+    require(&ctx, Action::HostAudit, &Resource::Host).map_err(AuditError::Denied)?;
     let limit = params
         .limit
         .unwrap_or(AUDIT_QUERY_DEFAULT_LIMIT)
@@ -3930,7 +3930,7 @@ fn parse_audit_cursor(s: &str) -> Result<(i64, u64), &'static str> {
 }
 
 enum AuditError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     Storage(crate::state::AuditLogError),
     BadCursor(&'static str),
 }
@@ -3938,7 +3938,7 @@ enum AuditError {
 impl IntoResponse for AuditError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            AuditError::Scope(s) => s.into_response(),
+            AuditError::Denied(s) => s.into_response(),
             AuditError::Storage(err) => {
                 tracing::error!(target: "api.audit", error = %err, "audit query failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
@@ -4279,7 +4279,7 @@ async fn delete_dashboard(
 /// Handler-local error type. Errors from the store fold
 /// into this via `?`.
 enum DashboardsError {
-    Scope(Forbidden),
+    Denied(Forbidden),
     NotFound,
     /// Round-2 finding 3: input violated the per-row cap
     /// or per-owner quota. Wired distinctly from
@@ -4304,7 +4304,7 @@ enum DashboardsError {
 
 impl From<Forbidden> for DashboardsError {
     fn from(value: Forbidden) -> Self {
-        Self::Scope(value)
+        Self::Denied(value)
     }
 }
 
@@ -4326,7 +4326,7 @@ impl From<crate::state::DashboardError> for DashboardsError {
 impl IntoResponse for DashboardsError {
     fn into_response(self) -> Response {
         match self {
-            Self::Scope(s) => s.into_response(),
+            Self::Denied(s) => s.into_response(),
             Self::NotFound => (StatusCode::NOT_FOUND, "").into_response(),
             Self::TooLarge { field, size, max } => (
                 StatusCode::BAD_REQUEST,

@@ -449,9 +449,9 @@ async fn connect_tokens_service_is_owner_only() {
         .expect("owner");
     let wildcard = engine.auth_tokens().mint("ha", &["*"]).unwrap();
     let router = build_router(engine.clone());
-    let visitor = json!({"name": "visitor", "grants": [
+    let visitor = json!({"name": "visitor", "grants": {"grants": [
         {"actions": ["device.list", "device.read", "device.command"],
-         "category": {"names": ["light", "media", "climate"]}}]})
+         "category": {"names": ["light", "media", "climate"]}}]}})
     .to_string();
     let (status, body) = send(
         &router,
@@ -567,17 +567,43 @@ async fn connect_tokens_service_is_owner_only() {
         "POST",
         "/oxidhome.v1.RolesService/UpdateRole",
         &owner.plaintext,
-        &json!({"name": "visitor", "grants": [{"actions": ["device.list"]}]}).to_string(),
+        &json!({"name": "visitor", "grants": {"grants": [{"actions": ["device.list"]}]}})
+            .to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["role"]["grants"], json!(["device.list"]));
+    // An omitted `grants` is refused, not read as "no grants".
     let (status, body) = send(
         &router,
         "POST",
         "/oxidhome.v1.RolesService/UpdateRole",
         &owner.plaintext,
-        &json!({"name": "nope", "grants": []}).to_string(),
+        &json!({"name": "visitor"}).to_string(),
+    )
+    .await;
+    assert_eq!(body["code"], "invalid_argument", "{status} {body}");
+    let (_, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.RolesService/ListRoles",
+        &owner.plaintext,
+        "{}",
+    )
+    .await;
+    let kept = body["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "visitor")
+        .expect("visitor listed");
+    assert_eq!(kept["grants"], json!(["device.list"]));
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/oxidhome.v1.RolesService/UpdateRole",
+        &owner.plaintext,
+        &json!({"name": "nope", "grants": {}}).to_string(),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
@@ -603,8 +629,9 @@ async fn connect_tokens_service_is_owner_only() {
     assert_eq!(body["role"]["name"], "visitor");
 }
 
-/// The offline CLI mints and lists role tokens.
+/// The offline CLI mints, lists and revokes role tokens and edits roles.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn cli_creates_and_lists_role_tokens() {
     let state = support::tempdir("token-roles-cli");
     let run = |args: &[&str]| {
@@ -683,8 +710,39 @@ fn cli_creates_and_lists_role_tokens() {
     assert!(stderr.contains("held by 1 live token"), "{stderr}");
     let (ok, _, _) = run(&["role", "delete", "guest"]);
     assert!(!ok, "a built-in role can't be deleted");
+    let (ok, stdout, stderr) = run(&[
+        "role",
+        "update",
+        "monitor",
+        r#"[{"actions":["device.list"]}]"#,
+    ]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("monitor\tcustom\tgrants=device.list\t"),
+        "{stdout}"
+    );
 
+    let rec = {
+        let engine = Engine::with_state_dir(state.path()).expect("engine");
+        let rec = engine.auth_tokens().verify(secret).expect("verifies");
+        assert_eq!(rec.label, "prometheus");
+        let owner = engine
+            .auth_tokens()
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.owner)
+            .expect("owner");
+        (rec.id, owner.id)
+    };
+    let (ok, _, stderr) = run(&["token", "revoke", &rec.1]);
+    assert!(!ok, "the owner isn't revoked this way");
+    assert!(stderr.contains("recover-admin-token"), "{stderr}");
+    let (ok, stdout, stderr) = run(&["token", "revoke", &rec.0]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.contains("prometheus\trevoked"), "{stdout}");
+    let (ok, _, stderr) = run(&["role", "delete", "monitor"]);
+    assert!(ok, "a revoked holder frees the role: {stderr}");
     let engine = Engine::with_state_dir(state.path()).expect("engine");
-    let rec = engine.auth_tokens().verify(secret).expect("verifies");
-    assert_eq!(rec.label, "prometheus");
+    assert!(engine.auth_tokens().verify(secret).is_err());
 }

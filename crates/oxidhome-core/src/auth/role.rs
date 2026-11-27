@@ -81,25 +81,15 @@ impl ActionSet {
         self.0 & action.bit() != 0
     }
 
-    /// `true` when every action of `other` is in the set.
-    #[must_use]
-    pub const fn contains_all(self, other: Self) -> bool {
-        other.0 & !self.0 == 0
-    }
-
     /// The actions, in [`Action::ALL`] order.
     pub fn iter(self) -> impl Iterator<Item = Action> {
         Action::ALL.into_iter().filter(move |a| self.contains(*a))
     }
 
-    /// The actions' names; `["*"]` for every grantable action.
+    /// The actions' names.
     #[must_use]
     pub fn names(self) -> Vec<&'static str> {
-        if self == GRANTABLE {
-            vec!["*"]
-        } else {
-            self.iter().map(Action::as_str).collect()
-        }
+        self.iter().map(Action::as_str).collect()
     }
 }
 
@@ -147,6 +137,10 @@ pub const NARROWABLE: ActionSet = ActionSet::of(&[
 pub struct RoleGrant {
     /// Actions granted.
     pub actions: ActionSet,
+    /// `true` when the grant named `*`: it is stored as `*`, so it
+    /// covers actions a later release adds, while an explicit list
+    /// stays that list.
+    pub wildcard: bool,
     /// Device categories the grant is narrowed to; `None` for every
     /// non-sensitive target. Names the sensitive categories it reaches.
     pub categories: Option<Vec<DeviceCategory>>,
@@ -201,11 +195,20 @@ impl RoleGrant {
         }
     }
 
+    /// The action names as written: `["*"]` for a wildcard grant.
+    fn action_names(&self) -> Vec<&'static str> {
+        if self.wildcard {
+            vec!["*"]
+        } else {
+            self.actions.names()
+        }
+    }
+
     /// The grant as role-definition JSON.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
-        obj.insert("actions".into(), serde_json::json!(self.actions.names()));
+        obj.insert("actions".into(), serde_json::json!(self.action_names()));
         if let Some(c) = &self.categories {
             obj.insert(
                 "category".into(),
@@ -221,7 +224,7 @@ impl RoleGrant {
     /// One-line form for listings: `actions[@categories][ [devices]]`.
     #[must_use]
     pub fn describe(&self) -> String {
-        let mut s = self.actions.names().join(",");
+        let mut s = self.action_names().join(",");
         if let Some(c) = &self.categories {
             s.push('@');
             s.push_str(&c.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(","));
@@ -276,6 +279,7 @@ impl GrantWire {
         let narrowed = self.category.is_some() || self.devices.is_some();
         let allowed = if narrowed { NARROWABLE } else { GRANTABLE };
         let mut actions = ActionSet::empty();
+        let wildcard = self.actions.iter().any(|n| n == "*");
         for name in &self.actions {
             actions = actions.union(if name == "*" {
                 allowed
@@ -331,6 +335,7 @@ impl GrantWire {
         });
         Ok(RoleGrant {
             actions,
+            wildcard,
             categories,
             devices,
         })
@@ -426,12 +431,14 @@ static BUILTINS: LazyLock<Vec<Arc<RoleDef>>> = LazyLock::new(|| {
     let role = |name: &str, actions: ActionSet, reaches_sensitive: bool| {
         let mut grants = vec![RoleGrant {
             actions,
+            wildcard: actions == GRANTABLE,
             categories: None,
             devices: None,
         }];
         if reaches_sensitive {
             grants.push(RoleGrant {
                 actions: ActionSet::of(&[DeviceCommand, BlobRead]),
+                wildcard: false,
                 categories: sensitive.clone(),
                 devices: None,
             });
@@ -503,6 +510,13 @@ mod tests {
     fn wildcard_is_every_grantable_action_or_every_narrowable_one() {
         let g = grant(serde_json::json!({"actions": ["*"]})).unwrap();
         assert_eq!(g.actions, GRANTABLE);
+        assert_eq!(g.to_json(), serde_json::json!({"actions": ["*"]}));
+        // An explicit full list stays explicit: a later action isn't
+        // added to it.
+        let all: Vec<&str> = GRANTABLE.names();
+        let g = grant(serde_json::json!({ "actions": all })).unwrap();
+        assert_eq!(g.actions, GRANTABLE);
+        assert_eq!(g.to_json(), serde_json::json!({ "actions": all }));
         assert!(!g.actions.contains(Action::TokenManage));
         let g = grant(serde_json::json!({"actions": ["*"], "category": ["light"]})).unwrap();
         assert_eq!(g.actions, NARROWABLE);

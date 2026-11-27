@@ -122,7 +122,14 @@ message CreateRoleRequest {
   // 1 to 32 of `a-z0-9-_`, starting with a letter; not `owner` or a
   // built-in role's name.
   string name = 1;
-  repeated Grant grants = 2;
+  // Required (INVALID_ARGUMENT when unset); empty grants nothing.
+  Grants grants = 2;
+}
+
+// A role's grants, with presence: an unset field is refused rather
+// than read as "no grants".
+message Grants {
+  repeated Grant grants = 1;
 }
 
 message CreateRoleResponse {
@@ -131,7 +138,10 @@ message CreateRoleResponse {
 
 message UpdateRoleRequest {
   string name = 1;
-  repeated Grant grants = 2;
+  // The replacement grants. Required (INVALID_ARGUMENT when unset, so
+  // an omitted field can't wipe the role); set but empty grants
+  // nothing.
+  Grants grants = 2;
 }
 
 message UpdateRoleResponse {

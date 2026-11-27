@@ -126,6 +126,7 @@ pub mod __buffa {
         reg.register_json_any(super::__LIST_ROLES_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_ROLES_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__CREATE_ROLE_REQUEST_JSON_ANY);
+        reg.register_json_any(super::__GRANTS_JSON_ANY);
         reg.register_json_any(super::__CREATE_ROLE_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__UPDATE_ROLE_REQUEST_JSON_ANY);
         reg.register_json_any(super::__UPDATE_ROLE_RESPONSE_JSON_ANY);
@@ -409,6 +410,10 @@ pub use self::__buffa::view::ListRolesResponseOwnedView;
 pub use self::__buffa::view::CreateRoleRequestView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateRoleRequestOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::GrantsView;
+#[doc(inline)]
+pub use self::__buffa::view::GrantsOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateRoleResponseView;
 #[doc(inline)]

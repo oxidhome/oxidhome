@@ -106,7 +106,7 @@
 //! intent/finalize contract as API requests and fail closed if the
 //! intent cannot be written; refusals are single-shot `deny` rows
 //! whose `required_scope` names what was missing (`consumes_services`
-//! for the plugin's grant, `service.call` or `deny` for the root).
+//! for the plugin's grant, `service.call` for the root).
 //! Other host-origin chains (`init`, `tick`, reactions to unattributed
 //! events) are traced but not audited.
 //!

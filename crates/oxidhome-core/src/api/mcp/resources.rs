@@ -538,7 +538,7 @@ impl ReadOutcome {
         }
     }
 
-    /// Scope name to record on the audit row's
+    /// Action name to record on the audit row's
     /// `required_scope` column. `Some` only for
     /// [`Self::Denied`] — every other outcome leaves the
     /// column NULL (matches how the REST middleware only

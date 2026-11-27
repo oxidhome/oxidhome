@@ -324,7 +324,9 @@ impl TokenStore {
     pub fn revoke(&self, token_id: &str) -> Result<bool, TokenError> {
         let id_owned = token_id.to_string();
         let now = now_ms();
-        let changed = self.db.write(move |conn| -> Result<bool, TokenError> {
+        // Durable: a revoked credential must not come back after a
+        // power cut.
+        let changed = self.durable_write(move |conn| -> Result<bool, TokenError> {
             let n = conn.execute(
                 "UPDATE auth_token SET revoked_ms = ?1 \
                  WHERE id = ?2 AND revoked_ms IS NULL",
@@ -1014,9 +1016,15 @@ mod tests {
 
         reset();
         let unused = store.create("x", &["admin"]).unwrap();
+        assert_eq!(sync(), 1, "create");
         reset();
         assert!(store.delete_undelivered(&unused.id).unwrap());
         assert_eq!(sync(), 1, "delete_undelivered");
+
+        let held = store.create("y", &["guest"]).unwrap();
+        reset();
+        assert!(store.revoke(&held.id).unwrap());
+        assert_eq!(sync(), 1, "revoke");
 
         db.write(|c| {
             c.execute_batch(
