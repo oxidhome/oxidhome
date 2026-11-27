@@ -77,6 +77,10 @@ pub enum ServeStdioError {
     Join(#[from] tokio::task::JoinError),
     #[error("unknown role `{0}`")]
     UnknownRole(String),
+    #[error("role `{0}`'s stored definition doesn't parse")]
+    BadRole(String),
+    #[error("reading role `{0}` failed: {1}")]
+    RoleStore(String, String),
 }
 
 /// Operator choices for an `mcp-stdio` session.
@@ -106,18 +110,21 @@ pub const STDIO_TOKEN_ID: &str = "mcp-stdio-parent-process";
 /// [`ServeStdioError::UnknownRole`] when no role has that name or its
 /// definition can't be read.
 pub fn stdio_actor(engine: &Engine, options: &StdioOptions) -> Result<Actor, ServeStdioError> {
-    let unknown = || ServeStdioError::UnknownRole(options.role.clone());
-    let role = match crate::auth::role::builtin(&options.role) {
-        Some(role) => role,
-        None => engine
-            .auth_tokens()
-            .roles_by_name(std::slice::from_ref(&options.role))
-            .map_err(|_| unknown())?
-            .first()
-            .and_then(crate::state::RoleRecord::def)
-            .map(std::sync::Arc::new)
-            .ok_or_else(unknown)?,
-    };
+    let name = &options.role;
+    if let Some(role) = crate::auth::role::builtin(name) {
+        return Ok(Actor::api(STDIO_TOKEN_ID, vec![role]));
+    }
+    let rows = engine
+        .auth_tokens()
+        .roles_by_name(std::slice::from_ref(name))
+        .map_err(|e| ServeStdioError::RoleStore(name.clone(), e.to_string()))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| ServeStdioError::UnknownRole(name.clone()))?;
+    let role = std::sync::Arc::new(
+        row.def()
+            .ok_or_else(|| ServeStdioError::BadRole(name.clone()))?,
+    );
     Ok(Actor::api(STDIO_TOKEN_ID, vec![role]))
 }
 

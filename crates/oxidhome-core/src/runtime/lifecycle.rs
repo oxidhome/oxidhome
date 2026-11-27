@@ -2293,15 +2293,26 @@ fn record_late_service_result(
 }
 
 /// After a sensitive command's `warn` row: refuse it if its device's
-/// class changed, or its deadline passed, during the write.
+/// class changed so that the caller is no longer allowed or the row
+/// (which names `recorded`) no longer covers every sensitive category
+/// the command touches, or its deadline passed, during the write.
 fn recheck_after_record(
     instance: &PluginInstance,
     ctx: &InvocationContext,
     device: &DeviceId,
     instance_id: &str,
+    recorded: crate::auth::SensitiveSet,
 ) -> Option<CommandOutcome> {
     let refusal = match instance.device_resource(device) {
-        Some(resource) => dispatch_check(ctx, &resource).err(),
+        Some(resource) => match dispatch_check(ctx, &resource) {
+            Err(why) => Some(why),
+            Ok(Some(d)) if !d.sensitive.is_subset(recorded) => Some(
+                "the device gained a sensitive category while the command was being \
+                 recorded; it did not run"
+                    .to_owned(),
+            ),
+            Ok(_) => None,
+        },
         None => Some("the device is no longer registered; the command did not run".to_owned()),
     };
     if let Some(why) = refusal {
@@ -2457,10 +2468,11 @@ async fn run_execute(
         && let Some(refused) = if stop_is_requested(stop) {
             Some(stopping())
         } else {
+            let recorded = decision.sensitive;
             match record_sensitive(instance.audit_log(), &ctx, &device, decision, &cmd.id).await {
                 Err(refused) => Some(refused),
                 Ok(()) if stop_is_requested(stop) => Some(stopping()),
-                Ok(()) => recheck_after_record(instance, &ctx, &device, instance_id),
+                Ok(()) => recheck_after_record(instance, &ctx, &device, instance_id, recorded),
             }
         }
     {
@@ -2720,6 +2732,50 @@ mod tests {
 
         let host = InvocationContext::host_origin("inst");
         assert_eq!(dispatch_check(&host, &lock), Ok(None));
+    }
+
+    /// No `warn` row, no run: a sensitive command whose row can't be
+    /// written is rejected.
+    #[tokio::test]
+    async fn a_sensitive_command_without_its_row_is_rejected() {
+        use crate::auth::role::builtin;
+        use crate::auth::{
+            Actor, ActorKind, DeviceCategory, DeviceClass, Principal, Resource, Transport,
+        };
+        use crate::state::{AuditLog, Db};
+        let db = Arc::new(Db::open_in_memory().expect("db"));
+        db.write(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER no_authz BEFORE INSERT ON audit_event \
+                 WHEN NEW.method = 'AUTHZ' BEGIN SELECT RAISE(ABORT, 'no'); END;",
+            )
+        })
+        .expect("trigger");
+        let audit = Arc::new(AuditLog::new(db));
+        let member = Actor::api("tok-2", vec![builtin("member").unwrap()]);
+        let ctx =
+            InvocationContext::external(Principal::token(ActorKind::Api, &member, Transport::Rest));
+        let lock = Resource::device("dev-1", DeviceClass::of(DeviceCategory::Lock));
+        let decision = dispatch_check(&ctx, &lock).unwrap().expect("sensitive");
+        let device: DeviceId = "dev-1".into();
+        let refused = record_sensitive(
+            Some(Arc::clone(&audit)),
+            &ctx,
+            &device,
+            decision.clone(),
+            "cmd-1",
+        )
+        .await
+        .expect_err("no row, no run");
+        assert!(
+            matches!(refused, CommandOutcome::Rejected { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            record_sensitive(None, &ctx, &device, decision, "cmd-1")
+                .await
+                .is_err()
+        );
     }
 
     /// The journal-backed table and ledger the ordering tests read.

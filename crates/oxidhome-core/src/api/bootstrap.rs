@@ -108,6 +108,25 @@ pub const AUDIT_PATH_RECOVER: &str = "cli.auth.recover";
 /// Audit path: offline recovery revoked a token.
 pub const AUDIT_PATH_RECOVER_REVOKE: &str = "cli.auth.revoke";
 
+/// Startup check: warn when tokens exist but none is a live owner, so
+/// nothing can manage tokens or roles until `recover-admin-token` mints
+/// a new owner.
+fn warn_if_no_live_owner(tokens: &TokenStore) {
+    match tokens.list() {
+        Ok(records) if !records.iter().any(|r| r.owner && r.revoked_ms.is_none()) => {
+            tracing::warn!(
+                target: "api.bootstrap",
+                "no live owner token: nothing can manage tokens or roles; mint one offline \
+                 with `oxidhome recover-admin-token` (it revokes the current admin tokens)",
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::error!(target: "api.bootstrap", error = %err, "listing tokens for the owner check failed");
+        }
+    }
+}
+
 /// If `tokens` is empty, mint an `admin` token and deliver its
 /// plaintext to `<state_dir>/admin-token`. Returns `Some(token)` if
 /// this call minted the admin, `None` if the store already had
@@ -138,6 +157,7 @@ pub fn ensure_admin_token(
     // already-provisioned host. The insert below re-checks inside
     // its own transaction, so this read isn't load-bearing.
     if tokens.count().context("counting tokens")? > 0 {
+        warn_if_no_live_owner(tokens);
         return Ok(None);
     }
 

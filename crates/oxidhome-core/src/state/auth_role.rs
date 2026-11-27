@@ -140,17 +140,6 @@ impl TokenStore {
             })
     }
 
-    /// Ids of the live tokens holding the role `name`.
-    ///
-    /// # Errors
-    ///
-    /// On database failure.
-    pub fn role_holders(&self, name: &str) -> Result<Vec<String>, RoleError> {
-        let name = name.to_owned();
-        self.db
-            .read(move |conn| -> Result<Vec<String>, RoleError> { Ok(holders(conn, &name)?) })
-    }
-
     /// Store a new role. The caller validated `name` and `definition`.
     ///
     /// # Errors
@@ -282,10 +271,6 @@ mod tests {
             Err(RoleError::Exists(_))
         ));
         let holder = tokens.create("t", &["tablet"]).unwrap();
-        assert_eq!(
-            tokens.role_holders("tablet").unwrap(),
-            vec![holder.id.clone()]
-        );
 
         let (_, held) = tokens
             .update_role("tablet", br#"[{"actions":["device.list"]}]"#)

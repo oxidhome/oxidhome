@@ -84,8 +84,7 @@ pub const MCP_ENDPOINT: &str = "/api/v1/mcp";
 
 /// Maximum concurrent MCP sessions. Sized for a home hub with
 /// one operator; a session count beyond this is either an
-/// abuser or a client bug. 14.4 wires per-token limits, at
-/// which point this becomes a config knob.
+/// abuser or a client bug.
 pub(super) const MAX_SESSIONS: usize = 128;
 
 /// Maximum concurrent POST bodies alive on the mount at any

@@ -226,7 +226,7 @@ fn ctx_bytes_gate(ctx: &RequestContext, engine: &Engine) -> BytesGate {
 
 /// Wrap a [`ConnectError`] on the error-return site so the audit
 /// row picks up the outcome. Idiomatic use — at every `return Err(...)`
-/// inside a Connect handler that isn't a scope denial:
+/// inside a Connect handler that isn't a permission denial:
 ///
 /// ```ignore
 /// return Err(rpc_err(&ctx, ConnectError::not_found("device x")));
@@ -565,7 +565,7 @@ impl oxidhome_proto::connect::oxidhome::v1::DevicesService for OxidHomeDevices {
         let device_id = request.to_owned_message().device_id;
         // Host-minted ids are short; don't copy a huge one under the
         // projection lock. The target check below decides for the
-        // device (a role narrowed to categories, a deny list).
+        // device (a role narrowed to categories or devices).
         if device_id.len() > MAX_DEVICE_ID_LEN {
             return Err(rpc_err(
                 &ctx,
@@ -1511,7 +1511,7 @@ impl oxidhome_proto::connect::oxidhome::v1::EventsService for OxidHomeEvents {
         request: ServiceRequest<'_, TailEventsRequest>,
     ) -> ServiceResult<connectrpc::ServiceStream<impl Encodable<TailEventsResponse> + Send + use<>>>
     {
-        // Auth + scope check runs BEFORE the stream is established
+        // Auth + permission check runs BEFORE the stream is established
         // — a denied caller sees a clean Connect error, no wasted
         // stream setup, and the audit row lands with the right
         // decision via the outcome slot. A cursor replays history,
@@ -1705,12 +1705,13 @@ struct OxidHomeRoles {
     engine: Engine,
 }
 
+/// A Connect grant as JSON's: an unset selector is no narrowing, a set
+/// one is kept even when empty, so validation refuses it on both.
 fn grant_wire(g: ProtoGrant) -> crate::auth::GrantWire {
-    let none_if_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
     crate::auth::GrantWire {
         actions: g.actions,
-        category: none_if_empty(g.category),
-        devices: none_if_empty(g.devices),
+        category: g.category.into_option().map(|n| n.names),
+        devices: g.devices.into_option().map(|n| n.names),
     }
 }
 
@@ -1900,11 +1901,13 @@ impl oxidhome_proto::connect::oxidhome::v1::TokensService for OxidHomeTokens {
             super::token_admin::mint(&tokens, &audit, "connect", "api", call_id.as_deref(), &mint)
         })
         .await?;
-        Response::ok(CreateTokenResponse {
+        // The secret is shown once: never cached, as on REST.
+        Ok(Response::new(CreateTokenResponse {
             secret: minted.secret,
             token: proto_token(minted.summary).into(),
             ..Default::default()
         })
+        .with_header(axum::http::header::CACHE_CONTROL, "no-store"))
     }
 
     async fn list_tokens<'a>(
@@ -2066,14 +2069,19 @@ async fn connect_auth_middleware(
             req.extensions_mut().insert(invocation.clone());
             req.extensions_mut().insert(actor);
             // Give the handler a way to smuggle back its outcome
-            // (scope-deny name + a synthesized HTTP status for the
+            // (permission-deny name + a synthesized HTTP status for the
             // audit classifier). See the `HandlerOutcomeSlot`
             // docstring for why we can't just read the response
             // status on gRPC / gRPC-Web transports.
             req.extensions_mut().insert(outcome_slot.clone());
             (token_id, actor_kind, invocation)
         }
-        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+        Err(
+            TokenError::Malformed
+            | TokenError::Unknown
+            | TokenError::Revoked
+            | TokenError::UnknownRole(_),
+        ) => {
             let fp = crate::state::credential_fingerprint(&bearer);
             record_anonymous_probe(&state.audit_log, &method, &path, 401, Some(fp)).await;
             return connect_error_response(
@@ -2168,7 +2176,7 @@ async fn connect_auth_middleware(
     // a real gap appears.
     let outcome = outcome_slot.take();
     // Authorization / transport status. `outcome.status` is `Some`
-    // for handler-returned errors (`rpc_err` / scope-deny), and
+    // for handler-returned errors (`rpc_err` / permission-deny), and
     // `None` for successful RPCs — including the F4 case where
     // `record_domain_outcome` stamped a `domain_error` but no
     // synthesized status. Falling back to `response.status()` on
@@ -2253,16 +2261,32 @@ mod command_report_tests {
         assert_eq!(wit_event_to_proto(event(None), &gate).call_id, None);
     }
 
-    /// An empty Connect list is an absent narrowing, not an empty one.
+    /// An unset Connect selector is no narrowing; a set, empty one is
+    /// kept, and refused like JSON's `[]`.
     #[test]
-    fn grants_map_empty_lists_to_unnarrowed() {
+    fn grants_keep_selector_presence() {
+        let names = |v: &[&str]| {
+            oxidhome_proto::runtime::MessageField::some(
+                oxidhome_proto::proto::oxidhome::v1::Names {
+                    names: v.iter().map(|s| (*s).to_owned()).collect(),
+                    ..Default::default()
+                },
+            )
+        };
         let g = grant_wire(ProtoGrant {
             actions: vec!["device.command".into()],
-            category: vec!["lock".into()],
+            category: names(&["lock"]),
             ..ProtoGrant::default()
         });
         assert_eq!(g.category, Some(vec!["lock".to_owned()]));
         assert_eq!(g.devices, None);
+        let g = grant_wire(ProtoGrant {
+            actions: vec!["device.command".into()],
+            devices: names(&[]),
+            ..ProtoGrant::default()
+        });
+        assert_eq!(g.devices, Some(Vec::new()));
+        assert!(crate::auth::RoleDef::from_wire("r", vec![g]).is_err());
     }
 
     /// M7 + H5: Connect withholds a `completed` report's `bytes-val`

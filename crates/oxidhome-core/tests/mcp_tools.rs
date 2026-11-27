@@ -255,7 +255,7 @@ async fn call_tool_unknown_name_returns_method_not_found() {
 
 /// A token without `device.command` cannot invoke
 /// `device.send_command` — mirrors the REST endpoint's
-/// scope gate. `-32001` is our per-mount `SCOPE_DENIED_CODE`.
+/// permission gate. `-32001` is our per-mount `SCOPE_DENIED_CODE`.
 #[tokio::test(flavor = "current_thread")]
 async fn device_send_command_requires_devices_command_scope() {
     let engine = Engine::new().expect("engine");
@@ -467,7 +467,7 @@ async fn device_send_command_end_to_end_toggles_a_switch() {
 /// audit row under `mcp.tool.<family>` with `actor_kind =
 /// "mcp"`. Drives one success (unknown-device: audit path
 /// = `mcp.tool.device.send_command`, status 200 because the
-/// dispatch ran, decision "allow") and one scope-denied
+/// dispatch ran, decision "allow") and one permission-denied
 /// call, and verifies both lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_calls_land_in_the_audit_log() {
@@ -494,7 +494,7 @@ async fn tool_calls_land_in_the_audit_log() {
     )
     .await;
 
-    // Fire a scope-denied call from a different session (a
+    // Fire a permission-denied call from a different session (a
     // fresh bearer needs its own initialize handshake).
     let (router, session2) = handshake(router, &bearer_denied).await;
     let _ = call(
@@ -541,7 +541,7 @@ async fn tool_calls_land_in_the_audit_log() {
     );
     assert!(
         paths_statuses.contains(&("mcp.tool.device.send_command", 403, "deny")),
-        "missing scope-denied row; got {paths_statuses:?}",
+        "missing permission-denied row; got {paths_statuses:?}",
     );
     for row in &tool_rows {
         assert_eq!(row.actor_kind, "mcp");
@@ -787,7 +787,7 @@ async fn list_tools_advertises_logs_query() {
 }
 
 /// A token without `host.logs` cannot invoke `logs.query`.
-/// Mirrors the resource-side scope check on
+/// Mirrors the resource-side permission check on
 /// `oxidhome://logs`.
 #[tokio::test(flavor = "current_thread")]
 async fn logs_query_requires_logs_read_scope() {

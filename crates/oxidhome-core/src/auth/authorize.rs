@@ -670,6 +670,11 @@ pub(crate) fn evaluate(authority: &Authority, action: Action, resource: &Resourc
     if authority.is_owner() {
         return Decision::allow(Reason::Owner, sensitive);
     }
+    // The owner's alone, whatever a role holds: parsing refuses them,
+    // and this keeps a role built in code from granting them either.
+    if !super::role::GRANTABLE.contains(action) {
+        return Decision::deny(Reason::NoPermit { action });
+    }
     match authority
         .roles()
         .iter()
@@ -749,6 +754,20 @@ mod tests {
             assert_eq!(d.reason.audit_label(), Some(a.as_str()));
             assert_eq!(authorize(&owner, a, &Resource::Host).reason, Reason::Owner);
         }
+        // Not even a role built in code with every action.
+        let all = Arc::new(RoleDef {
+            name: "all".into(),
+            grants: vec![crate::auth::RoleGrant {
+                actions: crate::auth::ActionSet::ALL,
+                categories: None,
+                devices: None,
+            }],
+        });
+        let all = ctx_for(&Actor::api("tok-all", vec![all]));
+        for a in [Action::TokenManage, Action::PolicyManage] {
+            assert!(!authorize(&all, a, &Resource::Host).allow);
+        }
+        assert!(authorize(&all, Action::HostStatus, &Resource::Host).allow);
     }
 
     #[test]

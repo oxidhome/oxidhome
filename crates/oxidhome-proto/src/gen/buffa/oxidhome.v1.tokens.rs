@@ -176,26 +176,24 @@ pub struct Grant {
         deserialize_with = "::buffa::json_helpers::null_as_default"
     )]
     pub actions: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Device categories the grant is narrowed to; empty for every
-    /// resource.
+    /// Device categories the grant is narrowed to; unset for every
+    /// resource. Set but empty is refused, as on the JSON API.
     ///
     /// Field 2: `category`
     #[serde(
         rename = "category",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub category: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
-    /// Device ids or `prefix*` patterns the grant is narrowed to; empty
-    /// for every device.
+    pub category: ::buffa::MessageField<Names, ::buffa::Inline<Names>>,
+    /// Device ids or `prefix*` patterns the grant is narrowed to; unset
+    /// for every device. Set but empty is refused.
     ///
     /// Field 3: `devices`
     #[serde(
         rename = "devices",
-        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
-        deserialize_with = "::buffa::json_helpers::null_as_default"
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_unset_message_field"
     )]
-    pub devices: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    pub devices: ::buffa::MessageField<Names, ::buffa::Inline<Names>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub __buffa_unknown_fields: ::buffa::UnknownFields,
@@ -232,25 +230,35 @@ impl ::buffa::Message for Grant {
     /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
     /// points reject, never a silently wrapped size.
     #[allow(clippy::let_and_return)]
-    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+    fn compute_size(&self, __cache: &mut ::buffa::SizeCache) -> u32 {
         #[allow(unused_imports)]
         use ::buffa::Enumeration as _;
         let mut size = 0u64;
         for v in &self.actions {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        for v in &self.category {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        if self.category.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.category.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
-        for v in &self.devices {
-            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        if self.devices.is_set() {
+            let __slot = __cache.reserve();
+            let inner_size = self.devices.compute_size(__cache);
+            __cache.set(__slot, inner_size);
+            size
+                += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
+                    + inner_size as u64;
         }
         size += self.__buffa_unknown_fields.encoded_len() as u64;
         ::buffa::saturate_size(size)
     }
     fn write_to(
         &self,
-        _cache: &mut ::buffa::SizeCache,
+        __cache: &mut ::buffa::SizeCache,
         buf: &mut impl ::buffa::EncodeSink,
     ) {
         #[allow(unused_imports)]
@@ -258,11 +266,21 @@ impl ::buffa::Message for Grant {
         for v in &self.actions {
             ::buffa::types::put_string_field(1u32, v, buf);
         }
-        for v in &self.category {
-            ::buffa::types::put_string_field(2u32, v, buf);
+        if self.category.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                2u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.category.write_to(__cache, buf);
         }
-        for v in &self.devices {
-            ::buffa::types::put_string_field(3u32, v, buf);
+        if self.devices.is_set() {
+            ::buffa::types::put_len_delimited_header(
+                3u32,
+                u64::from(__cache.consume_next()),
+                buf,
+            );
+            self.devices.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -293,22 +311,22 @@ impl ::buffa::Message for Grant {
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
+                ::buffa::Message::merge_length_delimited(
+                    self.category.get_or_insert_default(),
+                    buf,
+                    ctx,
                 )?;
-                self.category.push(__elem);
             }
             3u32 => {
                 ::buffa::encoding::check_wire_type(
                     tag,
                     ::buffa::encoding::WireType::LengthDelimited,
                 )?;
-                let __elem = ::buffa::types::decode_string(buf)?;
-                ctx.register_element_memory(
-                    ::buffa::__private::element_footprint(&__elem),
+                ::buffa::Message::merge_length_delimited(
+                    self.devices.get_or_insert_default(),
+                    buf,
+                    ctx,
                 )?;
-                self.devices.push(__elem);
             }
             _ => {
                 self.__buffa_unknown_fields
@@ -319,8 +337,8 @@ impl ::buffa::Message for Grant {
     }
     fn clear(&mut self) {
         self.actions.clear();
-        self.category.clear();
-        self.devices.clear();
+        self.category = ::buffa::MessageField::none();
+        self.devices = ::buffa::MessageField::none();
         self.__buffa_unknown_fields.clear();
     }
 }
@@ -351,6 +369,135 @@ pub const __GRANT_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type
     type_url: "type.googleapis.com/oxidhome.v1.Grant",
     to_json: ::buffa::type_registry::any_to_json::<Grant>,
     from_json: ::buffa::type_registry::any_from_json::<Grant>,
+    is_wkt: false,
+};
+/// A list whose presence is meaningful: unset is not the same as empty.
+#[derive(Clone, PartialEq, Default)]
+#[derive(::serde::Serialize, ::serde::Deserialize)]
+#[serde(default)]
+pub struct Names {
+    /// Field 1: `names`
+    #[serde(
+        rename = "names",
+        skip_serializing_if = "::buffa::json_helpers::skip_if::is_empty_vec",
+        deserialize_with = "::buffa::json_helpers::null_as_default"
+    )]
+    pub names: ::buffa::alloc::vec::Vec<::buffa::alloc::string::String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub __buffa_unknown_fields: ::buffa::UnknownFields,
+}
+impl ::core::fmt::Debug for Names {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("Names").field("names", &self.names).finish()
+    }
+}
+impl Names {
+    /// Protobuf type URL for this message, for use with `Any::pack` and
+    /// `Any::unpack_if`.
+    ///
+    /// Format: `type.googleapis.com/<fully.qualified.TypeName>`
+    pub const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Names";
+}
+::buffa::impl_default_instance!(Names);
+impl ::buffa::MessageName for Names {
+    const PACKAGE: &'static str = "oxidhome.v1";
+    const NAME: &'static str = "Names";
+    const FULL_NAME: &'static str = "oxidhome.v1.Names";
+    const TYPE_URL: &'static str = "type.googleapis.com/oxidhome.v1.Names";
+}
+impl ::buffa::Message for Names {
+    /// Returns the total encoded size in bytes.
+    ///
+    /// Accumulates in `u64` (which cannot overflow for in-memory
+    /// data) and saturates to `u32` at return, so a message whose
+    /// encoded size exceeds the 2 GiB protobuf limit yields a value
+    /// above [`::buffa::MAX_MESSAGE_BYTES`] that the encode entry
+    /// points reject, never a silently wrapped size.
+    #[allow(clippy::let_and_return)]
+    fn compute_size(&self, _cache: &mut ::buffa::SizeCache) -> u32 {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        let mut size = 0u64;
+        for v in &self.names {
+            size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
+        }
+        size += self.__buffa_unknown_fields.encoded_len() as u64;
+        ::buffa::saturate_size(size)
+    }
+    fn write_to(
+        &self,
+        _cache: &mut ::buffa::SizeCache,
+        buf: &mut impl ::buffa::EncodeSink,
+    ) {
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        for v in &self.names {
+            ::buffa::types::put_string_field(1u32, v, buf);
+        }
+        self.__buffa_unknown_fields.write_to(buf);
+    }
+    fn merge_field(
+        &mut self,
+        tag: ::buffa::encoding::Tag,
+        buf: &mut impl ::buffa::bytes::Buf,
+        ctx: ::buffa::DecodeContext<'_>,
+    ) -> ::core::result::Result<(), ::buffa::DecodeError> {
+        #[allow(unused_imports)]
+        use ::buffa::bytes::Buf as _;
+        #[allow(unused_imports)]
+        use ::buffa::Enumeration as _;
+        match tag.field_number() {
+            1u32 => {
+                ::buffa::encoding::check_wire_type(
+                    tag,
+                    ::buffa::encoding::WireType::LengthDelimited,
+                )?;
+                let __elem = ::buffa::types::decode_string(buf)?;
+                ctx.register_element_memory(
+                    ::buffa::__private::element_footprint(&__elem),
+                )?;
+                self.names.push(__elem);
+            }
+            _ => {
+                self.__buffa_unknown_fields
+                    .push(::buffa::encoding::decode_unknown_field(tag, buf, ctx)?);
+            }
+        }
+        ::core::result::Result::Ok(())
+    }
+    fn clear(&mut self) {
+        self.names.clear();
+        self.__buffa_unknown_fields.clear();
+    }
+}
+impl ::buffa::ExtensionSet for Names {
+    const PROTO_FQN: &'static str = "oxidhome.v1.Names";
+    fn unknown_fields(&self) -> &::buffa::UnknownFields {
+        &self.__buffa_unknown_fields
+    }
+    fn unknown_fields_mut(&mut self) -> &mut ::buffa::UnknownFields {
+        &mut self.__buffa_unknown_fields
+    }
+}
+impl ::buffa::json_helpers::ProtoElemJson for Names {
+    fn serialize_proto_json<S: ::serde::Serializer>(
+        v: &Self,
+        s: S,
+    ) -> ::core::result::Result<S::Ok, S::Error> {
+        ::serde::Serialize::serialize(v, s)
+    }
+    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
+        d: D,
+    ) -> ::core::result::Result<Self, D::Error> {
+        <Self as ::serde::Deserialize>::deserialize(d)
+    }
+}
+#[doc(hidden)]
+pub const __NAMES_JSON_ANY: ::buffa::type_registry::JsonAnyEntry = ::buffa::type_registry::JsonAnyEntry {
+    type_url: "type.googleapis.com/oxidhome.v1.Names",
+    to_json: ::buffa::type_registry::any_to_json::<Names>,
+    from_json: ::buffa::type_registry::any_from_json::<Names>,
     is_wkt: false,
 };
 #[derive(Clone, PartialEq, Default)]

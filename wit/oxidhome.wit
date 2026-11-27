@@ -1296,8 +1296,8 @@ interface host-services {
   /// **Root authority (H6).** When the invocation making the call
   /// is rooted at an external request (a token's command or service
   /// call, and every call-service hop it leads to), the call also
-  /// needs that request's own permission for `service.call` on the
-  /// target, and none of its denies may match. A plugin's grant
+  /// needs that request's own `service.call` permission (a role
+  /// granting it, or the owner). A plugin's grant
   /// never extends what the requester may do. Work the host started
   /// (`init`, `tick`, and every `on-event`, including a reaction to
   /// an event whose `call-id` names a request) is decided by the

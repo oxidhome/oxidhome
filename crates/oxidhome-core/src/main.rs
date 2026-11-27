@@ -23,9 +23,11 @@
 //!   the same transaction, and writes the secret to
 //!   `<state_dir>/admin-token`. Never reachable over the network:
 //!   it needs filesystem access to the state dir.
-//! - **`token list` / `token create <label> --role <name>...`** —
-//!   offline: list tokens with their owner flag and roles, or mint a
-//!   token holding built-in or custom roles, printing its secret once.
+//! - **`token list` / `token create <label> --role <name>...` /
+//!   `token revoke <token-id>`** — offline: list tokens with their
+//!   owner flag and roles, mint a token holding built-in or custom
+//!   roles (printing its secret once), or revoke one that isn't the
+//!   owner.
 //! - **`role list|create <name> <grants-json>|update <name>
 //!   <grants-json>|delete <name>`** — offline: the built-in roles and
 //!   the owner's custom ones. Commands on locks, openers and alarms and
@@ -530,13 +532,16 @@ fn run_recover_admin_token() -> anyhow::Result<()> {
 fn parse_stdio_args() -> anyhow::Result<Option<StdioOptions>> {
     const USAGE: &str = "usage: oxidhome mcp-stdio [--role <name>]";
     let mut options = StdioOptions::default();
+    let mut role_given = false;
     let mut args = std::env::args().skip(2);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--role" if role_given => anyhow::bail!("--role is given once\n{USAGE}"),
             "--role" => {
                 options.role = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--role needs a role name\n{USAGE}"))?;
+                role_given = true;
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -552,10 +557,12 @@ fn parse_stdio_args() -> anyhow::Result<Option<StdioOptions>> {
     Ok(Some(options))
 }
 
-/// `oxidhome token <list|create>`. Offline, like `recover-admin-token`.
+/// `oxidhome token <list|create|revoke>`. Offline, like
+/// `recover-admin-token`.
 fn run_token() -> anyhow::Result<()> {
     const USAGE: &str = "usage: oxidhome token list\n       \
-         oxidhome token create <label> --role <name> [--role <name>]...";
+         oxidhome token create <label> --role <name> [--role <name>]...\n       \
+         oxidhome token revoke <token-id>";
     let args: Vec<String> = std::env::args().skip(2).collect();
     match args.first().map(String::as_str) {
         Some("-h" | "--help") | None => {
@@ -568,6 +575,7 @@ fn run_token() -> anyhow::Result<()> {
         }
         Some("create") => run_token_create(&args[1..], USAGE),
         Some("list") if args.len() == 1 => run_token_list(),
+        Some("revoke") if args.len() == 2 => run_token_revoke(&args[1]),
         _ => anyhow::bail!("{USAGE}"),
     }
 }
@@ -593,6 +601,23 @@ fn run_token_list() -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// `oxidhome token revoke <token-id>`.
+fn run_token_revoke(token_id: &str) -> anyhow::Result<()> {
+    use oxidhome_core::api::token_admin::{Audited, revoke};
+    init_cli_tracing();
+    let state_dir = resolve_state_dir()?;
+    let by = Audited {
+        surface: "cli",
+        actor_kind: "cli",
+        call_id: None,
+    };
+    let t = with_offline_stores(&state_dir, |stores| {
+        revoke(&stores.tokens, &stores.audit, by, token_id).map_err(anyhow::Error::from)
+    })?;
+    println!("{}\t{}\trevoked", t.token_id, t.label);
+    Ok(())
 }
 
 /// One `oxidhome role` row.
@@ -1377,7 +1402,7 @@ async fn run_stdio(options: StdioOptions) -> anyhow::Result<()> {
     };
 
     // Round-2 P1 on PR #143: same bounded shutdown the HTTP
-    // daemon runs. Stdio exposes wildcard `plugins.start`, so
+    // daemon runs. Stdio can expose `plugins.start` (by role), so
     // live supervisors may exist when the client hangs up;
     // without this the tokio runtime teardown would abort them
     // mid-cleanup and leave partially-evicted device / service

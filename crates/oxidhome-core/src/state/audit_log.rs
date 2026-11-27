@@ -25,7 +25,7 @@
 //!    operation.
 //! 2. [`AuditLog::finalize`] after the handler returns. UPDATEs the
 //!    row with the outcome (`allow` / `deny` / `error`), the final
-//!    HTTP status, and `required_scope` on scope-deny 403s; stamps
+//!    HTTP status, and `required_scope` on permission-deny 403s; stamps
 //!    `finalized_ms`. Best-effort — if the update errors, the
 //!    handler's side effects are already committed, and the pending
 //!    row is the operator-visible signal that something went wrong.

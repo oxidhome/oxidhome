@@ -34,7 +34,8 @@ share one axum listener, so a household hub only exposes one endpoint.
   "roles": ["guest"]}`, `201` with the secret). `GET /api/v1/tokens`,
   Connect `ListTokens`, MCP `tokens.list` and `oxidhome token list` list
   tokens without secrets; only the owner reaches the API forms.
-  Revocation is offline (`recover-admin-token --revoke-all`). Missing or
+  Revocation is offline: `oxidhome token revoke <token-id>`, or
+  `recover-admin-token [--revoke-all]` for the owner. Missing or
   malformed bearer → `401`.
 - **Roles**: a role is a list of grants, each naming actions
   (`device.list`, `device.command`, `event.read`, `host.logs`,

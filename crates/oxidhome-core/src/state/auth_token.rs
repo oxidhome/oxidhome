@@ -63,6 +63,9 @@ pub enum TokenError {
     /// The matching row has a non-null `revoked_ms`.
     #[error("token revoked")]
     Revoked,
+    /// A mint named a role that is neither built in nor stored.
+    #[error("unknown role `{0}`")]
+    UnknownRole(String),
 }
 
 /// What the store hands back on a successful verify. `Clone` is
@@ -123,36 +126,24 @@ impl TokenStore {
         }
     }
 
-    /// Mint a fresh token with `label` holding `roles` (not checked
-    /// against the stored roles; see [`Self::insert_with_roles`]).
-    /// Returns the id + plaintext (the only copy — caller must surface
-    /// it to the operator immediately).
+    /// Mint a fresh token with `label` holding `roles`, checked like
+    /// [`Self::insert_with_roles`]. Returns the id + plaintext (the
+    /// only copy — caller must surface it to the operator immediately).
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::UnknownRole`] for a role that is neither built in
+    /// nor stored; [`TokenError::Sqlite`] on DB failure.
     pub fn create(
         &self,
         label: &str,
         roles: &[impl AsRef<str>],
     ) -> Result<IssuedToken, TokenError> {
-        let secret = generate_secret();
-        let plaintext = format_token(&secret);
-        let hash = sha256(&secret);
-        let id = derive_id(&hash);
-        let now = now_ms();
-
-        let label_owned = label.to_string();
-        let roles_owned = roles_json(roles);
-        let id_for_db = id.clone();
-        let hash_for_db = hash.to_vec();
-        self.db.write(move |conn| -> Result<(), TokenError> {
-            conn.execute(
-                "INSERT INTO auth_token \
-                   (id, label, hash, roles, created_ms, last_used_ms, revoked_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
-                params![id_for_db, label_owned, hash_for_db, roles_owned, now],
-            )?;
-            Ok(())
-        })?;
-
-        Ok(IssuedToken { id, plaintext })
+        let issued = Self::generate();
+        let roles: Vec<String> = roles.iter().map(|r| r.as_ref().to_owned()).collect();
+        self.insert_with_roles(&issued, label, &roles)?
+            .map_err(TokenError::UnknownRole)?;
+        Ok(issued)
     }
 
     /// Look up a token by id. Used by [`Self::revoke`] / the CLI's
@@ -356,27 +347,6 @@ impl TokenStore {
         Ok(n as u64)
     }
 
-    /// Atomic "mint exactly one token iff the table is empty".
-    /// Runs the count + insert inside one `BEGIN IMMEDIATE` write
-    /// transaction, so two daemons racing against the same `SQLite`
-    /// file see exactly one winner (the loser observes `count > 0`
-    /// inside the transaction and rolls back).
-    ///
-    /// Returns `Ok(Some(issued))` when a token is minted, `Ok(None)`
-    /// when the table already had at least one row.
-    pub fn create_if_empty(
-        &self,
-        label: &str,
-        roles: &[impl AsRef<str>],
-    ) -> Result<Option<IssuedToken>, TokenError> {
-        let issued = Self::generate();
-        Ok(if self.insert_first(&issued, label, roles, false)? {
-            Some(issued)
-        } else {
-            None
-        })
-    }
-
     /// Generate a fresh token **without** touching the database.
     ///
     /// M4: the first-run bootstrap and the offline recovery command
@@ -395,9 +365,10 @@ impl TokenStore {
 
     /// Insert a token produced by [`Self::generate`] **as the owner**
     /// iff the table is empty — the first-run bootstrap — inside one
-    /// `BEGIN IMMEDIATE` transaction (see
-    /// [`Self::create_if_empty`] for the race argument). Returns
-    /// `true` if the row was inserted.
+    /// `BEGIN IMMEDIATE` transaction, so two daemons racing against
+    /// the same `SQLite` file see exactly one winner (the loser
+    /// observes `count > 0` inside the transaction and rolls back).
+    /// Returns `true` if the row was inserted.
     ///
     /// # Errors
     ///
@@ -408,17 +379,7 @@ impl TokenStore {
         issued: &IssuedToken,
         label: &str,
     ) -> Result<bool, TokenError> {
-        self.insert_first(issued, label, &[] as &[&str], true)
-    }
-
-    fn insert_first(
-        &self,
-        issued: &IssuedToken,
-        label: &str,
-        roles: &[impl AsRef<str>],
-        owner: bool,
-    ) -> Result<bool, TokenError> {
-        let row = PendingRow::new(issued, label, roles, owner)?;
+        let row = PendingRow::new(issued, label, &[] as &[&str], true)?;
         self.durable_write(move |conn| -> Result<bool, TokenError> {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let existing: i64 =
@@ -973,29 +934,31 @@ mod tests {
         assert!(base64url_no_pad_decode("A/").is_none());
     }
 
-    /// `create_if_empty` mints on an empty store, becomes a no-op
-    /// once any token exists, and (most importantly) does both in
-    /// the same `BEGIN IMMEDIATE` write so two concurrent calls
-    /// can't both mint. Hard to drive a real two-process race in
-    /// a unit test; the next-best signal is "first call mints,
-    /// second call sees the row and returns None even with the
-    /// same `db` handle".
+    /// `insert_owner_if_empty` mints on an empty store and becomes a
+    /// no-op once any token exists, in one `BEGIN IMMEDIATE` write.
     #[test]
-    fn create_if_empty_mints_once_then_is_noop() {
+    fn insert_owner_if_empty_mints_once_then_is_noop() {
         let store = TokenStore::new(fresh());
-        let first = store
-            .create_if_empty("admin", &["admin"])
-            .expect("first call");
-        assert!(first.is_some(), "first call should mint");
+        assert!(
+            store
+                .insert_owner_if_empty(&TokenStore::generate(), "admin")
+                .unwrap()
+        );
         assert_eq!(store.count().unwrap(), 1);
-        // A generic insert is never the owner (H6 slice 2).
-        assert!(!store.list().unwrap()[0].owner);
-
-        let second = store
-            .create_if_empty("admin", &["admin"])
-            .expect("second call");
-        assert!(second.is_none(), "second call must see the row and bail");
+        assert!(store.list().unwrap()[0].owner);
+        assert!(
+            !store
+                .insert_owner_if_empty(&TokenStore::generate(), "admin")
+                .unwrap()
+        );
         assert_eq!(store.count().unwrap(), 1, "still exactly one row");
+        // A generic mint is never the owner, and names known roles only.
+        store.create("ci", &["guest"]).unwrap();
+        assert_eq!(store.list().unwrap().iter().filter(|t| t.owner).count(), 1);
+        assert!(matches!(
+            store.create("ci", &["nope"]),
+            Err(TokenError::UnknownRole(name)) if name == "nope"
+        ));
     }
 
     #[test]

@@ -451,7 +451,7 @@ async fn connect_tokens_service_is_owner_only() {
     let router = build_router(engine.clone());
     let visitor = json!({"name": "visitor", "grants": [
         {"actions": ["device.list", "device.read", "device.command"],
-         "category": ["light", "media", "climate"]}]})
+         "category": {"names": ["light", "media", "climate"]}}]})
     .to_string();
     let (status, body) = send(
         &router,

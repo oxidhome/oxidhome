@@ -117,6 +117,7 @@ pub mod __buffa {
         reg.register_json_any(super::__NOT_RESTARTED_INSTANCE_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_REQUEST_JSON_ANY);
         reg.register_json_any(super::__GRANT_JSON_ANY);
+        reg.register_json_any(super::__NAMES_JSON_ANY);
         reg.register_json_any(super::__CREATE_TOKEN_RESPONSE_JSON_ANY);
         reg.register_json_any(super::__LIST_TOKENS_REQUEST_JSON_ANY);
         reg.register_json_any(super::__LIST_TOKENS_RESPONSE_JSON_ANY);
@@ -372,6 +373,10 @@ pub use self::__buffa::view::CreateTokenRequestOwnedView;
 pub use self::__buffa::view::GrantView;
 #[doc(inline)]
 pub use self::__buffa::view::GrantOwnedView;
+#[doc(inline)]
+pub use self::__buffa::view::NamesView;
+#[doc(inline)]
+pub use self::__buffa::view::NamesOwnedView;
 #[doc(inline)]
 pub use self::__buffa::view::CreateTokenResponseView;
 #[doc(inline)]

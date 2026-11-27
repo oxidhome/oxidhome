@@ -310,7 +310,12 @@ pub(crate) async fn require_token(
             req.extensions_mut().insert(actor);
             (token_id, actor_kind, invocation)
         }
-        Err(TokenError::Malformed | TokenError::Unknown | TokenError::Revoked) => {
+        Err(
+            TokenError::Malformed
+            | TokenError::Unknown
+            | TokenError::Revoked
+            | TokenError::UnknownRole(_),
+        ) => {
             // Malformed / unknown / revoked — record the probe with
             // a fingerprint so a forensic sweep can correlate
             // repeats. Never store the raw secret.

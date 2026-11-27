@@ -133,8 +133,9 @@ impl ServerHandler for OxidHomeMcpHandler {
     {
         let engine = self.engine.clone();
         let actor = self.resolve_actor(&context);
-        // Resource reads write their own audit row without a call id;
-        // the context only carries the root's authority to `authorize`.
+        // Resource reads write their own audit row, with this
+        // context's call id; it also carries the root's authority to
+        // `authorize`.
         let invocation = crate::auth::InvocationContext::external(self.principal(&actor));
         async move {
             // 14.7c: standardised completion event. `read` is
@@ -404,7 +405,7 @@ fn emit_completion(target: &'static str, name: &str, actor: &Actor, outcome: &st
 ///   `CallToolResult { isError: true }`).
 /// - `Ok(_)` otherwise → `"ok"`.
 /// - `Err(mcp_error)` → tag derived from the JSON-RPC code
-///   ([`classify_mcp_error`]), so scope denials, oversized
+///   ([`classify_mcp_error`]), so permission denials, oversized
 ///   responses, and the audit-queue busy path each get a
 ///   dashboard-friendly slice.
 fn classify_call(result: &Result<CallToolResult, McpError>) -> &'static str {

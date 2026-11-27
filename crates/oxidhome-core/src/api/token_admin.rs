@@ -356,22 +356,31 @@ fn describe(def: Option<&RoleDef>) -> Vec<String> {
 ///
 /// [`AdminError::Store`] on a read failure.
 pub fn role_summaries(tokens: &TokenStore) -> Result<Vec<RoleSummary>, AdminError> {
-    let mut out = builtins()
+    let live: Vec<TokenRecord> = tokens
+        .list()
+        .map_err(|e| AdminError::Store(e.to_string()))?
+        .into_iter()
+        .filter(|t| t.revoked_ms.is_none())
+        .collect();
+    let held = |name: &str| -> Vec<String> {
+        live.iter()
+            .filter(|t| t.roles.iter().any(|r| r == name))
+            .map(|t| t.id.clone())
+            .collect()
+    };
+    let mut out: Vec<RoleSummary> = builtins()
         .iter()
-        .map(|r| {
-            Ok(RoleSummary {
-                name: r.name.clone(),
-                builtin: true,
-                grants: describe(Some(r)),
-                tokens: tokens.role_holders(&r.name)?,
-                created_ms: None,
-                updated_ms: None,
-            })
+        .map(|r| RoleSummary {
+            name: r.name.clone(),
+            builtin: true,
+            grants: describe(Some(r)),
+            tokens: held(&r.name),
+            created_ms: None,
+            updated_ms: None,
         })
-        .collect::<Result<Vec<_>, AdminError>>()?;
+        .collect();
     for r in tokens.roles()? {
-        let held = tokens.role_holders(&r.name)?;
-        out.push(RoleSummary::of(&r, held));
+        out.push(RoleSummary::of(&r, held(&r.name)));
     }
     Ok(out)
 }
@@ -473,6 +482,41 @@ pub fn delete_role(
     Ok(RoleSummary::of(&record, Vec::new()))
 }
 
+/// Revoke a token that isn't the owner (the owner is replaced with
+/// `recover-admin-token`). Revoking a revoked token changes nothing.
+/// Audited as `<surface>.auth.revoke:<token id>`. Blocking.
+///
+/// # Errors
+///
+/// [`AdminError::Invalid`] for an unknown id or the owner token,
+/// [`AdminError::Store`].
+pub fn revoke(
+    tokens: &TokenStore,
+    audit: &AuditLog,
+    by: Audited<'_>,
+    token_id: &str,
+) -> Result<TokenSummary, AdminError> {
+    let record = tokens
+        .get(token_id)
+        .map_err(|e| AdminError::Store(e.to_string()))?
+        .ok_or_else(|| invalid(format!("no token `{token_id}`")))?;
+    if record.owner {
+        return Err(invalid(
+            "the owner token is replaced, not revoked: use `oxidhome recover-admin-token`",
+        ));
+    }
+    let path = format!("{}.auth.revoke:{token_id}", by.surface);
+    audited_call(audit, by.actor_kind, token_id, &path, by.call_id, || {
+        Ok(tokens.revoke(token_id)?)
+    })
+    .map_err(|e| AdminError::Store(format!("{e:#}")))?;
+    let record = tokens
+        .get(token_id)
+        .map_err(|e| AdminError::Store(e.to_string()))?
+        .ok_or_else(|| AdminError::Store(format!("token `{token_id}` vanished")))?;
+    Ok(TokenSummary::of(&record))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +541,49 @@ mod tests {
 
     fn grants(json: &str) -> Vec<GrantWire> {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn revoke_frees_a_role_and_spares_the_owner() {
+        let (tokens, audit) = stores();
+        let by = Audited {
+            surface: "cli",
+            actor_kind: "cli",
+            call_id: None,
+        };
+        let held = tokens.create("tablet", &["dashboard"]).unwrap();
+        let other = tokens.create("other", &["guest"]).unwrap();
+        assert!(matches!(
+            delete_role(&tokens, &audit, by, "dashboard"),
+            Err(AdminError::Conflict(_))
+        ));
+        assert!(revoke(&tokens, &audit, by, &held.id).unwrap().revoked);
+        delete_role(&tokens, &audit, by, "dashboard").unwrap();
+        assert!(tokens.verify(&other.plaintext).is_ok());
+        assert!(matches!(
+            revoke(&tokens, &audit, by, "tok-none"),
+            Err(AdminError::Invalid(_))
+        ));
+        let owner = TokenStore::generate();
+        assert!(tokens.insert_owner_if_empty(&owner, "admin").is_ok());
+        let issued = TokenStore::generate();
+        tokens
+            .insert_owner_and_revoke(&issued, "admin", &[])
+            .unwrap();
+        assert!(matches!(
+            revoke(&tokens, &audit, by, &issued.id),
+            Err(AdminError::Invalid(_))
+        ));
+        let paths: Vec<String> = audit
+            .query(&AuditQuery::default(), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert!(
+            paths.contains(&format!("cli.auth.revoke:{}", held.id)),
+            "{paths:?}"
+        );
     }
 
     #[test]

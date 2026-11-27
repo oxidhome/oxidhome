@@ -455,9 +455,9 @@ enum ReadOutcome {
     /// H4: the `after_id` cursor can't be resumed without a gap.
     /// Audited as HTTP 410, like REST history.
     CursorExpired(crate::state::CursorExpired),
-    /// Bearer resolved, but its scope list does not include
+    /// Bearer resolved, but its roles don't grant
     /// [`Self::Denied::required`]. Carried through so the
-    /// audit row can name the scope that was missing.
+    /// audit row can name the action that was refused.
     Denied {
         required: &'static str,
     },
@@ -493,7 +493,7 @@ impl ReadOutcome {
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see
                 // `SCOPE_DENIED_CODE`'s doc.
-                "scope denied for MCP resource",
+                "permission denied for MCP resource",
                 None,
             )),
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
@@ -542,7 +542,7 @@ impl ReadOutcome {
     /// `required_scope` column. `Some` only for
     /// [`Self::Denied`] — every other outcome leaves the
     /// column NULL (matches how the REST middleware only
-    /// populates the field on scope-deny 403s).
+    /// populates the field on permission-deny 403s).
     fn required_scope(&self) -> Option<&'static str> {
         match self {
             Self::Denied { required } => Some(required),
@@ -582,9 +582,8 @@ impl Kind<'_> {
             Kind::DevicesList => AuthResource::pre_check(crate::auth::ResourceKind::Device),
             Kind::DevicesDetail(id) => engine.devices().resource(id),
             // The detail read is checked against the plugin collection:
-            // `plugin.read` on `oxidhome://plugins/{id}` has always been
-            // the flat `plugin.read` permission, and naming the plugin here
-            // would newly apply a token's `plugins.show` allowlist.
+            // `plugin.read` on `oxidhome://plugins/{id}` is the flat
+            // `plugin.read` permission.
             Kind::PluginsList | Kind::PluginsDetail(_) => AuthResource::plugins(),
             Kind::Events => AuthResource::events(),
             Kind::Logs | Kind::Status | Kind::Config => AuthResource::Host,
@@ -775,14 +774,14 @@ async fn read_inner(
         Route::Terminal { family, outcome } => return (family, outcome),
     };
 
-    // A blob instance segment that doesn't decode: the collection
-    // grant decides first, then the URI is malformed (not a camera
-    // grant the caller lacks).
-    if let Kind::Blob(instance, name) = &kind
+    // A blob instance segment that doesn't decode: the pre-check
+    // decides first (any `blob.read` grant, narrowed to `camera` or
+    // not), then the URI is malformed.
+    if let Kind::Blob(instance, _) = &kind
         && let Err(err) = percent_decode_segment(instance)
     {
-        let collection = AuthResource::blob((*instance).to_owned(), *name, false);
-        if let Err(required) = authorize(ctx, action, &collection).into_result() {
+        let pre_check = AuthResource::pre_check(crate::auth::ResourceKind::Blob);
+        if let Err(required) = authorize(ctx, action, &pre_check).into_result() {
             return (family, ReadOutcome::Denied { required });
         }
         return (

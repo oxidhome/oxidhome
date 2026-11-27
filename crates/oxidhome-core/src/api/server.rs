@@ -177,7 +177,7 @@ pub fn build_router(engine: Engine) -> Router {
     // ticket in `?tk=…` (verified inside each handler).
     // Physical separation from `authenticated` means an
     // accidental route add on this router can't inherit
-    // bearer-gated scopes, and ticket verification is the
+    // bearer-gated permissions, and ticket verification is the
     // only auth check that can grant access to plugin UI
     // content. `POST /ui-session` above (bearer-gated)
     // is the only path that mints these tickets.
@@ -191,9 +191,7 @@ pub fn build_router(engine: Engine) -> Router {
     // Phase 14.1 — mount the MCP streamable-HTTP endpoint on the
     // same listener as REST/Connect. `rmcp`'s
     // `StreamableHttpService` is a `tower::Service` nested at
-    // [`super::mcp::MCP_ENDPOINT`]; auth (14.4) will wrap the
-    // nested router in our bearer layer once the token-scope
-    // policy shape is stable.
+    // [`super::mcp::MCP_ENDPOINT`] behind our bearer layer.
     let mcp = super::mcp::mount_routes(&engine);
 
     public
@@ -471,8 +469,7 @@ async fn list_devices(
     State(state): State<ApiState>,
 ) -> Result<Json<DevicesBody>, Forbidden> {
     // Pre-check, then one decision per device: a role narrowed to
-    // device categories (H6 slice 3) lists only its devices, and a
-    // deny list hides the devices it names.
+    // device categories or ids lists only its devices.
     require(
         &ctx,
         Action::DeviceList,
@@ -1367,7 +1364,7 @@ struct AllDevicesStateSnapshot {
     truncated: bool,
 }
 
-/// Handler-local error type covering scope denial, malformed
+/// Handler-local error type covering permission denial, malformed
 /// cursor, and epoch drift. See [`get_all_device_state`].
 enum AllDevicesStateError {
     Scope(Forbidden),
@@ -3107,7 +3104,7 @@ fn js_string_escape(input: &str) -> String {
 /// **Ordering note.** Axum runs extractors in declaration order; a
 /// non-WS request rejects at `WebSocketUpgrade` with **426
 /// Upgrade Required** (no `OnUpgrade` in request extensions)
-/// *before* the scope check runs. That's a deliberate
+/// *before* the permission check runs. That's a deliberate
 /// information-leak property: a probing caller without
 /// `event.subscribe` and without a proper WS handshake gets the same
 /// 426 a wrong-method probe would, so they can't distinguish
@@ -3118,7 +3115,7 @@ fn js_string_escape(input: &str) -> String {
 /// **Audit consequence.** A non-WS probe (426) never reaches the
 /// handler body, so `emit_audit` doesn't run — non-WS requests to
 /// this path leave no audit row. Real WS handshakes (success or
-/// scope-deny) are audited normally. This is the same shape as
+/// permission-deny) are audited normally. This is the same shape as
 /// the `WWW-Authenticate: Bearer` 401 from `require_token`: failed
 /// extractor → no audit because there's no authenticated request
 /// to record. Documenting so a future audit-completeness audit

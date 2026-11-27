@@ -54,7 +54,7 @@ fn base_request(method: &str, bearer: &str) -> axum::http::request::Builder {
 }
 
 /// Mints a wildcard-scope test bearer — satisfies every
-/// per-resource scope check (round-2 F1). Tests that need
+/// per-resource permission check (round-2 F1). Tests that need
 /// to exercise scope-denial paths call
 /// [`mint_bearer_with_actions`] instead.
 fn mint_bearer(engine: &Engine) -> String {
@@ -643,10 +643,10 @@ async fn missing_bearer_is_401() {
     );
 }
 
-/// Round-2 F1 on PR #120 regression: a valid token with an
-/// empty scope list MUST NOT be able to read the devices or
-/// plugins resources. Pre-fix, the handler only checked
-/// authentication (any valid bearer) and ignored scopes.
+/// Round-2 F1 on PR #120 regression: a valid token with no
+/// role MUST NOT be able to read the devices or plugins
+/// resources. Pre-fix, the handler only checked authentication
+/// (any valid bearer) and ignored permissions.
 #[tokio::test(flavor = "current_thread")]
 async fn empty_scope_bearer_is_denied_on_resource_read() {
     let engine = Engine::new().expect("engine");
@@ -666,7 +666,7 @@ async fn empty_scope_bearer_is_denied_on_resource_read() {
     let error = &response["error"];
     assert_eq!(
         error["code"], -32001,
-        "empty-scope bearer must be refused with the scope-denied code",
+        "empty-scope bearer must be refused with the permission-denied code",
     );
 }
 
@@ -702,12 +702,12 @@ async fn unrelated_scope_bearer_is_denied_on_resource_read() {
             .as_str()
             .expect("error message")
             .contains("plugin.read"),
-        "scope-denied message must not name the required scope; got {}",
+        "permission-denied message must not name the required scope; got {}",
         error["message"],
     );
 }
 
-/// Round-2 F1 companion: the scope-deny audit row records
+/// Round-2 F1 companion: the permission-deny audit row records
 /// `decision = deny`, `status = 403`, AND the required scope
 /// (so a forensic sweep can distinguish "logs-only token
 /// probed devices resource" from other 403 paths).
@@ -737,7 +737,7 @@ async fn scope_denied_row_records_required_scope() {
     let denied = rows
         .iter()
         .find(|r| r.path == "mcp.resource.devices" && r.decision == "deny")
-        .expect("scope-denied audit row on devices read");
+        .expect("permission-denied audit row on devices read");
     assert_eq!(denied.status, 403);
     assert_eq!(
         denied.required_scope.as_deref(),
@@ -796,7 +796,7 @@ async fn per_resource_scopes_enforce_boundaries() {
 #[tokio::test(flavor = "current_thread")]
 async fn device_detail_uses_devices_list_scope_not_devices_read() {
     // Bearer with ONLY `device.list` must reach the detail
-    // URI (unknown device id => 404, but scope check must
+    // URI (unknown device id => 404, but permission check must
     // succeed first). If the detail were still gated on
     // `device.read`, this would return `-32001` instead.
     let engine = Engine::new().expect("engine");
@@ -815,7 +815,7 @@ async fn device_detail_uses_devices_list_scope_not_devices_read() {
     assert_eq!(
         response["error"]["code"], -32002,
         "device.list bearer must reach device-detail dispatch (unknown id → -32002 \
-         resource-not-found), NOT the scope-denied -32001; got {response}",
+         resource-not-found), NOT the permission-denied -32001; got {response}",
     );
 
     // Companion: a bearer with only `device.read` must be
@@ -1289,7 +1289,7 @@ async fn a_malformed_blob_instance_is_invalid_params() {
 
 /// A blobs URI for an instance that isn't running returns
 /// resource-not-found with a message naming the instance id.
-/// The scope check has already succeeded here (the token
+/// The permission check has already succeeded here (the token
 /// carries `blob.read`), so this is the not-found path — not
 /// the deny path.
 #[tokio::test(flavor = "current_thread")]
@@ -1321,7 +1321,7 @@ async fn blobs_uri_for_unknown_instance_returns_not_found() {
 }
 
 /// A token without `blob.read` cannot reach the blobs
-/// resource, even for an unknown instance — the scope check
+/// resource, even for an unknown instance — the permission check
 /// runs before the not-found dispatch so a probing caller
 /// can't enumerate live instances by the difference between
 /// `-32001` and `-32002`.

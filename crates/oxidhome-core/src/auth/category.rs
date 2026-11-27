@@ -292,7 +292,8 @@ pub struct DeviceClass {
     category: DeviceCategory,
     sensitive: SensitiveSet,
     /// `false` for a device that isn't registered right now: its
-    /// display category is unknown (a category deny then matches it).
+    /// display category is unknown (a display-category grant doesn't
+    /// match it; its sensitive floor still does).
     registered: bool,
 }
 

@@ -173,7 +173,7 @@ async fn valid_token_grants_access_and_bumps_last_used() {
 // ── Scope-policy enforcement (Phase 12-API-b) ─────────────────────
 
 /// A token without `instance.read` (but holding *some* other scope)
-/// gets through auth but is **403** at the scope check. Pre-fix the
+/// gets through auth but is **403** at the permission check. Pre-fix the
 /// route would have returned 200 — this is the new behavior.
 #[tokio::test(flavor = "current_thread")]
 async fn instances_list_returns_403_without_scope() {
@@ -300,7 +300,7 @@ async fn audit_log_records_one_event_per_authenticated_request() {
             "allow" => {
                 assert_eq!(row.status, 200);
                 // Allow rows carry no required_scope — the field
-                // is only populated on scope-deny 403s.
+                // is only populated on permission-deny 403s.
                 assert!(row.required_scope.is_none());
             }
             "deny" => {
@@ -895,11 +895,10 @@ fn audit_ledger_row_is_finalized_end_to_end() {
     );
 }
 
-/// The wildcard `["*"]` admin / bootstrap token satisfies every
-/// scoped route. Pins the wildcard contract (see
-/// `api::scopes::WILDCARD`) end-to-end through the HTTP path.
+/// A token whose role grants `*` satisfies every route that
+/// isn't owner-only, end-to-end through the HTTP path.
 #[tokio::test(flavor = "current_thread")]
-async fn wildcard_token_satisfies_every_scoped_route() {
+async fn star_role_satisfies_every_non_owner_route() {
     let engine = Engine::new().expect("engine");
     let admin = engine.auth_tokens().mint("admin", &["*"]).unwrap();
     let router = build_router(engine);
@@ -919,7 +918,7 @@ async fn wildcard_token_satisfies_every_scoped_route() {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "wildcard token must satisfy {path}, got {:?}",
+            "a `*` role must satisfy {path}, got {:?}",
             response.status(),
         );
     }
@@ -942,7 +941,7 @@ async fn wildcard_token_satisfies_every_scoped_route() {
 // `devices_list_enforces_scope`.
 
 /// A non-WS probe hits axum's `WebSocketUpgrade` rejection at the
-/// extractor *before* the scope check runs in the handler body.
+/// extractor *before* the permission check runs in the handler body.
 /// That's intentional: a caller without a real handshake gets the
 /// same "wrong shape" response regardless of scope, so the probing
 /// signal "scope missing vs scope OK" only leaks through a real
@@ -1427,7 +1426,7 @@ async fn instances_list_includes_plugin_id() {
 /// through the in-process bus, and assert the JSON frame the
 /// client reads back is the same shape `WireEvent` ships on the
 /// `oneshot` path. Validates the bind/serve split, the WS handler's
-/// scope gate, the supervisor-less bus → WS dispatch, and the JSON
+/// permission gate, the supervisor-less bus → WS dispatch, and the JSON
 /// payload all at once.
 #[tokio::test(flavor = "multi_thread")]
 async fn events_tail_ws_round_trip_with_real_listener() {
@@ -1441,7 +1440,7 @@ async fn events_tail_ws_round_trip_with_real_listener() {
     use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
     let engine = Engine::new().expect("engine");
-    // `event.subscribe` only — the scope gate inside the handler
+    // `event.subscribe` only — the permission gate inside the handler
     // upgrades only if it passes.
     let token = engine
         .auth_tokens()
@@ -2281,7 +2280,7 @@ async fn connect_authenticated_call_emits_audit_row_in_same_shape_as_json() {
         "unexpected status={}, decision={}",
         row.status, row.decision,
     );
-    // Not a scope denial — required_scope stays None.
+    // Not a permission denial — required_scope stays None.
     assert!(row.required_scope.is_none());
     // Method + path landed verbatim; the audit-target derivation
     // that used to happen for the tracing mirror is gone.
@@ -2568,7 +2567,7 @@ async fn connect_logs_query_scope_deny_returns_permission_denied() {
     assert_connect_scope_denied("/oxidhome.v1.LogsService/QueryLogs", &["instance.read"]).await;
 }
 
-/// Shared harness for the four scope-deny tests: mint a token with
+/// Shared harness for the four permission-deny tests: mint a token with
 /// a scope that *isn't* the one the target RPC requires, POST an
 /// empty message body, assert 403 + Connect-JSON `permission_denied`.
 async fn assert_connect_scope_denied(uri: &str, actions: &[&str]) {
@@ -2593,7 +2592,7 @@ async fn assert_connect_scope_denied(uri: &str, actions: &[&str]) {
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "scope-deny on {uri} should be 403 (Connect PermissionDenied)",
+        "permission-deny on {uri} should be 403 (Connect PermissionDenied)",
     );
     let body = body_to_json(response.into_body()).await;
     assert_eq!(
@@ -2641,7 +2640,7 @@ async fn connect_logs_query_rejects_unknown_min_level_as_invalid_argument() {
     );
 }
 
-/// The Connect audit row on a scope denial carries the missing
+/// The Connect audit row on a permission denial carries the missing
 /// scope name in `required_scope` — the JSON side has done this
 /// since 12-API-b via a `DeniedScope` response-extension smuggle,
 /// and the Connect side matches it via a request-extension slot
@@ -2654,7 +2653,7 @@ async fn connect_scope_deny_audit_row_carries_required_scope() {
 
     let engine = Engine::new().expect("engine");
     // Token has `host.logs` but the RPC we hit requires
-    // `device.list` — a clean scope-deny with a known missing
+    // `device.list` — a clean permission-deny with a known missing
     // scope name.
     let issued = engine.auth_tokens().mint("scoped", &["host.logs"]).unwrap();
     let audit_log = engine.audit_log();
@@ -2682,7 +2681,7 @@ async fn connect_scope_deny_audit_row_carries_required_scope() {
     assert_eq!(
         rows.len(),
         1,
-        "expected one audit row from the scope-denied Connect call, got {rows:?}",
+        "expected one audit row from the permission-denied Connect call, got {rows:?}",
     );
     let row = &rows[0];
     assert_eq!(row.status, 403);
@@ -2694,7 +2693,7 @@ async fn connect_scope_deny_audit_row_carries_required_scope() {
     );
 }
 
-/// Same scope-denied Connect call as
+/// Same permission-denied Connect call as
 /// `connect_scope_deny_audit_row_carries_required_scope`, but on
 /// the **gRPC-Web** transport. The Connect spec renders RPC errors
 /// for gRPC / gRPC-Web as HTTP 200 with the status in body/trailers;
@@ -2715,7 +2714,7 @@ async fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     let router = build_router(engine.clone());
     // A well-formed gRPC-Web frame is required for the dispatcher
     // to reach the handler — otherwise the dispatcher rejects on
-    // framing before scope check runs and we never populate
+    // framing before permission check runs and we never populate
     // `DeniedScopeSlot`. ListDevicesRequest is an empty proto3
     // message (zero-byte payload); framing is 1 byte flags (0 =
     // uncompressed data frame) + 4 bytes big-endian length (0) +
@@ -2747,13 +2746,13 @@ async fn connect_scope_deny_on_grpc_web_transport_still_audits_as_deny() {
     let row = &rows[0];
     assert_eq!(
         row.decision, "deny",
-        "gRPC-Web scope denial must audit as deny, got {row:?}",
+        "gRPC-Web permission denial must audit as deny, got {row:?}",
     );
     assert_eq!(row.required_scope.as_deref(), Some("device.list"));
 }
 
 /// **Non-scope** handler-returned Connect error on gRPC-Web still
-/// audits as `deny`, not `allow`. Sibling of the scope-deny test
+/// audits as `deny`, not `allow`. Sibling of the permission-deny test
 /// above — verifies the outcome slot fix (PR #74 review) covers
 /// every `rpc_err(&ctx, ...)` path, not just the scope one.
 ///
@@ -2818,7 +2817,7 @@ async fn connect_non_scope_error_on_grpc_web_transport_still_audits_as_deny() {
         row.decision, "deny",
         "gRPC-Web non-scope handler error must audit as deny, got {row:?}",
     );
-    // Not a scope denial → required_scope stays None.
+    // Not a permission denial → required_scope stays None.
     assert!(row.required_scope.is_none());
 }
 
@@ -2904,7 +2903,7 @@ async fn connect_devices_execute_command_unknown_device_audits_as_deny() {
     let row = &rows[0];
     assert_eq!(row.status, 404);
     assert_eq!(row.decision, "deny");
-    // NotFound isn't a scope denial — required_scope stays None.
+    // NotFound isn't a permission denial — required_scope stays None.
     assert!(row.required_scope.is_none());
 }
 
@@ -3471,7 +3470,7 @@ fn connect_stream_request_envelope(payload: &[u8]) -> Vec<u8> {
 /// (Connect unary Content-Type), which the dispatcher rejects on
 /// streaming methods with `unimplemented` — different code path.
 /// This test sends `application/connect+json` (Connect streaming
-/// Content-Type) so it reaches the handler; the scope check runs
+/// Content-Type) so it reaches the handler; the permission check runs
 /// before the stream is established and comes back as HTTP 200
 /// with a gRPC-style trailer carrying `permission_denied`
 /// (streaming errors ride in trailers, not on the HTTP status).
@@ -5240,7 +5239,7 @@ async fn plugin_ui_frame_rejects_missing_malformed_and_oversized_ticket() {
 /// C6 round-2 finding 1: `POST /ui-session` requires the
 /// `plugin.ui` permission; a token with only `plugin.read`
 /// gets 403. `/ui` itself is public (ticket-gated), so a
-/// scope check there would be a category error.
+/// permission check there would be a category error.
 #[tokio::test(flavor = "multi_thread")]
 async fn plugin_ui_session_requires_plugins_ui_scope() {
     let state_dir = support::tempdir("ui-scope");
@@ -6401,7 +6400,7 @@ async fn connect_device_state_rpcs_mirror_rest() {
 /// Every REST and Connect route now asks `auth::authorize`; a deny
 /// still lands as a `403` / `permission_denied` whose audit row names
 /// the missing scope in `required_scope`, exactly as the per-route
-/// scope checks recorded it. A token holding only `event.subscribe`
+/// permission checks recorded it. A token holding only `event.subscribe`
 /// exercises one route per action; the tail's replay branch is covered
 /// in `events_resume.rs`.
 #[tokio::test(flavor = "current_thread")]

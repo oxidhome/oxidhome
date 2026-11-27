@@ -243,7 +243,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              recursively copies `source_dir` into `<state_dir>/plugins/<plugin_id>/`. \
              Does NOT start the plugin — the operator follows up with \
              `plugins.start`. SENSITIVE + DESTRUCTIVE: gated on `plugin.install` — a \
-             token holding this scope can effectively load arbitrary `.wasm` onto the \
+             token holding this permission can effectively load arbitrary `.wasm` onto the \
              host. `source_dir` MUST already exist on the daemon-local filesystem; \
              the MCP endpoint is loopback-only, so this mirrors REST's trust model \
              for the same operation.",
@@ -348,7 +348,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
              with the same `after_id`. Omitting `after_id` starts at the oldest \
              retained matching row; to tail only new events, seed the cursor with \
              the newest `id` from `events.history` (`limit: 1`). Same `event.read` \
-             scope as `events.history`.",
+             permission as `events.history`.",
             Arc::new(events_subscribe_schema()),
         )
         .with_title("Long-poll for new events")
@@ -363,7 +363,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "tokens.list",
-            "List every API token with its roles, scopes, sensitive grants and deny list. \
+            "List every API token with its owner flag and roles. \
              Never returns a secret. The owner token only (`token.manage`). Same shape as \
              `GET /api/v1/tokens`.",
             Arc::new(plugins_list_schema()),
@@ -381,8 +381,7 @@ pub(super) fn list_tools() -> Vec<Tool> {
 /// Hand-authored JSON Schema for [`device_send_command_args`].
 /// We're not pulling in `schemars` just for one tool's input
 /// shape — the schema is small enough to keep in sync by
-/// eye, and 14.4 (tool policy) will need a hand-authored
-/// per-tool policy blob anyway.
+/// eye.
 fn device_send_command_schema() -> serde_json::Map<String, JsonValue> {
     let schema = json!({
         "type": "object",
@@ -950,7 +949,7 @@ fn audit_meta_value(intent_id: u64, family: &str) -> JsonValue {
 }
 
 /// Single-shot audit path for outcomes decided BEFORE any
-/// dispatch — unknown-tool, scope-denied. Uses
+/// dispatch — unknown-tool, permission-denied. Uses
 /// `record_completed` (`intent_ms == finalized_ms`) since
 /// there's no physical actuation to protect against.
 async fn finalize_synchronous(
@@ -1014,7 +1013,7 @@ impl FinalizeInput {
         // - `None` — execution never reached the plugin
         //   (unknown-device fell out inside the tool body
         //   before `execute_command`; unknown-tool / bad
-        //   args / scope-denied never even enter here).
+        //   args / permission-denied never even enter here).
         //
         // Round-1 F3 shipped `"ok"` and stamped `"failed"`
         // on the unknown-device path too — both wrong per
@@ -1140,7 +1139,7 @@ enum ToolOutcome {
     /// Tool name isn't in the catalogue. Maps to `-32601`
     /// method-not-found.
     UnknownTool(String),
-    /// Scope check failed. Maps to [`SCOPE_DENIED_CODE`].
+    /// Permission check failed. Maps to [`SCOPE_DENIED_CODE`].
     Denied { required: &'static str },
     /// Server-side failure. Maps to `-32603`.
     Internal(String),
@@ -1212,7 +1211,7 @@ impl ToolOutcome {
                 SCOPE_DENIED_CODE,
                 // Deliberately omits the scope name; see the
                 // resource-side `SCOPE_DENIED_CODE` doc.
-                "scope denied for MCP tool",
+                "permission denied for MCP tool",
                 None,
             )),
             Self::Internal(reason) => Err(McpError::internal_error(reason, None)),
@@ -2378,10 +2377,7 @@ fn plugins_show_call(
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
-    // detail lookup so the not-installed / not-installed
-    // paths can't be used to probe an id the operator's
-    // policy hides.
+    // Authorize the target BEFORE the detail lookup.
     if let Err(denied) = authorize_target(
         invocation,
         Action::PluginRead,
@@ -2509,9 +2505,8 @@ async fn plugins_stop_call(
         );
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE
-    // touching the instance registry so a disallowed id
-    // can't infer running-state through timing / semantics.
+    // Authorize the target BEFORE touching the instance
+    // registry, so a refused caller learns nothing about it.
     if let Err(denied) = authorize_target(
         invocation,
         Action::InstanceStop,
@@ -2778,9 +2773,8 @@ async fn plugins_uninstall_call(
         return ToolOutcome::InvalidParams("`plugin_id` must not be empty".into());
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE
-    // acquiring the lifecycle lock so a disallowed id can't
-    // starve a concurrent lookup for the same key.
+    // Authorize the target BEFORE acquiring the lifecycle
+    // lock, so a refused caller can't hold it.
     if let Err(denied) = authorize_target(
         invocation,
         Action::PluginUninstall,
@@ -3016,10 +3010,9 @@ async fn plugins_start_call(
         );
     }
 
-    // Phase 14.4c: enforce `plugins` allowlist BEFORE the
-    // manifest scan / supervisor spawn — a disallowed id
-    // shouldn't observably touch the FS or the process
-    // table.
+    // Authorize the target BEFORE the manifest scan /
+    // supervisor spawn: a refused caller shouldn't touch the
+    // FS or the process table.
     if let Err(denied) = authorize_target(
         invocation,
         Action::InstanceStart,
@@ -3359,7 +3352,7 @@ fn new_pending_audit_entry(token_id: &str, family: &str) -> AuditEntry {
 
 /// [`AuditEntry`] for [`AuditLog::record_completed`] — used
 /// on outcomes decided BEFORE any dispatch (unknown tool,
-/// scope-denied). Populates status + decision from the
+/// permission-denied). Populates status + decision from the
 /// outcome; `execution_outcome` / `domain_error` stay `None`
 /// because no tool body ran.
 fn new_completed_audit_entry(token_id: &str, family: &str, outcome: &ToolOutcome) -> AuditEntry {

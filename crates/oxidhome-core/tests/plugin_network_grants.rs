@@ -155,7 +155,7 @@ async fn api_status(
     )
 }
 
-/// The owner token (`policy.manage`) and a non-owner wildcard token.
+/// The owner token (`policy.manage`) and a non-owner `*` token.
 fn owner_and_wildcard(engine: &Engine) -> (String, String) {
     let issued = oxidhome_core::state::TokenStore::generate();
     assert!(

@@ -14,9 +14,10 @@
 //! `policy.manage`). A grant without selectors covers every resource
 //! that isn't sensitive. With a `category` and / or `devices` selector
 //! it names only [`NARROWABLE`] actions (a narrowed `*` means those)
-//! and covers a device whose display category or sensitive set is
-//! listed (only while the device is registered: an offline device's
-//! category is unknown) and whose id matches a pattern (`dev-…`,
+//! and covers a device whose display category (only while the device
+//! is registered: an offline device's display category is unknown) or
+//! sensitive set (the host's durable floor) is listed, and whose id
+//! matches a pattern (`dev-…`,
 //! literal or `prefix*`). A `category` grant also covers a camera
 //! instance's blob when it lists `camera`. A narrowed grant covers the
 //! pre-check on devices and blobs ([`crate::auth::Resource::PreCheck`]),
@@ -130,6 +131,9 @@ impl FromStr for Action {
 pub const GRANTABLE: ActionSet =
     ActionSet::ALL.without(ActionSet::of(&[Action::TokenManage, Action::PolicyManage]));
 
+/// Most device patterns one grant lists.
+pub const MAX_GRANT_DEVICES: usize = 64;
+
 /// The actions a grant narrowed to categories or devices may name.
 pub const NARROWABLE: ActionSet = ActionSet::of(&[
     Action::DeviceList,
@@ -167,13 +171,15 @@ impl RoleGrant {
         match resource {
             Resource::Device(d) => {
                 let class = d.class();
+                // The display category is known only while the device
+                // is registered; its sensitive set is the host's durable
+                // floor, known offline too.
                 names_all
                     && self.categories.as_ref().is_none_or(|c| {
-                        class.is_registered()
-                            && c.iter().any(|c| {
-                                *c == class.category()
-                                    || c.sensitive().is_some_and(|s| class.sensitive().contains(s))
-                            })
+                        c.iter().any(|c| {
+                            (class.is_registered() && *c == class.category())
+                                || c.sensitive().is_some_and(|s| class.sensitive().contains(s))
+                        })
                     })
                     && self
                         .devices
@@ -303,16 +309,30 @@ impl GrantWire {
             if d.is_empty() {
                 return Err("`devices` is empty".into());
             }
+            if d.len() > MAX_GRANT_DEVICES {
+                return Err(format!(
+                    "`devices` lists at most {MAX_GRANT_DEVICES} patterns"
+                ));
+            }
             if let Some(bad) = d.iter().find(|p| !crate::state::is_device_pattern(p)) {
                 return Err(format!(
                     "`{bad}` is not a device id or a `dev-…*` prefix pattern"
                 ));
             }
         }
+        let devices = self.devices.map(|d| {
+            let mut out: Vec<String> = Vec::with_capacity(d.len());
+            for p in d {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+            out
+        });
         Ok(RoleGrant {
             actions,
             categories,
-            devices: self.devices,
+            devices,
         })
     }
 }
@@ -501,6 +521,10 @@ mod tests {
         ] {
             assert!(grant(bad.clone()).is_err(), "{bad}");
         }
+        let devices =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("dev-{i:016x}")).collect() };
+        assert!(grant(serde_json::json!({"actions": ["device.read"], "devices": devices(MAX_GRANT_DEVICES)})).is_ok());
+        assert!(grant(serde_json::json!({"actions": ["device.read"], "devices": devices(MAX_GRANT_DEVICES + 1)})).is_err());
         assert!(
             serde_json::from_value::<GrantWire>(serde_json::json!({"actions": ["*"], "deny": []}))
                 .is_err()
@@ -558,6 +582,36 @@ mod tests {
         assert!(!cat.permits(
             Action::DeviceRead,
             &Resource::device("dev-a1", DeviceClass::unregistered()),
+            none
+        ));
+        // An offline device's sensitive floor is still known: a grant
+        // naming it reaches it, a display-category grant still doesn't.
+        let offline_lock = DeviceClass::unregistered()
+            .with_sensitive([SensitiveCategory::Lock].into_iter().collect());
+        assert!(!offline_lock.is_registered());
+        let locks = [SensitiveCategory::Lock].into_iter().collect();
+        let lock = grant(serde_json::json!({"actions": ["device.command"], "category": ["lock"]}))
+            .unwrap();
+        assert!(lock.permits(
+            Action::DeviceCommand,
+            &Resource::device("dev-a1", offline_lock),
+            locks
+        ));
+        assert!(builtin("member").unwrap().permits(
+            Action::DeviceCommand,
+            &Resource::device("dev-a1", offline_lock),
+            locks
+        ));
+        let offline_cam = DeviceClass::unregistered().with_camera_bytes();
+        let cams = [SensitiveCategory::Camera].into_iter().collect();
+        assert!(builtin("admin").unwrap().permits(
+            Action::BlobRead,
+            &Resource::device("dev-a1", offline_cam),
+            cams
+        ));
+        assert!(!cat.permits(
+            Action::DeviceRead,
+            &Resource::device("dev-a1", offline_lock),
             none
         ));
     }

@@ -89,12 +89,11 @@
 //! so a refused call spends no refcount and cannot influence
 //! `remove-service` timing.
 //!
-//! **Root authority (H6 slice 4)**: the grant gate is one half of the
-//! hop decision. [`crate::auth::authorize_hop`] combines it with the
+//! **Root authority**: the grant gate is one half of the hop
+//! decision. [`crate::auth::authorize_hop`] combines it with the
 //! root's own authority: when the invocation is rooted at an external
-//! principal, the root must hold `service.call` on the target (the
-//! `service.call` permission, or a role grant whose `services` selector
-//! covers it) and none of its denies may match. A narrow token can't
+//! principal, the root must hold `service.call` (a role granting it,
+//! or the owner). A narrow token can't
 //! have a script call services on its behalf that the token itself
 //! wasn't given. Host-rooted work is decided by the grant alone.
 //!
@@ -394,8 +393,8 @@ pub(crate) async fn call_service(
         &target_local_id,
         &command,
     );
-    // H6 slice 4: the hop decision — the plugin's grant above, plus
-    // the root's own permit and denies when the root is external.
+    // The hop decision: the plugin's grant above, plus the root's
+    // own `service.call` permit when the root is external.
     let decision = authorize_hop(
         &callee_ctx,
         Action::ServiceCall,
@@ -428,8 +427,8 @@ pub(crate) async fn call_service(
         return Err(WitError::PermissionDenied(format!(
             "caller `{caller_instance}` refused: invocation `{}` was not granted \
              `service.call` on target `{target_plugin_id}` service `{target_local_id}` \
-             command `{}` by its root principal (a token needs `service.call` or a \
-             role grant naming the service for every hop it causes)",
+             command `{}` by its root principal (its token needs a role granting \
+             `service.call` for every hop it causes)",
             callee_ctx.call_id(),
             audit_cap(&command),
         )));

@@ -384,7 +384,7 @@ async fn get_prompt_draft_automation_rejects_missing_args_and_scope() {
 /// 14.6: `draft_automation` under a token WITHOUT
 /// `device.list` (but with valid arguments) lands as
 /// `-32001` — argument shape is validated first, but the
-/// scope check is still enforced. Round-2 P1 on PR #135
+/// permission check is still enforced. Round-2 P1 on PR #135
 /// simplified requirements to `device.list` alone (see
 /// [`get_prompt_draft_automation_uses_only_devices_list_scope`]);
 /// this test locks in the deny path.
@@ -415,7 +415,7 @@ async fn get_prompt_draft_automation_requires_devices_list_scope() {
     );
 }
 
-/// 14.6: `draft_automation` with wildcard scope + valid
+/// 14.6: `draft_automation` with a `*` role + valid
 /// arguments returns rendered messages. The interpolated
 /// `trigger` and `action` MUST appear verbatim in the user
 /// message, and the result carries a description.

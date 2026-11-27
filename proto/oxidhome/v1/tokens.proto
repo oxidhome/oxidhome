@@ -56,12 +56,17 @@ message Grant {
   // Action names (`device.command`) or `*` for every action a role can
   // grant. Required.
   repeated string actions = 1;
-  // Device categories the grant is narrowed to; empty for every
-  // resource.
-  repeated string category = 2;
-  // Device ids or `prefix*` patterns the grant is narrowed to; empty
-  // for every device.
-  repeated string devices = 3;
+  // Device categories the grant is narrowed to; unset for every
+  // resource. Set but empty is refused, as on the JSON API.
+  Names category = 2;
+  // Device ids or `prefix*` patterns the grant is narrowed to; unset
+  // for every device. Set but empty is refused.
+  Names devices = 3;
+}
+
+// A list whose presence is meaningful: unset is not the same as empty.
+message Names {
+  repeated string names = 1;
 }
 
 message CreateTokenResponse {
