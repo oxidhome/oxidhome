@@ -8,11 +8,14 @@
 //!
 //! - **What is watched:** every TCP input stream (the one
 //!   `finish-connect` handed the guest), every `wasi:http` response body
-//!   stream (the one `incoming-body.stream` handed it) and every UDP
-//!   `incoming-datagram-stream` in the instance's resource table, and
-//!   every `host-network` discovery socket. Other streams (stdin) are
-//!   not. A body stream is readable when data, its end or its error
-//!   (a between-bytes timeout too) is there to read.
+//!   stream (the one `incoming-body.stream` handed it), every
+//!   `wasi:http` `future-incoming-response` whose response the guest
+//!   hasn't taken yet, and every UDP `incoming-datagram-stream` in the
+//!   instance's resource table, and every `host-network` discovery
+//!   socket. Other streams (stdin) are not. A body stream is readable
+//!   when data, its end or its error (a between-bytes timeout too) is
+//!   there to read; a pending response when its head or its error is
+//!   (until the guest takes it with `get`).
 //! - **Who gets it:** `streaming-plugin` / `streaming-ai-plugin`
 //!   instances whose manifest sets `runtime.tick_interval_ms`. A plugin
 //!   without a tick cadence is never ticked, early or not; the other
@@ -45,6 +48,7 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::bindings::sockets::udp::IncomingDatagramStream;
 use wasmtime_wasi::p2::{DynFuture, DynInputStream, Pollable as _, TcpSocket};
 use wasmtime_wasi_http::p2::body::HostIncomingBody;
+use wasmtime_wasi_http::p2::types::HostFutureIncomingResponse;
 
 use super::network::DiscoverySocket;
 
@@ -94,6 +98,12 @@ pub(crate) fn readable(table: &mut ResourceTable) -> Readable<'_> {
             } else if entry.is::<DiscoverySocket>() {
                 let socket = entry.downcast_mut::<DiscoverySocket>()?;
                 Some(socket.ready())
+            } else if entry.is::<HostFutureIncomingResponse>() {
+                let response = entry.downcast_mut::<HostFutureIncomingResponse>()?;
+                // Taken by `get`: nothing more to wait for (its `ready`
+                // would complete at once, waking the plugin forever).
+                (!matches!(response, HostFutureIncomingResponse::Consumed))
+                    .then(|| response.ready())
             } else if inputs.contains(&entry_addr(entry)) {
                 let stream = entry.downcast_mut::<DynInputStream>()?;
                 Some(stream.ready())
@@ -181,6 +191,15 @@ mod tests {
         // A readable input stream that isn't a TCP socket's.
         let stdin: DynInputStream = Box::new(ClosedInputStream);
         table.push(stdin).unwrap();
+        let mut ready = readable(&mut table);
+        assert!(ready.is_empty());
+        assert!(poll_once(&mut ready).is_pending());
+    }
+
+    #[test]
+    fn a_taken_response_is_not_watched() {
+        let mut table = ResourceTable::new();
+        table.push(HostFutureIncomingResponse::Consumed).unwrap();
         let mut ready = readable(&mut table);
         assert!(ready.is_empty());
         assert!(poll_once(&mut ready).is_pending());

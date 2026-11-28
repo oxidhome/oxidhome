@@ -411,12 +411,58 @@ async fn a_response_body_wakes_the_plugin_before_its_tick() {
     drop(next);
 }
 
-/// One total timeout covers every phase of an SDK request, even under a
-/// virtual clock (the guest's clock stands still, its timers don't):
-/// a head and a body that each come within the limit, but not both.
+/// A pending `wasi:http` response the plugin keeps (raw
+/// `future-incoming-response`) wakes it when the head arrives; once the
+/// plugin has taken it, nothing wakes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_total_timeout_spans_the_head_and_the_body() {
+async fn a_pending_response_wakes_the_plugin_before_its_tick() {
     let host = TestHost::with_virtual_clock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http peer");
+    let peer = listener.local_addr().expect("local addr");
+    let (answer_tx, answer_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        // The head only when the test says so.
+        let _ = answer_rx.recv();
+        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let _ = stream.flush();
+        // Open until the test is done.
+        let _ = answer_rx.recv();
+    });
+    let dir = probe(&format!("tcp://{peer}"), Some(HOUR_MS));
+    let instance = start(&host, &dir, &format!("hold-head http://{peer}/slow")).await;
+    let storage = instance.storage();
+    // Nothing to read yet: no tick.
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(int(&storage, "ticks"), 0);
+
+    // The head wakes it.
+    answer_tx.send(()).unwrap();
+    wait_for(&storage, "received", 1).await;
+    assert_eq!(string(&storage, "last"), "204");
+    assert_eq!(int(&storage, "ticks"), 1);
+    assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
+
+    // Taken (the plugin keeps the emptied future): no more wakeups.
+    wait_for_gate(&host).await;
+    host.advance(GAP * 5).await.unwrap();
+    tokio::time::sleep(QUIET).await;
+    host.advance(GAP * 5).await.unwrap();
+    assert_eq!(int(&storage, "ticks"), 1);
+    instance.stop().await.unwrap();
+    drop(answer_tx);
+}
+
+/// A peer on loopback that answers one request with its head after
+/// 700 ms and its 2-byte body 700 ms later.
+fn split_delay_peer() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow peer");
     let peer = listener.local_addr().expect("local addr");
     std::thread::spawn(move || {
@@ -434,11 +480,26 @@ async fn a_total_timeout_spans_the_head_and_the_body() {
         std::thread::sleep(Duration::from_millis(700));
         let _ = stream.write_all(b"ok");
     });
-    let dir = probe(&format!("tcp://{peer}"), None);
+    peer
+}
+
+/// One total timeout covers every phase of an SDK request, even under a
+/// virtual clock (the guest's clock stands still, its timers don't):
+/// a head and a body that each come within the limit, but not both;
+/// for `send` and for a streamed body read with `read_to_end`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_total_timeout_spans_the_head_and_the_body() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let sent = split_delay_peer();
+    let streamed = split_delay_peer();
+    // Both peers are on loopback.
+    let dir = probe("tcp://127.0.0.1:*", None);
     let mut overrides = toml::Table::new();
     overrides.insert(
         "ops".into(),
-        toml::Value::String(format!("get-total 1000 http://{peer}/")),
+        toml::Value::String(format!(
+            "get-total 1000 http://{sent}/; stream-total 1000 16 http://{streamed}/"
+        )),
     );
     let instance = host
         .start_with(
@@ -448,10 +509,12 @@ async fn a_total_timeout_spans_the_head_and_the_body() {
         .await
         .expect("start net-probe");
     instance.wait_for_running().await.expect("running");
-    let result = string(&instance.storage(), "op/0");
-    assert!(
-        result.starts_with("err:TotalTimeout") && result.ends_with("|sent:true"),
-        "{result}"
-    );
+    for key in ["op/0", "op/1"] {
+        let result = string(&instance.storage(), key);
+        assert!(
+            result.starts_with("err:TotalTimeout") && result.ends_with("|sent:true"),
+            "{key}: {result}"
+        );
+    }
     instance.stop().await.unwrap();
 }

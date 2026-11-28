@@ -40,6 +40,8 @@ unused_dependencies = "deny"
 oxidhome-core = { path = "crates/oxidhome-core" }
 oxidhome-manifest = { path = "crates/oxidhome-manifest" }
 oxidhome-proto = { path = "crates/oxidhome-proto" }
+# Only core's unit tests use it (they compare its copies of host limits).
+oxidhome-sdk = { path = "crates/oxidhome-sdk" }
 # No default features: `oxidhome-sdk` picks the one world a plugin is
 # built for (see its `plugin` / `streaming-plugin` features).
 oxidhome-wit = { path = "crates/oxidhome-wit", default-features = false }

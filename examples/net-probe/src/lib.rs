@@ -5,7 +5,8 @@
 //! `err:<detail>`), so a host test can assert what the network policy let
 //! through. See `manifest.toml` for the operation syntax.
 //!
-//! The `hold-*` operations keep their socket (or response body) open.
+//! The `hold-*` operations keep their socket (or response, or response
+//! body) open.
 //! Each `tick` counts itself (`ticks`) and drains them without blocking: the
 //! number of messages read so far goes to `received` and the last one to
 //! `last`, so a host test can see when, and how often, the host woke the
@@ -21,7 +22,8 @@ use oxidhome_sdk::streaming::discovery::{self, DiscoverySocket};
 use oxidhome_sdk::streaming::http::{BodyReader, Request};
 use oxidhome_sdk::streaming::wasi::http::outgoing_handler;
 use oxidhome_sdk::streaming::wasi::http::types::{
-    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
+    Fields, FutureIncomingResponse, IncomingBody, Method, OutgoingBody, OutgoingRequest,
+    RequestOptions, Scheme,
 };
 use oxidhome_sdk::streaming::wasi::io::streams::StreamError;
 use oxidhome_sdk::{Plugin, StreamingPlugin};
@@ -46,6 +48,9 @@ struct NetProbe {
     tcp: Vec<TcpStream>,
     discovery: Vec<DiscoverySocket>,
     bodies: Vec<BodyReader>,
+    heads: Vec<FutureIncomingResponse>,
+    /// Responses `hold-head` took, kept so the host sees them taken.
+    taken: Vec<FutureIncomingResponse>,
     ticks: i64,
     received: i64,
 }
@@ -83,6 +88,10 @@ impl Plugin for NetProbe {
                         "held".to_owned()
                     })
                     .map_err(|e| sdk_err(&e)),
+                Some(("hold-head", url)) => http_start(url).map(|pending| {
+                    self.heads.push(pending);
+                    "held".to_owned()
+                }),
                 _ => run(op),
             };
             let result = match result {
@@ -146,6 +155,22 @@ impl Plugin for NetProbe {
             }
             true
         });
+        // A response is taken once it's there, never waited for; its
+        // status counts as a message. The emptied future is kept: one
+        // already taken must not wake the plugin.
+        for pending in std::mem::take(&mut self.heads) {
+            match pending.get() {
+                None => self.heads.push(pending),
+                Some(response) => {
+                    last = Some(match response {
+                        Ok(Ok(response)) => response.status().to_string(),
+                        other => format!("{other:?}"),
+                    });
+                    self.received += 1;
+                    self.taken.push(pending);
+                }
+            }
+        }
         // `received` last: a test that sees it can read `last`.
         if let Some(last) = last {
             let _ = storage::set("last", &Value::StringVal(last));
@@ -297,7 +322,35 @@ fn run(op: &str) -> Result<String, String> {
                 .map(|r| format!("{}", r.status()))
                 .map_err(|e| sdk_err(&e))
         }
-        "stream" => stream(arg),
+        "stream" => stream(arg, None),
+        // `stream-slow <ms> <url>`: `stream` with that total timeout,
+        // which ends with the head.
+        "stream-slow" => {
+            let (ms, url) = arg.split_once(' ').ok_or("stream-slow <ms> <url>")?;
+            let ms: u64 = ms.parse().map_err(|_| "bad milliseconds")?;
+            stream(url, Some(Duration::from_millis(ms)))
+        }
+        // `stream-total <ms> <max> <url>`: GET with `send_streaming` and
+        // that total timeout, then `read_to_end(max)`.
+        "stream-total" => {
+            let mut parts = arg.splitn(3, ' ');
+            let (Some(ms), Some(max), Some(url)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err("stream-total <ms> <max> <url>".into());
+            };
+            let ms: u64 = ms.parse().map_err(|_| "bad milliseconds")?;
+            let max: usize = max.parse().map_err(|_| "bad length")?;
+            let mut response = Request::get(url)
+                .timeout(Duration::from_secs(5))
+                .total_timeout(Duration::from_millis(ms))
+                .send_streaming()
+                .map_err(|e| sdk_err(&e))?;
+            let body = response
+                .body()
+                .read_to_end(max)
+                .map_err(|e| sdk_err(&e))?;
+            Ok(format!("{}:{}", response.status(), String::from_utf8_lossy(&body)))
+        }
         "hdr" => header(arg),
         "hdrval" => header_value(arg),
         "httppoll" => http_get(arg, false)
@@ -403,14 +456,19 @@ fn sdk_err(err: &oxidhome_sdk::streaming::http::Error) -> String {
 }
 
 /// GET `url` with `send_streaming`, with headers the host would refuse
-/// (dropped by the client), and read the body to its end:
-/// `<status>:<body>`.
-fn stream(url: &str) -> Result<String, String> {
-    let mut response = Request::get(url)
+/// (dropped by the client), and the `total` timeout if any, and read the
+/// body to its end with `read_blocking`: `<status>:<body>`.
+fn stream(url: &str, total: Option<Duration>) -> Result<String, String> {
+    let request = Request::get(url)
         .header("Connection", "keep-alive")
         .header("Host", "elsewhere.example")
         .header("Transfer-Encoding", "chunked")
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5));
+    let request = match total {
+        Some(total) => request.total_timeout(total),
+        None => request,
+    };
+    let mut response = request
         .send_streaming()
         .map_err(|e| sdk_err(&e))?;
     let status = response.status();
@@ -459,10 +517,8 @@ fn http(url: &str) -> Result<String, String> {
     Err("too many redirects".into())
 }
 
-/// GET `url` once. With `block`, wait on the response's pollable;
-/// without, call `get` until it answers (as a plugin polling from `tick`
-/// would).
-fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), String> {
+/// Send a `GET` to `url` over raw `wasi:http`; the response is pending.
+fn http_start(url: &str) -> Result<FutureIncomingResponse, String> {
     let (scheme, rest) = url.split_once("://").ok_or("no scheme")?;
     // No `/` after the authority: leave the path unset (`none`).
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
@@ -491,7 +547,14 @@ fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), St
     options
         .set_connect_timeout(Some(10_000_000_000))
         .map_err(|()| "connect timeout")?;
-    let pending = outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))?;
+    outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))
+}
+
+/// GET `url` once. With `block`, wait on the response's pollable;
+/// without, call `get` until it answers (as a plugin polling from `tick`
+/// would).
+fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    let pending = http_start(url)?;
     let ready = if block {
         pending.subscribe().block();
         pending.get()
