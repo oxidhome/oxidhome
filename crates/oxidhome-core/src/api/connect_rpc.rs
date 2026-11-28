@@ -1978,6 +1978,126 @@ pub fn router(engine: Engine) -> ConnectRouter {
     Arc::new(OxidHomeEvents { engine }).register(router)
 }
 
+// ── Strict JSON for grant writes ────────────────────────────────
+
+/// One field a grant write accepts in JSON, under every name proto3
+/// JSON accepts for it (the lowerCamelCase one and the proto one).
+struct StrictField {
+    names: &'static [&'static str],
+    shape: StrictShape,
+}
+
+enum StrictShape {
+    /// A scalar or repeated scalar; the codec checks its type.
+    Leaf,
+    /// A message field.
+    Message(&'static [StrictField]),
+    /// A repeated message field.
+    Repeated(&'static [StrictField]),
+}
+
+const fn strict(names: &'static [&'static str], shape: StrictShape) -> StrictField {
+    StrictField { names, shape }
+}
+
+const STRICT_NAMES: &[StrictField] = &[strict(&["names"], StrictShape::Leaf)];
+const STRICT_GRANT: &[StrictField] = &[
+    strict(&["actions"], StrictShape::Leaf),
+    strict(&["category"], StrictShape::Message(STRICT_NAMES)),
+    strict(&["devices"], StrictShape::Message(STRICT_NAMES)),
+];
+const STRICT_GRANTS: &[StrictField] = &[strict(&["grants"], StrictShape::Repeated(STRICT_GRANT))];
+/// `CreateRoleRequest` and `UpdateRoleRequest`.
+const STRICT_ROLE_WRITE: &[StrictField] = &[
+    strict(&["name"], StrictShape::Leaf),
+    strict(&["grants"], StrictShape::Message(STRICT_GRANTS)),
+];
+const STRICT_NETWORK_GRANT: &[StrictField] = &[
+    strict(&["pluginId", "plugin_id"], StrictShape::Leaf),
+    strict(&["rules"], StrictShape::Leaf),
+];
+
+/// The RPCs that store a grant, with their request's fields and the
+/// permission their handler checks.
+fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> {
+    use oxidhome_proto::connect::oxidhome::v1::{
+        PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC, ROLES_SERVICE_CREATE_ROLE_SPEC,
+        ROLES_SERVICE_UPDATE_ROLE_SPEC,
+    };
+    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure
+        || path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure
+    {
+        Some((STRICT_ROLE_WRITE, Resource::Host))
+    } else if path == PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
+        Some((
+            STRICT_NETWORK_GRANT,
+            Resource::pre_check(ResourceKind::Plugin),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Refuse an unknown key or a `null` anywhere in `value`. The codec
+/// drops the first and reads the second as unset, and an unset grant
+/// selector means every device. A value of the wrong type passes
+/// through: the codec refuses it.
+fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> Result<(), String> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in object {
+        let Some(field) = fields.iter().find(|f| f.names.contains(&key.as_str())) else {
+            return Err(format!("unknown field `{at}{key}`"));
+        };
+        if value.is_null() {
+            return Err(format!("`{at}{key}` is null: omit it or give a value"));
+        }
+        match field.shape {
+            StrictShape::Leaf => {}
+            StrictShape::Message(inner) => check_strict(value, inner, &format!("{at}{key}."))?,
+            StrictShape::Repeated(inner) => {
+                for (i, item) in value.as_array().into_iter().flatten().enumerate() {
+                    if item.is_null() {
+                        return Err(format!("`{at}{key}[{i}]` is null"));
+                    }
+                    check_strict(item, inner, &format!("{at}{key}[{i}]."))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Connect interceptor for the RPCs that store a grant
+/// ([`strict_grant_write`]): a JSON body with an unknown key or a
+/// `null` is `INVALID_ARGUMENT`, as on REST, so a typo can't store an
+/// unnarrowed grant. Runs after the body is read under the service's
+/// size limit and before decoding; the caller's permission is checked
+/// first, as the handler does. Binary protobuf passes untouched. A
+/// strict-decode option in the codec would replace this.
+struct StrictGrantJson;
+
+#[connectrpc::async_trait]
+impl connectrpc::Interceptor for StrictGrantJson {
+    async fn intercept_unary(
+        &self,
+        req: connectrpc::interceptor::UnaryRequest,
+        next: connectrpc::interceptor::Next<'_>,
+    ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
+        if req.payload.format() == connectrpc::CodecFormat::Json
+            && let Some((fields, resource)) = req.ctx.path().and_then(strict_grant_write)
+        {
+            require_connect(&req.ctx, Action::PolicyManage, &resource)?;
+            serde_json::from_slice::<serde_json::Value>(req.payload.bytes())
+                .map_err(|err| format!("invalid JSON: {err}"))
+                .and_then(|value| check_strict(&value, fields, ""))
+                .map_err(|msg| rpc_err(&req.ctx, ConnectError::invalid_argument(msg)))?;
+        }
+        next.run(req).await
+    }
+}
+
 // ── Auth + audit middleware ─────────────────────────────────────
 
 /// Connect paths that don't require a bearer token. Mirrors the
@@ -2017,7 +2137,9 @@ pub fn axum_service(engine: Engine) -> axum::Router {
         audit_log: engine.audit_log(),
         transport: crate::auth::Transport::Connect,
     };
-    let inner = router(engine).into_axum_service();
+    let inner = router(engine)
+        .into_axum_service()
+        .with_interceptor(StrictGrantJson);
     axum::Router::new()
         .fallback_service(inner)
         .layer(from_fn_with_state(auth_state, connect_auth_middleware))
