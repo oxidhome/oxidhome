@@ -778,6 +778,18 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     )
     .await;
     assert_eq!(row(&listed, "plugins")["network"], network(&API));
+    // A reset with a stray `rules` is refused, not read as a reset to
+    // the full request.
+    let (status, body) = api_status(
+        &g.router,
+        &g.owner,
+        "POST",
+        &connect("ResetPluginNetworkGrant"),
+        json!({"pluginId": PLUGIN_ID, "rules": API}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(g.listed().await, network(&API));
     let (status, body) = api_status(
         &g.router,
         &g.owner,

@@ -771,7 +771,7 @@ async fn connect_role_writes_refuse_loose_json() {
         (
             json!(["narrow", {"grants": [{"actions": ["device.command"], "device": []}]}])
                 .to_string(),
-            "`the request` must be a JSON object",
+            "the request must be a JSON object",
         ),
         (
             json!({"name": "narrow", "grants": [[{"actions": ["device.command"]}]]}).to_string(),

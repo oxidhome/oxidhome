@@ -207,6 +207,14 @@ impl HandlerOutcomeSlot {
             .take()
     }
 
+    /// Record `outcome` unless the handler already recorded one.
+    fn set_if_empty(&self, outcome: HandlerOutcome) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(outcome);
+    }
+
     fn set(&self, outcome: HandlerOutcome) {
         *self
             .0
@@ -2016,51 +2024,33 @@ const STRICT_NETWORK_GRANT: &[StrictField] = &[
     strict(&["pluginId", "plugin_id"], StrictShape::Leaf),
     strict(&["rules"], StrictShape::Leaf),
 ];
+const STRICT_NETWORK_RESET: &[StrictField] =
+    &[strict(&["pluginId", "plugin_id"], StrictShape::Leaf)];
 
-/// One RPC that stores a grant: its request's fields, the resource its
-/// handler checks `policy.manage` on, and its request decoder.
-struct StrictRpc {
-    fields: &'static [StrictField],
-    resource: Resource,
-    decode: fn(&connectrpc::payload::Payload) -> Result<(), ConnectError>,
-}
-
-/// Decode the payload as `M`. The decoded message is cached on the
-/// payload and handed to the handler, so this is not a second decode.
-fn decode_as<M>(payload: &connectrpc::payload::Payload) -> Result<(), ConnectError>
-where
-    M: oxidhome_proto::runtime::Message
-        + connectrpc::codec::JsonSerialize
-        + connectrpc::codec::JsonDeserialize,
-    M: 'static,
-{
-    payload.message::<M>().map(|_| ())
-}
-
-/// The RPCs that store a grant.
-fn strict_grant_write(path: &str) -> Option<StrictRpc> {
+/// The RPCs that store a grant: their request's fields and the resource
+/// their handler checks `policy.manage` on.
+fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> {
     use oxidhome_proto::connect::oxidhome::v1::{
+        PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC,
         PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC, ROLES_SERVICE_CREATE_ROLE_SPEC,
         ROLES_SERVICE_UPDATE_ROLE_SPEC,
     };
-    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure {
-        Some(StrictRpc {
-            fields: STRICT_ROLE_WRITE,
-            resource: Resource::Host,
-            decode: decode_as::<CreateRoleRequest>,
-        })
-    } else if path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure {
-        Some(StrictRpc {
-            fields: STRICT_ROLE_WRITE,
-            resource: Resource::Host,
-            decode: decode_as::<UpdateRoleRequest>,
-        })
+    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure
+        || path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure
+    {
+        Some((STRICT_ROLE_WRITE, Resource::Host))
     } else if path == PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
-        Some(StrictRpc {
-            fields: STRICT_NETWORK_GRANT,
-            resource: Resource::pre_check(ResourceKind::Plugin),
-            decode: decode_as::<pb_grant::SetPluginNetworkGrantRequest>,
-        })
+        Some((
+            STRICT_NETWORK_GRANT,
+            Resource::pre_check(ResourceKind::Plugin),
+        ))
+    } else if path == PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
+        // A reset restores the manifest's full request, so a `rules`
+        // sent here by mistake must not be dropped silently.
+        Some((
+            STRICT_NETWORK_RESET,
+            Resource::pre_check(ResourceKind::Plugin),
+        ))
     } else {
         None
     }
@@ -2073,8 +2063,10 @@ fn strict_grant_write(path: &str) -> Option<StrictRpc> {
 /// positional array, which this check couldn't see into.
 fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> Result<(), String> {
     let Some(object) = value.as_object() else {
-        let at = at.strip_suffix('.').unwrap_or("the request");
-        return Err(format!("`{at}` must be a JSON object"));
+        return Err(match at.strip_suffix('.') {
+            Some(at) => format!("`{at}` must be a JSON object"),
+            None => "the request must be a JSON object".to_owned(),
+        });
     };
     for (key, value) in object {
         let Some(field) = fields.iter().find(|f| f.names.contains(&key.as_str())) else {
@@ -2103,11 +2095,12 @@ fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> 
 /// ([`strict_grant_write`]): a JSON body with an unknown key, a `null`
 /// or a message not written as an object is `INVALID_ARGUMENT`, as on
 /// REST, so a typo can't store an unnarrowed grant. Runs after the body
-/// is read under the service's size limit; checks the caller's
-/// permission first, as the handler does, then the body, then decodes
-/// it, so any refusal of the body is recorded on the audit row (on
-/// gRPC too). Binary protobuf passes untouched. A strict-decode option
-/// in the codec would replace this.
+/// is read under the service's size limit and before decoding, and
+/// checks the caller's permission first, as the handler does. A decode
+/// error past this check (the codec's own refusals) is recorded on the
+/// audit row too, so gRPC doesn't audit it as `allow`. Binary protobuf
+/// passes untouched. A strict-decode option in the codec would replace
+/// this.
 struct StrictGrantJson;
 
 #[connectrpc::async_trait]
@@ -2117,18 +2110,27 @@ impl connectrpc::Interceptor for StrictGrantJson {
         req: connectrpc::interceptor::UnaryRequest,
         next: connectrpc::interceptor::Next<'_>,
     ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
-        if req.payload.format() == connectrpc::CodecFormat::Json
-            && let Some(rpc) = req.ctx.path().and_then(strict_grant_write)
-        {
-            require_connect(&req.ctx, Action::PolicyManage, &rpc.resource)?;
-            serde_json::from_slice::<serde_json::Value>(req.payload.bytes())
-                .map_err(|err| format!("invalid JSON: {err}"))
-                .and_then(|value| check_strict(&value, rpc.fields, ""))
-                .map_err(ConnectError::invalid_argument)
-                .and_then(|()| (rpc.decode)(&req.payload))
-                .map_err(|err| rpc_err(&req.ctx, err))?;
+        if req.payload.format() != connectrpc::CodecFormat::Json {
+            return next.run(req).await;
         }
-        next.run(req).await
+        let Some((fields, resource)) = req.ctx.path().and_then(strict_grant_write) else {
+            return next.run(req).await;
+        };
+        require_connect(&req.ctx, Action::PolicyManage, &resource)?;
+        serde_json::from_slice::<serde_json::Value>(req.payload.bytes())
+            .map_err(|err| format!("invalid JSON: {err}"))
+            .and_then(|value| check_strict(&value, fields, ""))
+            .map_err(|msg| rpc_err(&req.ctx, ConnectError::invalid_argument(msg)))?;
+        let slot = req.ctx.extensions().get::<HandlerOutcomeSlot>().cloned();
+        let response = next.run(req).await;
+        if let (Err(err), Some(slot)) = (&response, slot) {
+            slot.set_if_empty(HandlerOutcome {
+                status: Some(err.http_status()),
+                denied_action: None,
+                command: None,
+            });
+        }
+        response
     }
 }
 
