@@ -616,6 +616,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     let host = TestHost::new().unwrap();
     let cut = dropping_server();
     let (trickle, connected) = trickling_server();
+    let (trickle_streamed, streamed_connected) = trickling_server();
     let (stalled, _stalled_open) = stalled_server();
     // Freed after the other servers started, so none of them takes it.
     let closing = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -632,6 +633,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
         &[
             format!("tcp://127.0.0.1:{}", ok.port()),
             format!("tcp://{trickle}"),
+            format!("tcp://{trickle_streamed}"),
             format!("tcp://{closed}"),
             format!("tcp://{stalled}"),
             format!("https://{cut}"),
@@ -650,6 +652,11 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
             // A 16 MiB upload nobody reads: the total timeout ends it long
             // before the 30 s write stall would.
             format!("post-total 1000 16777216 http://{stalled}/"),
+            // A streamed body read to its end keeps to the total timeout,
+            // and to the size given.
+            format!("stream-total 1000 4096 http://{trickle_streamed}/"),
+            format!("stream-total 5000 16 http://127.0.0.1:{}/", ok.port()),
+            format!("stream-total 5000 3 http://127.0.0.1:{}/", ok.port()),
         ],
     )
     .await;
@@ -687,7 +694,17 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
         results[9].starts_with("err:TotalTimeout") && results[9].contains("dispatched: true"),
         "{results:?}"
     );
-    assert_eq!(ok.accepted(), 4);
+    let held = streamed_connected
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert!(held < Duration::from_secs(5), "{held:?}");
+    assert!(
+        results[10].starts_with("err:TotalTimeout") && results[10].ends_with("|sent:true"),
+        "{results:?}"
+    );
+    assert_eq!(results[11], "ok:200:hello");
+    assert_eq!(results[12], "err:BodyTooLarge { limit: 3 }|sent:true");
+    assert_eq!(ok.accepted(), 6);
 }
 
 #[tokio::test(flavor = "multi_thread")]

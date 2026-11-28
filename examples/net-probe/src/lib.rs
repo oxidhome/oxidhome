@@ -318,6 +318,27 @@ fn run(op: &str) -> Result<String, String> {
                 .map_err(|e| sdk_err(&e))
         }
         "stream" => stream(arg),
+        // `stream-total <ms> <max> <url>`: GET with `send_streaming` and
+        // that total timeout, then `read_to_end(max)`.
+        "stream-total" => {
+            let mut parts = arg.splitn(3, ' ');
+            let (Some(ms), Some(max), Some(url)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return Err("stream-total <ms> <max> <url>".into());
+            };
+            let ms: u64 = ms.parse().map_err(|_| "bad milliseconds")?;
+            let max: usize = max.parse().map_err(|_| "bad length")?;
+            let mut response = Request::get(url)
+                .timeout(Duration::from_secs(5))
+                .total_timeout(Duration::from_millis(ms))
+                .send_streaming()
+                .map_err(|e| sdk_err(&e))?;
+            let body = response
+                .body()
+                .read_to_end(max)
+                .map_err(|e| sdk_err(&e))?;
+            Ok(format!("{}:{}", response.status(), String::from_utf8_lossy(&body)))
+        }
         "hdr" => header(arg),
         "hdrval" => header_value(arg),
         "httppoll" => http_get(arg, false)
