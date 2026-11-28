@@ -629,6 +629,246 @@ async fn connect_tokens_service_is_owner_only() {
     assert_eq!(body["role"]["name"], "visitor");
 }
 
+/// A raw Connect request with `content_type`, returning the status and
+/// body bytes.
+async fn send_raw(
+    router: &axum::Router,
+    uri: &str,
+    bearer: &str,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Connect JSON role writes refuse an unknown key or a `null` anywhere
+/// in the request, so a typo can't store an unnarrowed grant. Binary
+/// protobuf is unaffected.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn connect_role_writes_refuse_loose_json() {
+    const CREATE: &str = "/oxidhome.v1.RolesService/CreateRole";
+    const UPDATE: &str = "/oxidhome.v1.RolesService/UpdateRole";
+    let state = support::tempdir("token-roles-strict");
+    let engine = Engine::with_state_dir(state.path()).expect("engine");
+    let owner = ensure_admin_token(&engine.auth_tokens(), &engine.audit_log(), state.path())
+        .expect("bootstrap")
+        .expect("owner");
+    let wildcard = engine.auth_tokens().mint("ha", &["*"]).unwrap();
+    let router = build_router(engine.clone());
+    let grant = |g: Value| json!({"name": "narrow", "grants": {"grants": [g]}}).to_string();
+    let list_roles = || async {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/oxidhome.v1.RolesService/ListRoles",
+            &owner.plaintext,
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["name"] == "narrow" || r["name"] == "bin")
+            .map(|r| (r["name"].as_str().unwrap().to_owned(), r["grants"].clone()))
+            .collect::<Vec<_>>()
+    };
+
+    // gRPC-Web JSON: refused in the trailer and audited as a deny, by
+    // the strict check (an unknown key) or by the codec (a `null` string).
+    for (i, (payload, needle)) in [
+        (
+            grant(json!({"actions": ["device.command"], "device": ["dev-ab*"]})),
+            "grants[0].device",
+        ),
+        (grant(json!({"actions": [null]})), "failed to decode JSON"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        let (status, body) = send_raw(
+            &router,
+            CREATE,
+            &owner.plaintext,
+            "application/grpc-web+json",
+            frame,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("grpc-status: 3"), "{body}");
+        assert!(body.contains(needle), "{body}");
+        let rows = engine
+            .audit_log()
+            .query(
+                &AuditQuery {
+                    path: Some(CREATE.into()),
+                    ..AuditQuery::default()
+                },
+                8,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), i + 1, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| (r.status, r.decision.as_str()) == (400, "deny")),
+            "{rows:?}"
+        );
+    }
+
+    // Connect JSON: each loose body is refused and stores nothing.
+    for (body, needle) in [
+        (
+            grant(json!({"actions": ["device.command"], "device": ["dev-ab*"]})),
+            "unknown field `grants.grants[0].device`",
+        ),
+        (
+            grant(json!({"actions": ["device.command"], "devices": null})),
+            "`grants.grants[0].devices` is null",
+        ),
+        (
+            grant(json!({"actions": ["device.command"], "category": null})),
+            "`grants.grants[0].category` is null",
+        ),
+        (
+            grant(json!({"actions": ["device.command"], "devices": {"name": ["dev-ab*"]}})),
+            "unknown field `grants.grants[0].devices.name`",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"grants": [], "grant": []}}).to_string(),
+            "unknown field `grants.grant`",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"grants": [null]}}).to_string(),
+            "`grants.grants[0]` must be a JSON object",
+        ),
+        // serde would decode a message from a positional array.
+        (
+            json!(["narrow", {"grants": [{"actions": ["device.command"], "device": []}]}])
+                .to_string(),
+            "the request must be a JSON object",
+        ),
+        (
+            json!({"name": "narrow", "grants": [[{"actions": ["device.command"]}]]}).to_string(),
+            "`grants` must be a JSON object",
+        ),
+        (
+            grant(json!([["device.command"], null, null])),
+            "`grants.grants[0]` must be a JSON object",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"grants": {"actions": []}}}).to_string(),
+            "`grants.grants` must be a JSON array",
+        ),
+        (
+            r#"{"name": "narrow", "name": "again", "grants": {}}"#.to_owned(),
+            "`name` is given twice",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"$serde_json::private::RawValue": "{}"}})
+                .to_string(),
+            "unknown field `grants.$serde_json::private::RawValue`",
+        ),
+        (
+            json!({"name": "narrow", "x".repeat(10_000): 1}).to_string(),
+            &format!("unknown field `{}…`", "x".repeat(64)),
+        ),
+        // The codec's own refusals still apply.
+        (grant(json!({"actions": [null]})), "failed to decode JSON"),
+        (
+            json!({"name": "narrow", "grant": {"grants": []}}).to_string(),
+            "unknown field `grant`",
+        ),
+        ("{".to_owned(), "invalid JSON"),
+    ] {
+        let (status, reply) = send(&router, "POST", CREATE, &owner.plaintext, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert_eq!(reply["code"], "invalid_argument", "{body}: {reply}");
+        let message = reply["message"].as_str().unwrap();
+        assert!(message.contains(needle), "{body}: {message}");
+    }
+    assert_eq!(list_roles().await, Vec::new());
+
+    // A caller without `policy.manage` is denied before the body is checked.
+    let loose = grant(json!({"actions": ["device.command"], "devices": null}));
+    let (status, reply) = send(&router, "POST", CREATE, &wildcard.plaintext, &loose).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
+    assert_eq!(reply["code"], "permission_denied");
+
+    // A well-formed body still works.
+    let (status, reply) = send(
+        &router,
+        "POST",
+        CREATE,
+        &owner.plaintext,
+        &grant(json!({"actions": ["device.command"], "devices": {"names": ["dev-ab*"]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["role"]["grants"], json!(["device.command[dev-ab*]"]));
+
+    // UpdateRole: a `null` selector, an array-form request or an
+    // unknown key that `serde_json::Value` would read as raw JSON is
+    // refused and the role is kept.
+    for body in [
+        loose.clone(),
+        json!(["narrow", {"grants": [[["device.command"], null, null]]}]).to_string(),
+        json!({"name": "narrow", "grants": {"$serde_json::private::RawValue": "{}"}}).to_string(),
+    ] {
+        let (status, reply) = send(&router, "POST", UPDATE, &owner.plaintext, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert_eq!(reply["code"], "invalid_argument", "{body}: {reply}");
+    }
+    let kept = vec![("narrow".to_owned(), json!(["device.command[dev-ab*]"]))];
+    assert_eq!(list_roles().await, kept);
+
+    // Binary protobuf, an unknown field included, is decoded as before:
+    // `CreateRoleRequest{name: "bin", grants: {grants: [{actions:
+    // ["device.list"], devices: {names: ["dev-ab*"]}}]}}` plus field 9.
+    let field =
+        |tag: u8, bytes: &[u8]| [&[tag, u8::try_from(bytes.len()).unwrap()][..], bytes].concat();
+    let names = field(0x0a, b"dev-ab*");
+    let one = [field(0x0a, b"device.list"), field(0x1a, &names)].concat();
+    let grants = field(0x0a, &one);
+    let request = [field(0x0a, b"bin"), field(0x12, &grants), vec![0x48, 1]].concat();
+    let (status, _) = send_raw(
+        &router,
+        CREATE,
+        &owner.plaintext,
+        "application/proto",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let roles = list_roles().await;
+    assert!(
+        roles.contains(&("bin".to_owned(), json!(["device.list[dev-ab*]"]))),
+        "{roles:?}"
+    );
+}
+
 /// The offline CLI mints, lists and revokes role tokens and edits roles.
 #[test]
 #[allow(clippy::too_many_lines)]

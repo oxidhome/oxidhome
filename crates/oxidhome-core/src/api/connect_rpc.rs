@@ -207,6 +207,14 @@ impl HandlerOutcomeSlot {
             .take()
     }
 
+    /// Record `outcome` unless the handler already recorded one.
+    fn set_if_empty(&self, outcome: HandlerOutcome) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(outcome);
+    }
+
     fn set(&self, outcome: HandlerOutcome) {
         *self
             .0
@@ -1978,6 +1986,233 @@ pub fn router(engine: Engine) -> ConnectRouter {
     Arc::new(OxidHomeEvents { engine }).register(router)
 }
 
+// ── Strict JSON for grant writes ────────────────────────────────
+
+/// One field a grant write accepts in JSON, under every name proto3
+/// JSON accepts for it (the lowerCamelCase one and the proto one).
+struct StrictField {
+    names: &'static [&'static str],
+    shape: StrictShape,
+}
+
+enum StrictShape {
+    /// A scalar or repeated scalar; the codec checks its type.
+    Leaf,
+    /// A message field.
+    Message(&'static [StrictField]),
+    /// A repeated message field.
+    Repeated(&'static [StrictField]),
+}
+
+const fn strict(names: &'static [&'static str], shape: StrictShape) -> StrictField {
+    StrictField { names, shape }
+}
+
+const STRICT_NAMES: &[StrictField] = &[strict(&["names"], StrictShape::Leaf)];
+const STRICT_GRANT: &[StrictField] = &[
+    strict(&["actions"], StrictShape::Leaf),
+    strict(&["category"], StrictShape::Message(STRICT_NAMES)),
+    strict(&["devices"], StrictShape::Message(STRICT_NAMES)),
+];
+const STRICT_GRANTS: &[StrictField] = &[strict(&["grants"], StrictShape::Repeated(STRICT_GRANT))];
+/// `CreateRoleRequest` and `UpdateRoleRequest`.
+const STRICT_ROLE_WRITE: &[StrictField] = &[
+    strict(&["name"], StrictShape::Leaf),
+    strict(&["grants"], StrictShape::Message(STRICT_GRANTS)),
+];
+const STRICT_NETWORK_GRANT: &[StrictField] = &[
+    strict(&["pluginId", "plugin_id"], StrictShape::Leaf),
+    strict(&["rules"], StrictShape::Leaf),
+];
+const STRICT_NETWORK_RESET: &[StrictField] =
+    &[strict(&["pluginId", "plugin_id"], StrictShape::Leaf)];
+
+/// The RPCs that store a grant: their request's fields and the resource
+/// their handler checks `policy.manage` on.
+fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> {
+    use oxidhome_proto::connect::oxidhome::v1::{
+        PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC,
+        PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC, ROLES_SERVICE_CREATE_ROLE_SPEC,
+        ROLES_SERVICE_UPDATE_ROLE_SPEC,
+    };
+    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure
+        || path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure
+    {
+        Some((STRICT_ROLE_WRITE, Resource::Host))
+    } else if path == PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
+        Some((
+            STRICT_NETWORK_GRANT,
+            Resource::pre_check(ResourceKind::Plugin),
+        ))
+    } else if path == PLUGINS_SERVICE_RESET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
+        // A reset restores the manifest's full request, so a `rules`
+        // sent here by mistake must not be dropped silently.
+        Some((
+            STRICT_NETWORK_RESET,
+            Resource::pre_check(ResourceKind::Plugin),
+        ))
+    } else {
+        None
+    }
+}
+
+/// A JSON value as written: object members in order, under their
+/// literal names. Not `serde_json::Value`, which reads an object keyed
+/// by `serde_json`'s private raw-value token as the JSON in its string,
+/// where the codec sees an unknown key.
+enum JsonTree {
+    Null,
+    Scalar,
+    Array(Vec<JsonTree>),
+    Object(Vec<(String, JsonTree)>),
+}
+
+impl<'de> serde::Deserialize<'de> for JsonTree {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = JsonTree;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_unit<E>(self) -> Result<JsonTree, E> {
+                Ok(JsonTree::Null)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<JsonTree, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(JsonTree::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<JsonTree, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(JsonTree::Object(members))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// An unknown key as shown in an error: a long one is cut, since a gRPC
+/// error message rides in a response header.
+fn shown_key(key: &str) -> String {
+    const MAX: usize = 64;
+    match key.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &key[..cut]),
+        None => key.to_owned(),
+    }
+}
+
+/// Refuse an unknown or repeated key or a `null` anywhere in `value`.
+/// The codec drops an unknown key and reads `null` as unset, and an
+/// unset grant selector means every device. A message must be a JSON
+/// object and a repeated message an array: serde would also take a
+/// message as a positional array, which this check couldn't see into.
+fn check_strict(value: &JsonTree, fields: &[StrictField], at: &str) -> Result<(), String> {
+    let JsonTree::Object(members) = value else {
+        return Err(match at.strip_suffix('.') {
+            Some(at) => format!("`{at}` must be a JSON object"),
+            None => "the request must be a JSON object".to_owned(),
+        });
+    };
+    let mut seen = Vec::with_capacity(fields.len());
+    for (key, value) in members {
+        let Some(index) = fields.iter().position(|f| f.names.contains(&key.as_str())) else {
+            return Err(format!("unknown field `{at}{}`", shown_key(key)));
+        };
+        if seen.contains(&index) {
+            return Err(format!("`{at}{key}` is given twice"));
+        }
+        seen.push(index);
+        match (value, &fields[index].shape) {
+            (JsonTree::Null, _) => {
+                return Err(format!("`{at}{key}` is null: omit it or give a value"));
+            }
+            (_, StrictShape::Leaf) => {}
+            (_, StrictShape::Message(inner)) => {
+                check_strict(value, inner, &format!("{at}{key}."))?;
+            }
+            (JsonTree::Array(items), StrictShape::Repeated(inner)) => {
+                for (i, item) in items.iter().enumerate() {
+                    check_strict(item, inner, &format!("{at}{key}[{i}]."))?;
+                }
+            }
+            (_, StrictShape::Repeated(_)) => {
+                return Err(format!("`{at}{key}` must be a JSON array"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Connect interceptor for the RPCs that store a grant
+/// ([`strict_grant_write`]): a JSON body with an unknown key, a `null`
+/// or a message not written as an object is `INVALID_ARGUMENT`, as on
+/// REST, so a typo can't store an unnarrowed grant. Runs after the body
+/// is read under the service's size limit and before decoding, and
+/// checks the caller's permission first, as the handler does. A decode
+/// error past this check (the codec's own refusals) is recorded on the
+/// audit row too, so gRPC doesn't audit it as `allow`. Binary protobuf
+/// passes untouched. A strict-decode option in the codec would replace
+/// this.
+struct StrictGrantJson;
+
+#[connectrpc::async_trait]
+impl connectrpc::Interceptor for StrictGrantJson {
+    async fn intercept_unary(
+        &self,
+        req: connectrpc::interceptor::UnaryRequest,
+        next: connectrpc::interceptor::Next<'_>,
+    ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
+        if req.payload.format() != connectrpc::CodecFormat::Json {
+            return next.run(req).await;
+        }
+        let Some((fields, resource)) = req.ctx.path().and_then(strict_grant_write) else {
+            return next.run(req).await;
+        };
+        require_connect(&req.ctx, Action::PolicyManage, &resource)?;
+        serde_json::from_slice::<JsonTree>(req.payload.bytes())
+            .map_err(|err| format!("invalid JSON: {err}"))
+            .and_then(|value| check_strict(&value, fields, ""))
+            .map_err(|msg| rpc_err(&req.ctx, ConnectError::invalid_argument(msg)))?;
+        let slot = req.ctx.extensions().get::<HandlerOutcomeSlot>().cloned();
+        let response = next.run(req).await;
+        if let (Err(err), Some(slot)) = (&response, slot) {
+            slot.set_if_empty(HandlerOutcome {
+                status: Some(err.http_status()),
+                denied_action: None,
+                command: None,
+            });
+        }
+        response
+    }
+}
+
 // ── Auth + audit middleware ─────────────────────────────────────
 
 /// Connect paths that don't require a bearer token. Mirrors the
@@ -2017,7 +2252,9 @@ pub fn axum_service(engine: Engine) -> axum::Router {
         audit_log: engine.audit_log(),
         transport: crate::auth::Transport::Connect,
     };
-    let inner = router(engine).into_axum_service();
+    let inner = router(engine)
+        .into_axum_service()
+        .with_interceptor(StrictGrantJson);
     axum::Router::new()
         .fallback_service(inner)
         .layer(from_fn_with_state(auth_state, connect_auth_middleware))

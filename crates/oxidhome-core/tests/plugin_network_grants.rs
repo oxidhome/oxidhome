@@ -699,6 +699,7 @@ async fn the_owner_narrows_and_resets_the_grant_over_rest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     let g = granting("net-grants-connect");
     let connect = |rpc: &str| format!("/oxidhome.v1.PluginsService/{rpc}");
@@ -708,6 +709,35 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
         "POST",
         &connect("ResetPluginNetworkGrant"),
         json!({"pluginId": PLUGIN_ID}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // JSON with an unknown key or a `null` is refused before anything
+    // is stored. (The proto name `plugin_id` is accepted below.)
+    for body in [
+        json!({"plugin_id": PLUGIN_ID, "rule": []}),
+        json!({"pluginId": PLUGIN_ID, "rules": null}),
+        json!([PLUGIN_ID, null]),
+    ] {
+        let (status, reply) = api_status(
+            &g.router,
+            &g.owner,
+            "POST",
+            &connect("SetPluginNetworkGrant"),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert_eq!(reply["code"], "invalid_argument", "{body}: {reply}");
+    }
+    assert_eq!(grant_audit_paths(&g.engine), Vec::<String>::new());
+    // A caller without `policy.manage` is denied first.
+    let (status, _) = api_status(
+        &g.router,
+        &g.wildcard,
+        "POST",
+        &connect("SetPluginNetworkGrant"),
+        json!({"pluginId": PLUGIN_ID, "rule": []}),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -735,7 +765,7 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
         &g.owner,
         "POST",
         &connect("SetPluginNetworkGrant"),
-        json!({"pluginId": PLUGIN_ID, "rules": API}),
+        json!({"plugin_id": PLUGIN_ID, "rules": API}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -749,6 +779,18 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     )
     .await;
     assert_eq!(row(&listed, "plugins")["network"], network(&API));
+    // A reset with a stray `rules` is refused, not read as a reset to
+    // the full request.
+    let (status, body) = api_status(
+        &g.router,
+        &g.owner,
+        "POST",
+        &connect("ResetPluginNetworkGrant"),
+        json!({"pluginId": PLUGIN_ID, "rules": API}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(g.listed().await, network(&API));
     let (status, body) = api_status(
         &g.router,
         &g.owner,
