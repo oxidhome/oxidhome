@@ -44,14 +44,16 @@
 //!   bounds everything up to the response head (and the end of the
 //!   request body); the body is then read without a deadline, only
 //!   [`Request::timeout`] between chunks, except by
-//!   [`BodyReader::read_to_end`], which keeps to it. Raise it for a big
-//!   or slow download (from `init`, a command or a service call, each
-//!   under the same call limit), or turn it off with
-//!   [`Request::no_total_timeout`]. A server that may take longer than
-//!   that to answer (a long poll) is better served across calls: send
-//!   it with raw `wasi:http` (`outgoing-handler.handle`), keep the
-//!   `future-incoming-response`, and take the response with `get` from
-//!   the `tick` its arrival wakes.
+//!   [`BodyReader::read_to_end`], which keeps to it. A plugin can change
+//!   it ([`Request::total_timeout`], [`Request::no_total_timeout`]), but
+//!   not the call limit: past it the watchdog stops the instance instead
+//!   of the plugin getting an error. Work that may take longer belongs
+//!   across calls, with a plugin whose manifest sets
+//!   `runtime.tick_interval_ms` (readiness wakeups need one): drain a
+//!   big or slow download from a kept [`BodyReader`] a little each
+//!   `tick`, and send a long poll with raw `wasi:http`
+//!   (`outgoing-handler.handle`), keep the `future-incoming-response`,
+//!   and take the response with `get` in the `tick` its arrival wakes.
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
 //!   the request with [`Error::BodyTooLarge`]. The host caps a request's
 //!   headers at [`MAX_HEADER_BYTES`]; more fails it with
@@ -515,9 +517,10 @@ impl Request {
 
     /// No [`Request::total_timeout`]: only [`Request::timeout`] bounds
     /// the request, each phase on its own, so a server that trickles its
-    /// body keeps [`Request::send`] busy for as long as it trickles, out
-    /// of the liveness watchdog's reach. Prefer a longer
-    /// [`Request::total_timeout`].
+    /// body keeps [`Request::send`] busy for as long as it trickles. The
+    /// host's per-call watchdog then stops the instance once the call
+    /// returns past its limit, where a total timeout would have returned
+    /// an error in time.
     #[must_use]
     pub fn no_total_timeout(mut self) -> Self {
         self.total_timeout = None;

@@ -763,6 +763,16 @@ mod tests {
         );
     }
 
+    /// A request that runs out the SDK's default total timeout must
+    /// return before the per-call watchdog traps the call.
+    #[test]
+    fn the_sdk_total_timeout_ends_before_the_watchdog() {
+        assert!(
+            oxidhome_sdk::streaming::http::DEFAULT_TOTAL_TIMEOUT
+                < crate::runtime::watchdog::WATCHDOG_DEFAULT
+        );
+    }
+
     #[test]
     fn oversized_header_maps_fail_instead_of_trapping() {
         use wasmtime_wasi_http::FieldMapError;
