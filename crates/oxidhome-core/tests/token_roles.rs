@@ -693,35 +693,53 @@ async fn connect_role_writes_refuse_loose_json() {
             .collect::<Vec<_>>()
     };
 
-    // gRPC-Web JSON: refused in the trailer, audited as a deny.
-    let payload = grant(json!({"actions": ["device.command"], "device": ["dev-ab*"]}));
-    let mut frame = vec![0u8];
-    frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
-    frame.extend_from_slice(payload.as_bytes());
-    let (status, body) = send_raw(
-        &router,
-        CREATE,
-        &owner.plaintext,
-        "application/grpc-web+json",
-        frame,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("grpc-status: 3"), "{body}");
-    assert!(body.contains("grants[0].device"), "{body}");
-    let rows = engine
-        .audit_log()
-        .query(
-            &AuditQuery {
-                path: Some(CREATE.into()),
-                ..AuditQuery::default()
-            },
-            8,
+    // gRPC-Web JSON: refused in the trailer and audited as a deny, by
+    // the strict check (an unknown key) or by the codec (a duplicate key).
+    for (i, (payload, needle)) in [
+        (
+            grant(json!({"actions": ["device.command"], "device": ["dev-ab*"]})),
+            "grants[0].device",
+        ),
+        (
+            r#"{"name": "narrow", "name": "again", "grants": {}}"#.to_owned(),
+            "duplicate field",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(payload.as_bytes());
+        let (status, body) = send_raw(
+            &router,
+            CREATE,
+            &owner.plaintext,
+            "application/grpc-web+json",
+            frame,
         )
-        .unwrap();
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert_eq!((rows[0].status, rows[0].decision.as_str()), (400, "deny"));
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("grpc-status: 3"), "{body}");
+        assert!(body.contains(needle), "{body}");
+        let rows = engine
+            .audit_log()
+            .query(
+                &AuditQuery {
+                    path: Some(CREATE.into()),
+                    ..AuditQuery::default()
+                },
+                8,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), i + 1, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|r| (r.status, r.decision.as_str()) == (400, "deny")),
+            "{rows:?}"
+        );
+    }
 
     // Connect JSON: each loose body is refused and stores nothing.
     for (body, needle) in [
@@ -747,8 +765,28 @@ async fn connect_role_writes_refuse_loose_json() {
         ),
         (
             json!({"name": "narrow", "grants": {"grants": [null]}}).to_string(),
-            "`grants.grants[0]` is null",
+            "`grants.grants[0]` must be a JSON object",
         ),
+        // serde would decode a message from a positional array.
+        (
+            json!(["narrow", {"grants": [{"actions": ["device.command"], "device": []}]}])
+                .to_string(),
+            "`the request` must be a JSON object",
+        ),
+        (
+            json!({"name": "narrow", "grants": [[{"actions": ["device.command"]}]]}).to_string(),
+            "`grants` must be a JSON object",
+        ),
+        (
+            grant(json!([["device.command"], null, null])),
+            "`grants.grants[0]` must be a JSON object",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"grants": {"actions": []}}}).to_string(),
+            "`grants.grants` must be a JSON array",
+        ),
+        // The codec's own refusals still apply.
+        (grant(json!({"actions": [null]})), "failed to decode JSON"),
         (
             json!({"name": "narrow", "grant": {"grants": []}}).to_string(),
             "unknown field `grant`",
@@ -763,7 +801,7 @@ async fn connect_role_writes_refuse_loose_json() {
     }
     assert_eq!(list_roles().await, Vec::new());
 
-    // A caller without `policy.manage` is denied before the body is read.
+    // A caller without `policy.manage` is denied before the body is checked.
     let loose = grant(json!({"actions": ["device.command"], "devices": null}));
     let (status, reply) = send(&router, "POST", CREATE, &wildcard.plaintext, &loose).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{reply}");
@@ -781,9 +819,16 @@ async fn connect_role_writes_refuse_loose_json() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(reply["role"]["grants"], json!(["device.command[dev-ab*]"]));
 
-    // UpdateRole: a `null` selector is refused and the role is kept.
-    let (status, reply) = send(&router, "POST", UPDATE, &owner.plaintext, &loose).await;
-    assert_eq!(reply["code"], "invalid_argument", "{status} {reply}");
+    // UpdateRole: a `null` selector or an array-form request is refused
+    // and the role is kept.
+    for body in [
+        loose.clone(),
+        json!(["narrow", {"grants": [[["device.command"], null, null]]}]).to_string(),
+    ] {
+        let (status, reply) = send(&router, "POST", UPDATE, &owner.plaintext, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert_eq!(reply["code"], "invalid_argument", "{body}: {reply}");
+    }
     let kept = vec![("narrow".to_owned(), json!(["device.command[dev-ab*]"]))];
     assert_eq!(list_roles().await, kept);
 

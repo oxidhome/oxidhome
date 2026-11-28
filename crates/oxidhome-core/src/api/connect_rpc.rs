@@ -2017,22 +2017,50 @@ const STRICT_NETWORK_GRANT: &[StrictField] = &[
     strict(&["rules"], StrictShape::Leaf),
 ];
 
-/// The RPCs that store a grant, with their request's fields and the
-/// permission their handler checks.
-fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> {
+/// One RPC that stores a grant: its request's fields, the resource its
+/// handler checks `policy.manage` on, and its request decoder.
+struct StrictRpc {
+    fields: &'static [StrictField],
+    resource: Resource,
+    decode: fn(&connectrpc::payload::Payload) -> Result<(), ConnectError>,
+}
+
+/// Decode the payload as `M`. The decoded message is cached on the
+/// payload and handed to the handler, so this is not a second decode.
+fn decode_as<M>(payload: &connectrpc::payload::Payload) -> Result<(), ConnectError>
+where
+    M: oxidhome_proto::runtime::Message
+        + connectrpc::codec::JsonSerialize
+        + connectrpc::codec::JsonDeserialize,
+    M: 'static,
+{
+    payload.message::<M>().map(|_| ())
+}
+
+/// The RPCs that store a grant.
+fn strict_grant_write(path: &str) -> Option<StrictRpc> {
     use oxidhome_proto::connect::oxidhome::v1::{
         PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC, ROLES_SERVICE_CREATE_ROLE_SPEC,
         ROLES_SERVICE_UPDATE_ROLE_SPEC,
     };
-    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure
-        || path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure
-    {
-        Some((STRICT_ROLE_WRITE, Resource::Host))
+    if path == ROLES_SERVICE_CREATE_ROLE_SPEC.procedure {
+        Some(StrictRpc {
+            fields: STRICT_ROLE_WRITE,
+            resource: Resource::Host,
+            decode: decode_as::<CreateRoleRequest>,
+        })
+    } else if path == ROLES_SERVICE_UPDATE_ROLE_SPEC.procedure {
+        Some(StrictRpc {
+            fields: STRICT_ROLE_WRITE,
+            resource: Resource::Host,
+            decode: decode_as::<UpdateRoleRequest>,
+        })
     } else if path == PLUGINS_SERVICE_SET_PLUGIN_NETWORK_GRANT_SPEC.procedure {
-        Some((
-            STRICT_NETWORK_GRANT,
-            Resource::pre_check(ResourceKind::Plugin),
-        ))
+        Some(StrictRpc {
+            fields: STRICT_NETWORK_GRANT,
+            resource: Resource::pre_check(ResourceKind::Plugin),
+            decode: decode_as::<pb_grant::SetPluginNetworkGrantRequest>,
+        })
     } else {
         None
     }
@@ -2040,11 +2068,13 @@ fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> 
 
 /// Refuse an unknown key or a `null` anywhere in `value`. The codec
 /// drops the first and reads the second as unset, and an unset grant
-/// selector means every device. A value of the wrong type passes
-/// through: the codec refuses it.
+/// selector means every device. A message must be a JSON object and a
+/// repeated message an array: serde would also take a message as a
+/// positional array, which this check couldn't see into.
 fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> Result<(), String> {
     let Some(object) = value.as_object() else {
-        return Ok(());
+        let at = at.strip_suffix('.').unwrap_or("the request");
+        return Err(format!("`{at}` must be a JSON object"));
     };
     for (key, value) in object {
         let Some(field) = fields.iter().find(|f| f.names.contains(&key.as_str())) else {
@@ -2057,10 +2087,10 @@ fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> 
             StrictShape::Leaf => {}
             StrictShape::Message(inner) => check_strict(value, inner, &format!("{at}{key}."))?,
             StrictShape::Repeated(inner) => {
-                for (i, item) in value.as_array().into_iter().flatten().enumerate() {
-                    if item.is_null() {
-                        return Err(format!("`{at}{key}[{i}]` is null"));
-                    }
+                let Some(items) = value.as_array() else {
+                    return Err(format!("`{at}{key}` must be a JSON array"));
+                };
+                for (i, item) in items.iter().enumerate() {
                     check_strict(item, inner, &format!("{at}{key}[{i}]."))?;
                 }
             }
@@ -2070,12 +2100,14 @@ fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> 
 }
 
 /// Connect interceptor for the RPCs that store a grant
-/// ([`strict_grant_write`]): a JSON body with an unknown key or a
-/// `null` is `INVALID_ARGUMENT`, as on REST, so a typo can't store an
-/// unnarrowed grant. Runs after the body is read under the service's
-/// size limit and before decoding; the caller's permission is checked
-/// first, as the handler does. Binary protobuf passes untouched. A
-/// strict-decode option in the codec would replace this.
+/// ([`strict_grant_write`]): a JSON body with an unknown key, a `null`
+/// or a message not written as an object is `INVALID_ARGUMENT`, as on
+/// REST, so a typo can't store an unnarrowed grant. Runs after the body
+/// is read under the service's size limit; checks the caller's
+/// permission first, as the handler does, then the body, then decodes
+/// it, so any refusal of the body is recorded on the audit row (on
+/// gRPC too). Binary protobuf passes untouched. A strict-decode option
+/// in the codec would replace this.
 struct StrictGrantJson;
 
 #[connectrpc::async_trait]
@@ -2086,13 +2118,15 @@ impl connectrpc::Interceptor for StrictGrantJson {
         next: connectrpc::interceptor::Next<'_>,
     ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
         if req.payload.format() == connectrpc::CodecFormat::Json
-            && let Some((fields, resource)) = req.ctx.path().and_then(strict_grant_write)
+            && let Some(rpc) = req.ctx.path().and_then(strict_grant_write)
         {
-            require_connect(&req.ctx, Action::PolicyManage, &resource)?;
+            require_connect(&req.ctx, Action::PolicyManage, &rpc.resource)?;
             serde_json::from_slice::<serde_json::Value>(req.payload.bytes())
                 .map_err(|err| format!("invalid JSON: {err}"))
-                .and_then(|value| check_strict(&value, fields, ""))
-                .map_err(|msg| rpc_err(&req.ctx, ConnectError::invalid_argument(msg)))?;
+                .and_then(|value| check_strict(&value, rpc.fields, ""))
+                .map_err(ConnectError::invalid_argument)
+                .and_then(|()| (rpc.decode)(&req.payload))
+                .map_err(|err| rpc_err(&req.ctx, err))?;
         }
         next.run(req).await
     }

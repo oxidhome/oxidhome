@@ -44,5 +44,6 @@ pub mod connect;
 /// `oxidhome_proto::runtime::EnumValue<...>` etc.
 pub mod runtime {
     pub use buffa::EnumValue;
+    pub use buffa::Message;
     pub use buffa::MessageField;
 }

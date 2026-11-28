@@ -716,6 +716,7 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     for body in [
         json!({"plugin_id": PLUGIN_ID, "rule": []}),
         json!({"pluginId": PLUGIN_ID, "rules": null}),
+        json!([PLUGIN_ID, null]),
     ] {
         let (status, reply) = api_status(
             &g.router,
@@ -729,6 +730,16 @@ async fn the_owner_narrows_and_resets_the_grant_over_connect() {
         assert_eq!(reply["code"], "invalid_argument", "{body}: {reply}");
     }
     assert_eq!(grant_audit_paths(&g.engine), Vec::<String>::new());
+    // A caller without `policy.manage` is denied first.
+    let (status, _) = api_status(
+        &g.router,
+        &g.wildcard,
+        "POST",
+        &connect("SetPluginNetworkGrant"),
+        json!({"pluginId": PLUGIN_ID, "rule": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, body) = api_status(
         &g.router,
         &g.owner,
