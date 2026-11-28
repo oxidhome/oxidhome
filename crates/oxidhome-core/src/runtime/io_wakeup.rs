@@ -7,10 +7,12 @@
 //! one of them becomes readable:
 //!
 //! - **What is watched:** every TCP input stream (the one
-//!   `finish-connect` handed the guest) and every UDP
+//!   `finish-connect` handed the guest), every `wasi:http` response body
+//!   stream (the one `incoming-body.stream` handed it) and every UDP
 //!   `incoming-datagram-stream` in the instance's resource table, and
-//!   every `host-network` discovery socket. Other streams (stdin,
-//!   `wasi:http` bodies) are not.
+//!   every `host-network` discovery socket. Other streams (stdin) are
+//!   not. A body stream is readable when data, its end or its error
+//!   (a between-bytes timeout too) is there to read.
 //! - **Who gets it:** `streaming-plugin` / `streaming-ai-plugin`
 //!   instances whose manifest sets `runtime.tick_interval_ms`. A plugin
 //!   without a tick cadence is never ticked, early or not; the other
@@ -42,6 +44,7 @@ use std::time::Duration;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::bindings::sockets::udp::IncomingDatagramStream;
 use wasmtime_wasi::p2::{DynFuture, DynInputStream, Pollable as _, TcpSocket};
+use wasmtime_wasi_http::p2::body::HostIncomingBody;
 
 use super::network::DiscoverySocket;
 
@@ -81,7 +84,7 @@ impl Future for Readable<'_> {
 
 /// Wait for the read side of the sockets in `table`.
 pub(crate) fn readable(table: &mut ResourceTable) -> Readable<'_> {
-    let tcp_inputs = tcp_input_streams(table);
+    let inputs = watched_input_streams(table);
     let waits = table
         .iter_mut()
         .filter_map(|(_, entry)| {
@@ -91,7 +94,7 @@ pub(crate) fn readable(table: &mut ResourceTable) -> Readable<'_> {
             } else if entry.is::<DiscoverySocket>() {
                 let socket = entry.downcast_mut::<DiscoverySocket>()?;
                 Some(socket.ready())
-            } else if tcp_inputs.contains(&entry_addr(entry)) {
+            } else if inputs.contains(&entry_addr(entry)) {
                 let stream = entry.downcast_mut::<DynInputStream>()?;
                 Some(stream.ready())
             } else {
@@ -102,32 +105,57 @@ pub(crate) fn readable(table: &mut ResourceTable) -> Readable<'_> {
     Readable { waits }
 }
 
-/// The input streams of the TCP sockets in `table`, by entry address.
+/// The input streams of the TCP sockets and `wasi:http` response
+/// bodies in `table`, by entry address.
 ///
 /// `wasmtime-wasi` stores a connected socket's input stream as a child
-/// of the socket's entry, typed only as a boxed `input-stream` (stdin
-/// and `wasi:http` bodies have the same type), so the socket's children
-/// are what tells a TCP stream apart. The table lends children out
-/// read-only; the address of the boxed entry identifies them in the
-/// mutable walk.
-fn tcp_input_streams(table: &mut ResourceTable) -> HashSet<usize> {
-    let sockets: Vec<u32> = table
+/// of the socket's entry, and `wasmtime-wasi-http` a body's stream as a
+/// child of the body's, both typed only as a boxed `input-stream` (as
+/// stdin is), so the parent is what tells a watched stream apart. The
+/// table lends children out read-only; the address of the boxed entry
+/// identifies them in the mutable walk.
+fn watched_input_streams(table: &mut ResourceTable) -> HashSet<usize> {
+    let parents: Vec<(u32, bool)> = table
         .iter_mut()
-        .filter(|(_, entry)| entry.is::<TcpSocket>())
-        .map(|(rep, _)| rep)
+        .filter_map(|(rep, entry)| {
+            if entry.is::<TcpSocket>() {
+                Some((rep, true))
+            } else if entry.is::<HostIncomingBody>() {
+                Some((rep, false))
+            } else {
+                None
+            }
+        })
         .collect();
     let mut inputs = HashSet::new();
-    for rep in sockets {
-        let Ok(children) = table.iter_children(&Resource::<TcpSocket>::new_borrow(rep)) else {
-            continue;
-        };
-        inputs.extend(
-            children
-                .filter(|child| child.is::<DynInputStream>())
-                .map(entry_addr),
-        );
+    for (rep, socket) in parents {
+        if socket {
+            inputs.extend(input_children(
+                table.iter_children(&Resource::<TcpSocket>::new_borrow(rep)),
+            ));
+        } else {
+            inputs.extend(input_children(table.iter_children(&Resource::<
+                HostIncomingBody,
+            >::new_borrow(
+                rep
+            ))));
+        }
     }
     inputs
+}
+
+/// The input streams among a table entry's `children`, by entry address.
+fn input_children<'a>(
+    children: Result<
+        impl Iterator<Item = &'a (dyn Any + Send)>,
+        wasmtime::component::ResourceTableError,
+    >,
+) -> impl Iterator<Item = usize> {
+    children
+        .into_iter()
+        .flatten()
+        .filter(|child| child.is::<DynInputStream>())
+        .map(entry_addr)
 }
 
 /// Identity of a table entry: the address of its boxed value.
@@ -164,7 +192,7 @@ mod tests {
         let (_writer, reader) = tokio::io::duplex(16);
         let stream: DynInputStream = Box::new(AsyncReadStream::new(reader));
         table.push(stream).unwrap();
-        assert!(tcp_input_streams(&mut table).is_empty());
+        assert!(watched_input_streams(&mut table).is_empty());
         assert!(poll_once(&mut readable(&mut table)).is_pending());
     }
 }

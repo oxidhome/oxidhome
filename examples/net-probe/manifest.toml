@@ -32,7 +32,12 @@ storage_quota_kb = 16
 #   httppoll <url>     GET once, polling `get` instead of the pollable
 #   get <url>          GET with the SDK client (`streaming::http`)
 #   post <bytes> <url> POST that many bytes with the SDK client
+#   get-total <ms> <url> GET with the SDK client and that total timeout
+#   post-total <ms> <len> <url> POST <len> bytes with the SDK client and that total timeout
+#   get-big <len> <url> GET with the SDK client and a <len>-byte header value
+#   stream <url>       GET with the SDK client's streaming body, read to the end
 #   hdr <len>          append a header with a <len>-byte name to new fields
+#   hdrval <len>       append a header with a <len>-byte value to new fields
 #   bind <addr:port>   bind a UDP socket
 #   listen <addr:port> bind + listen a TCP socket
 #   hold-udp <host:port> send "ping" from a socket kept open; ticks drain it
@@ -43,6 +48,7 @@ storage_quota_kb = 16
 #   disc-join <group>  join a multicast group from a discovery socket
 #   nets -             list the local networks the grant covers
 #   hold-disc <ip:port> send "ping" from a discovery socket kept open; ticks drain it
+#   hold-http <url>    GET with the SDK client's streaming body, kept open; ticks drain it
 type = "string"
 default = ""
 description = "Network operations to run on init."

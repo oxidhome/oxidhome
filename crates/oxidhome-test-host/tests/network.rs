@@ -546,6 +546,150 @@ async fn http_requests_are_checked_on_every_hop() {
     wait_for_deny(&host, "http", "http", "https://").await;
 }
 
+/// A server on loopback that answers one request with a head promising
+/// 1000 bytes, then trickles them a byte every 100 ms; reports how long
+/// the client stayed connected.
+fn trickling_server() -> (SocketAddr, std::sync::mpsc::Receiver<Duration>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind trickle server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let accepted = Instant::now();
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n");
+        for _ in 0..1000 {
+            if stream
+                .write_all(b"x")
+                .and_then(|()| stream.flush())
+                .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = tx.send(accepted.elapsed());
+    });
+    (addr, rx)
+}
+
+/// A server on loopback that accepts one connection and never reads
+/// from it, until the test drops the returned sender.
+fn stalled_server() -> (SocketAddr, std::sync::mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((_stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = rx.recv();
+    });
+    (addr, tx)
+}
+
+/// A server on loopback that drops every connection it accepts (for
+/// TLS, mid-handshake).
+fn dropping_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind dropping server");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    addr
+}
+
+/// The SDK client: a total timeout ends a trickling body, refused
+/// headers are dropped, oversized ones fail without trapping, a body can
+/// be streamed, and each error says whether the request may have gone
+/// out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
+    let host = TestHost::new().unwrap();
+    let cut = dropping_server();
+    let (trickle, connected) = trickling_server();
+    let (stalled, _stalled_open) = stalled_server();
+    // Freed after the other servers started, so none of them takes it.
+    let closing = TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed = closing.local_addr().unwrap();
+    let ok = TcpServer::http(move |path| match path {
+        "/to-closed" => http_redirect(&format!("http://{closed}/")),
+        "/to-ftp" => http_redirect("ftp://cam.lan/x"),
+        _ => http_ok("hello"),
+    });
+    drop(closing);
+    let results = probe(
+        &host,
+        "sdk",
+        &[
+            format!("tcp://127.0.0.1:{}", ok.port()),
+            format!("tcp://{trickle}"),
+            format!("tcp://{closed}"),
+            format!("tcp://{stalled}"),
+            format!("https://{cut}"),
+        ],
+        &[
+            format!("get-total 1000 http://{trickle}/"),
+            format!("get-total 5000 https://{cut}/"),
+            format!("get-total 5000 http://{closed}/"),
+            format!("get-big 20000 http://127.0.0.1:{}/", ok.port()),
+            "hdrval 20000".to_owned(),
+            format!("stream http://127.0.0.1:{}/", ok.port()),
+            format!("get-total 5000 http://127.0.0.1:{}/", ok.port()),
+            // Refused at the second hop: the first one was answered.
+            format!("get-total 5000 http://127.0.0.1:{}/to-closed", ok.port()),
+            format!("get-total 5000 http://127.0.0.1:{}/to-ftp", ok.port()),
+            // A 16 MiB upload nobody reads: the total timeout ends it long
+            // before the 30 s write stall would.
+            format!("post-total 1000 16777216 http://{stalled}/"),
+        ],
+    )
+    .await;
+    // The trickle alone would take 100 s.
+    let held = connected.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(held < Duration::from_secs(5), "{held:?}");
+    assert!(
+        results[0].starts_with("err:TotalTimeout") && results[0].ends_with("|sent:true"),
+        "{results:?}"
+    );
+    assert_eq!(
+        results[1],
+        "err:Http(ErrorCode::TlsProtocolError)|sent:false"
+    );
+    assert_eq!(
+        results[2],
+        "err:Http(ErrorCode::ConnectionRefused)|sent:false"
+    );
+    assert!(
+        results[3].starts_with("err:Request(") && results[3].ends_with("|sent:false"),
+        "{results:?}"
+    );
+    assert_eq!(results[4], "err:HeaderError::InvalidSyntax");
+    assert_eq!(results[5], "ok:200:hello");
+    assert_eq!(results[6], "ok:200:hello");
+    assert_eq!(
+        results[7],
+        "err:AfterRedirect { hops: 1, error: Http(ErrorCode::ConnectionRefused) }|sent:true"
+    );
+    assert_eq!(
+        results[8],
+        "err:InvalidRedirect(\"ftp://cam.lan/x\")|sent:true"
+    );
+    assert!(
+        results[9].starts_with("err:TotalTimeout") && results[9].contains("dispatched: true"),
+        "{results:?}"
+    );
+    assert_eq!(ok.accepted(), 4);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn plugin_world_components_get_no_network_imports() {
     let host = TestHost::new().unwrap();
