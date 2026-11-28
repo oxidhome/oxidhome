@@ -460,12 +460,9 @@ async fn a_pending_response_wakes_the_plugin_before_its_tick() {
     drop(answer_tx);
 }
 
-/// One total timeout covers every phase of an SDK request, even under a
-/// virtual clock (the guest's clock stands still, its timers don't):
-/// a head and a body that each come within the limit, but not both.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_total_timeout_spans_the_head_and_the_body() {
-    let host = TestHost::with_virtual_clock().unwrap();
+/// A peer on loopback that answers one request with its head after
+/// 700 ms and its 2-byte body 700 ms later.
+fn split_delay_peer() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow peer");
     let peer = listener.local_addr().expect("local addr");
     std::thread::spawn(move || {
@@ -483,11 +480,26 @@ async fn a_total_timeout_spans_the_head_and_the_body() {
         std::thread::sleep(Duration::from_millis(700));
         let _ = stream.write_all(b"ok");
     });
-    let dir = probe(&format!("tcp://{peer}"), None);
+    peer
+}
+
+/// One total timeout covers every phase of an SDK request, even under a
+/// virtual clock (the guest's clock stands still, its timers don't):
+/// a head and a body that each come within the limit, but not both;
+/// for `send` and for a streamed body read with `read_to_end`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_total_timeout_spans_the_head_and_the_body() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let sent = split_delay_peer();
+    let streamed = split_delay_peer();
+    // Both peers are on loopback.
+    let dir = probe("tcp://127.0.0.1:*", None);
     let mut overrides = toml::Table::new();
     overrides.insert(
         "ops".into(),
-        toml::Value::String(format!("get-total 1000 http://{peer}/")),
+        toml::Value::String(format!(
+            "get-total 1000 http://{sent}/; stream-total 1000 16 http://{streamed}/"
+        )),
     );
     let instance = host
         .start_with(
@@ -497,10 +509,12 @@ async fn a_total_timeout_spans_the_head_and_the_body() {
         .await
         .expect("start net-probe");
     instance.wait_for_running().await.expect("running");
-    let result = string(&instance.storage(), "op/0");
-    assert!(
-        result.starts_with("err:TotalTimeout") && result.ends_with("|sent:true"),
-        "{result}"
-    );
+    for key in ["op/0", "op/1"] {
+        let result = string(&instance.storage(), key);
+        assert!(
+            result.starts_with("err:TotalTimeout") && result.ends_with("|sent:true"),
+            "{key}: {result}"
+        );
+    }
     instance.stop().await.unwrap();
 }

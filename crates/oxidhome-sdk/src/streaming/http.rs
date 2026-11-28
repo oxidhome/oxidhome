@@ -142,7 +142,8 @@ pub enum Error {
     /// Nothing was sent.
     #[error("{0}")]
     Request(String),
-    /// The response body is larger than [`Request::max_body`].
+    /// The response body is larger than [`Request::max_body`] (or the
+    /// `max` given to [`BodyReader::read_to_end`]).
     #[error("response body exceeds {limit} bytes")]
     BodyTooLarge {
         /// The limit that was exceeded.
@@ -474,7 +475,9 @@ impl Request {
     }
 
     /// Bound connecting, the wait for the response head, and each gap
-    /// between body chunks (each separately).
+    /// between body chunks (each separately). [`Request::total_timeout`]
+    /// still bounds them all: raising this past it needs that raised
+    /// too.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -594,7 +597,7 @@ impl Request {
                 _incoming: incoming,
                 _response: response,
                 _upload: upload,
-                deadline: expiry.map(|expiry| expiry.deadline),
+                expiry,
                 ended: false,
             },
         })
@@ -1107,8 +1110,10 @@ pub struct BodyReader {
     _response: IncomingResponse,
     /// An upload the server answered before it finished.
     _upload: Option<OutgoingBody>,
-    /// The request's total timeout, for [`BodyReader::read_to_end`].
-    deadline: Option<Deadline>,
+    /// The request's total timeout, for [`BodyReader::read_to_end`]: the
+    /// exchange's own timer, since a virtual clock moves timers without
+    /// the clock (a new one would start the limit over).
+    expiry: Option<Expiry>,
     ended: bool,
 }
 
@@ -1157,7 +1162,8 @@ impl BodyReader {
     /// [`Request::send_streaming`]) runs out: a bounded body read the
     /// plugin chooses to make, for example only for a status below `400`
     /// (an error status being the answer whatever its body). The reader
-    /// has ended afterwards, whatever the outcome.
+    /// has ended afterwards, whatever the outcome: drop it (its
+    /// [`BodyReader::pollable`] still follows the stream).
     ///
     /// # Errors
     ///
@@ -1168,8 +1174,7 @@ impl BodyReader {
             return Ok(Vec::new());
         }
         self.ended = true;
-        let expiry = self.deadline.map(Deadline::timer);
-        read_stream(&self.stream, &self.ready, max, expiry.as_ref())
+        read_stream(&self.stream, &self.ready, max, self.expiry.as_ref())
     }
 
     /// A pollable that is ready when [`BodyReader::read`] has something to
