@@ -699,6 +699,7 @@ async fn the_owner_narrows_and_resets_the_grant_over_rest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn the_owner_narrows_and_resets_the_grant_over_connect() {
     let g = granting("net-grants-connect");
     let connect = |rpc: &str| format!("/oxidhome.v1.PluginsService/{rpc}");
