@@ -2056,35 +2056,114 @@ fn strict_grant_write(path: &str) -> Option<(&'static [StrictField], Resource)> 
     }
 }
 
-/// Refuse an unknown key or a `null` anywhere in `value`. The codec
-/// drops the first and reads the second as unset, and an unset grant
-/// selector means every device. A message must be a JSON object and a
-/// repeated message an array: serde would also take a message as a
-/// positional array, which this check couldn't see into.
-fn check_strict(value: &serde_json::Value, fields: &[StrictField], at: &str) -> Result<(), String> {
-    let Some(object) = value.as_object() else {
+/// A JSON value as written: object members in order, under their
+/// literal names. Not `serde_json::Value`, which reads an object keyed
+/// by `serde_json`'s private raw-value token as the JSON in its string,
+/// where the codec sees an unknown key.
+enum JsonTree {
+    Null,
+    Scalar,
+    Array(Vec<JsonTree>),
+    Object(Vec<(String, JsonTree)>),
+}
+
+impl<'de> serde::Deserialize<'de> for JsonTree {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = JsonTree;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+            fn visit_unit<E>(self) -> Result<JsonTree, E> {
+                Ok(JsonTree::Null)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<JsonTree, E> {
+                Ok(JsonTree::Scalar)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<JsonTree, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(JsonTree::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<JsonTree, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(JsonTree::Object(members))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// An unknown key as shown in an error: a long one is cut, since a gRPC
+/// error message rides in a response header.
+fn shown_key(key: &str) -> String {
+    const MAX: usize = 64;
+    match key.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &key[..cut]),
+        None => key.to_owned(),
+    }
+}
+
+/// Refuse an unknown or repeated key or a `null` anywhere in `value`.
+/// The codec drops an unknown key and reads `null` as unset, and an
+/// unset grant selector means every device. A message must be a JSON
+/// object and a repeated message an array: serde would also take a
+/// message as a positional array, which this check couldn't see into.
+fn check_strict(value: &JsonTree, fields: &[StrictField], at: &str) -> Result<(), String> {
+    let JsonTree::Object(members) = value else {
         return Err(match at.strip_suffix('.') {
             Some(at) => format!("`{at}` must be a JSON object"),
             None => "the request must be a JSON object".to_owned(),
         });
     };
-    for (key, value) in object {
-        let Some(field) = fields.iter().find(|f| f.names.contains(&key.as_str())) else {
-            return Err(format!("unknown field `{at}{key}`"));
+    let mut seen = Vec::with_capacity(fields.len());
+    for (key, value) in members {
+        let Some(index) = fields.iter().position(|f| f.names.contains(&key.as_str())) else {
+            return Err(format!("unknown field `{at}{}`", shown_key(key)));
         };
-        if value.is_null() {
-            return Err(format!("`{at}{key}` is null: omit it or give a value"));
+        if seen.contains(&index) {
+            return Err(format!("`{at}{key}` is given twice"));
         }
-        match field.shape {
-            StrictShape::Leaf => {}
-            StrictShape::Message(inner) => check_strict(value, inner, &format!("{at}{key}."))?,
-            StrictShape::Repeated(inner) => {
-                let Some(items) = value.as_array() else {
-                    return Err(format!("`{at}{key}` must be a JSON array"));
-                };
+        seen.push(index);
+        match (value, &fields[index].shape) {
+            (JsonTree::Null, _) => {
+                return Err(format!("`{at}{key}` is null: omit it or give a value"));
+            }
+            (_, StrictShape::Leaf) => {}
+            (_, StrictShape::Message(inner)) => {
+                check_strict(value, inner, &format!("{at}{key}."))?;
+            }
+            (JsonTree::Array(items), StrictShape::Repeated(inner)) => {
                 for (i, item) in items.iter().enumerate() {
                     check_strict(item, inner, &format!("{at}{key}[{i}]."))?;
                 }
+            }
+            (_, StrictShape::Repeated(_)) => {
+                return Err(format!("`{at}{key}` must be a JSON array"));
             }
         }
     }
@@ -2117,7 +2196,7 @@ impl connectrpc::Interceptor for StrictGrantJson {
             return next.run(req).await;
         };
         require_connect(&req.ctx, Action::PolicyManage, &resource)?;
-        serde_json::from_slice::<serde_json::Value>(req.payload.bytes())
+        serde_json::from_slice::<JsonTree>(req.payload.bytes())
             .map_err(|err| format!("invalid JSON: {err}"))
             .and_then(|value| check_strict(&value, fields, ""))
             .map_err(|msg| rpc_err(&req.ctx, ConnectError::invalid_argument(msg)))?;

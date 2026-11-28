@@ -694,16 +694,13 @@ async fn connect_role_writes_refuse_loose_json() {
     };
 
     // gRPC-Web JSON: refused in the trailer and audited as a deny, by
-    // the strict check (an unknown key) or by the codec (a duplicate key).
+    // the strict check (an unknown key) or by the codec (a `null` string).
     for (i, (payload, needle)) in [
         (
             grant(json!({"actions": ["device.command"], "device": ["dev-ab*"]})),
             "grants[0].device",
         ),
-        (
-            r#"{"name": "narrow", "name": "again", "grants": {}}"#.to_owned(),
-            "duplicate field",
-        ),
+        (grant(json!({"actions": [null]})), "failed to decode JSON"),
     ]
     .into_iter()
     .enumerate()
@@ -785,6 +782,19 @@ async fn connect_role_writes_refuse_loose_json() {
             json!({"name": "narrow", "grants": {"grants": {"actions": []}}}).to_string(),
             "`grants.grants` must be a JSON array",
         ),
+        (
+            r#"{"name": "narrow", "name": "again", "grants": {}}"#.to_owned(),
+            "`name` is given twice",
+        ),
+        (
+            json!({"name": "narrow", "grants": {"$serde_json::private::RawValue": "{}"}})
+                .to_string(),
+            "unknown field `grants.$serde_json::private::RawValue`",
+        ),
+        (
+            json!({"name": "narrow", "x".repeat(10_000): 1}).to_string(),
+            &format!("unknown field `{}…`", "x".repeat(64)),
+        ),
         // The codec's own refusals still apply.
         (grant(json!({"actions": [null]})), "failed to decode JSON"),
         (
@@ -819,11 +829,13 @@ async fn connect_role_writes_refuse_loose_json() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(reply["role"]["grants"], json!(["device.command[dev-ab*]"]));
 
-    // UpdateRole: a `null` selector or an array-form request is refused
-    // and the role is kept.
+    // UpdateRole: a `null` selector, an array-form request or an
+    // unknown key that `serde_json::Value` would read as raw JSON is
+    // refused and the role is kept.
     for body in [
         loose.clone(),
         json!(["narrow", {"grants": [[["device.command"], null, null]]}]).to_string(),
+        json!({"name": "narrow", "grants": {"$serde_json::private::RawValue": "{}"}}).to_string(),
     ] {
         let (status, reply) = send(&router, "POST", UPDATE, &owner.plaintext, &body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
