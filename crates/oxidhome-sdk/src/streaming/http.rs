@@ -40,7 +40,9 @@
 //!   blocked inside the host is out of the liveness watchdog's reach,
 //!   but the watchdog stops the instance once the call returns late, so
 //!   a request that runs out its total timeout still leaves the plugin
-//!   time to handle the error. With [`Request::send_streaming`] it
+//!   time to handle the error, as long as the call spent less than 5 s
+//!   before sending it (the watchdog counts from the start of the call;
+//!   set a shorter total timeout for a request sent later in a call). With [`Request::send_streaming`] it
 //!   bounds everything up to the response head (and the end of the
 //!   request body); the body is then read without a deadline, only
 //!   [`Request::timeout`] between chunks, except by
@@ -102,8 +104,9 @@ pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 /// Default [`Request::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default [`Request::total_timeout`]: under the host's 30 s limit on
-/// one plugin call, so a request that runs it out still returns in time
-/// for the plugin to handle the error.
+/// one plugin call (counted from the start of the call), so a request
+/// sent early in a call that runs it out still returns in time for the
+/// plugin to handle the error.
 pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
 /// The host's budget for a request's headers: each name once and every
 /// value, plus a few dozen bytes of bookkeeping for each, so the headers
