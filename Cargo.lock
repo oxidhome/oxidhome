@@ -1652,6 +1652,7 @@ dependencies = [
  "libc",
  "oxidhome-manifest",
  "oxidhome-proto",
+ "oxidhome-sdk",
  "rand 0.10.4",
  "rcgen",
  "rmcp",

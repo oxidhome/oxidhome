@@ -24,9 +24,10 @@
 //! keeps open between calls becomes readable: a connected `TcpStream`, or
 //! a `UdpSocket` that has connected, sent, or tried a receive (a
 //! non-blocking `recv_from` that answered `WouldBlock` counts), a
-//! [`discovery::DiscoverySocket`], or the body of an HTTP response the
+//! [`discovery::DiscoverySocket`], the body of an HTTP response the
 //! plugin is reading ([`http::BodyReader`], or a `wasi:http`
-//! `incoming-body` stream). The
+//! `incoming-body` stream), or a `wasi:http` response it is waiting for
+//! (a `future-incoming-response` it hasn't taken with `get`). The
 //! cadence can then be a slow fallback rather than a polling rate.
 //! Wakeups are coalesced (one tick however much arrived) and start at
 //! least 100 ms after the previous tick returned. Read what a tick finds,

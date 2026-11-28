@@ -32,13 +32,16 @@
 //!
 //! - **Timeouts.** [`Request::timeout`] (30 s by default) bounds
 //!   connecting, waiting for the response head, and each gap between
-//!   body chunks, each on its own: a server that trickles its body keeps
-//!   [`Request::send`] busy for as long as it trickles.
-//!   [`Request::total_timeout`] bounds the whole exchange, redirects
-//!   included ([`Error::TotalTimeout`]); with
-//!   [`Request::send_streaming`], everything up to the response head.
-//!   Set it on calls from `tick` or a command: a call blocked inside the
-//!   host is out of the liveness watchdog's reach.
+//!   body chunks, each on its own. [`Request::total_timeout`]
+//!   ([`DEFAULT_TOTAL_TIMEOUT`], 30 s, by default) bounds the whole
+//!   exchange, redirects included ([`Error::TotalTimeout`]), so a server
+//!   that trickles its body can't keep [`Request::send`] busy: a call
+//!   blocked inside the host is out of the liveness watchdog's reach.
+//!   With [`Request::send_streaming`] it bounds everything up to the
+//!   response head; the body is then read without a deadline, only
+//!   [`Request::timeout`] between chunks. Raise it for a big or slow
+//!   download or a long poll, or turn it off with
+//!   [`Request::no_total_timeout`].
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
 //!   the request with [`Error::BodyTooLarge`]. The host caps a request's
 //!   headers at [`MAX_HEADER_BYTES`]; more fails it with
@@ -86,9 +89,12 @@ pub const MAX_REDIRECTS: u8 = 5;
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 /// Default [`Request::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default [`Request::total_timeout`].
+pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The host's budget for a request's headers: each name once and every
 /// value, plus a few dozen bytes of bookkeeping for each, so the headers
-/// that fit are somewhat less than this.
+/// that fit are somewhat less than this. The host's own limit (its
+/// `FIELD_SIZE_LIMIT`) isn't in WIT; a host test keeps the two equal.
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
 /// Headers `wasi:http` refuses from a plugin: hop-by-hop headers, and
 /// `host`, which the host sets from the URL. [`Request::header`] drops
@@ -112,9 +118,10 @@ const READ_CHUNK: u64 = 64 * 1024;
 /// Headers dropped when a redirect leaves the origin.
 const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "cookie", "proxy-authorization"];
 /// Most of a [`Request::total_timeout`]'s remainder the host's connect
-/// timeout leaves unused, so a server that can't be reached fails as
-/// `connection-timeout` (nothing sent) before the total timeout (maybe
-/// sent) ends the request.
+/// timeout leaves unused (10 % of it, at most this), so a server that
+/// can't be reached fails as `connection-timeout` (nothing sent) before
+/// the total timeout (maybe sent) ends the request. Fixed: a connect
+/// that needs that last slice fails instead.
 const CONNECT_MARGIN: Duration = Duration::from_millis(500);
 
 /// Why a request failed. [`Error::may_have_reached_server`] tells
@@ -400,7 +407,7 @@ impl Request {
             headers: Vec::new(),
             body: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
-            total_timeout: None,
+            total_timeout: Some(DEFAULT_TOTAL_TIMEOUT),
             max_body: DEFAULT_MAX_BODY,
             max_redirects: MAX_REDIRECTS,
             connection_options: Vec::new(),
@@ -474,15 +481,28 @@ impl Request {
 
     /// Bound the whole exchange, from the call to [`Request::send`] until
     /// the body has arrived (redirects included), or until the response
-    /// head has arrived for [`Request::send_streaming`]. None by default.
+    /// head has arrived for [`Request::send_streaming`] (its
+    /// [`BodyReader`] has no deadline). [`DEFAULT_TOTAL_TIMEOUT`] by
+    /// default.
     ///
-    /// The host's connect timeout is then kept up to 10 % (at most
-    /// 500 ms) short of the time left, so a server that can't be reached
-    /// fails as `connection-timeout` (nothing sent) rather than as
-    /// [`Error::TotalTimeout`] (maybe sent).
+    /// The host's connect timeout is kept up to 10 % (at most 500 ms,
+    /// a fixed margin) short of the time left, so a server that can't be
+    /// reached fails as `connection-timeout` (nothing sent) rather than
+    /// as [`Error::TotalTimeout`] (maybe sent).
     #[must_use]
     pub fn total_timeout(mut self, limit: Duration) -> Self {
         self.total_timeout = Some(limit);
+        self
+    }
+
+    /// No [`Request::total_timeout`]: only [`Request::timeout`] bounds
+    /// the request, each phase on its own, so a server that trickles its
+    /// body keeps [`Request::send`] busy for as long as it trickles, out
+    /// of the liveness watchdog's reach. Prefer a longer
+    /// [`Request::total_timeout`].
+    #[must_use]
+    pub fn no_total_timeout(mut self) -> Self {
+        self.total_timeout = None;
         self
     }
 
@@ -1048,8 +1068,10 @@ impl StreamingResponse {
 
 /// A response body read as it arrives. Dropping it ends the exchange.
 ///
-/// [`Request::timeout`] still bounds each gap between body chunks: after
-/// that long without data, a read fails with `connection-read-timeout`.
+/// [`Request::total_timeout`] ended with the head: the body has no
+/// deadline. [`Request::timeout`] still bounds each gap between body
+/// chunks: after that long without data, a read fails with
+/// `connection-read-timeout`.
 /// A reader the plugin keeps between calls wakes it early when it has
 /// something to read, including its end: drop the reader once it has
 /// ended, or the plugin keeps being woken.
@@ -1700,5 +1722,16 @@ mod tests {
     fn redirect_limits_are_clamped() {
         assert_eq!(Request::get("http://h").max_redirects(50).max_redirects, 5);
         assert_eq!(Request::get("http://h").max_redirects(2).max_redirects, 2);
+    }
+
+    #[test]
+    fn a_total_timeout_is_on_unless_turned_off() {
+        let request = Request::get("http://h");
+        assert_eq!(request.total_timeout, Some(DEFAULT_TOTAL_TIMEOUT));
+        assert_eq!(request.clone().no_total_timeout().total_timeout, None);
+        let longer = request
+            .no_total_timeout()
+            .total_timeout(Duration::from_secs(90));
+        assert_eq!(longer.total_timeout, Some(Duration::from_secs(90)));
     }
 }

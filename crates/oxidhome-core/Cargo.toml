@@ -274,3 +274,6 @@ rcgen.workspace = true
 # `http-body-util` is now a regular dep (see above); the 15-e
 # Connect server-streaming test and the 14.1 MCP handshake test
 # both use `BodyExt::frame()` off it.
+# The SDK's copies of host limits (`MAX_HEADER_BYTES`) are checked
+# against the host's in unit tests. Native builds may enable both worlds.
+oxidhome-sdk = { path = "../oxidhome-sdk", features = ["streaming-plugin"] }

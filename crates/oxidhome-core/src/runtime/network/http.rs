@@ -118,6 +118,8 @@ const MAX_PATH_LEN: usize = 8 * 1024;
 /// host keeps; also hyper's read-buffer cap.
 const MAX_RESPONSE_HEAD: usize = 64 * 1024;
 /// Most bytes one `fields` map may hold (upstream's default is 128 KiB).
+/// The SDK copies it as `streaming::http::MAX_HEADER_BYTES`; a unit test
+/// keeps the two equal.
 pub(crate) const FIELD_SIZE_LIMIT: usize = 16 * 1024;
 /// Longest header name a guest may set. Upstream charges a repeated
 /// name once against [`FIELD_SIZE_LIMIT`] but copies it for every value
@@ -749,6 +751,16 @@ mod tests {
 
     fn plain(s: &str) -> bool {
         plain_authority(&s.parse().expect("authority"))
+    }
+
+    /// The SDK documents the host's header budget as a constant of its
+    /// own (no WIT carries it); it must not drift from the host's.
+    #[test]
+    fn the_sdk_header_budget_is_the_hosts() {
+        assert_eq!(
+            oxidhome_sdk::streaming::http::MAX_HEADER_BYTES,
+            super::FIELD_SIZE_LIMIT
+        );
     }
 
     #[test]

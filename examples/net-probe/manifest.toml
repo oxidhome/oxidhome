@@ -49,6 +49,7 @@ storage_quota_kb = 16
 #   nets -             list the local networks the grant covers
 #   hold-disc <ip:port> send "ping" from a discovery socket kept open; ticks drain it
 #   hold-http <url>    GET with the SDK client's streaming body, kept open; ticks drain it
+#   hold-head <url>    GET over raw wasi:http, the pending response kept; ticks take it once there
 type = "string"
 default = ""
 description = "Network operations to run on init."

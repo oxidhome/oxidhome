@@ -5,7 +5,8 @@
 //! `err:<detail>`), so a host test can assert what the network policy let
 //! through. See `manifest.toml` for the operation syntax.
 //!
-//! The `hold-*` operations keep their socket (or response body) open.
+//! The `hold-*` operations keep their socket (or response, or response
+//! body) open.
 //! Each `tick` counts itself (`ticks`) and drains them without blocking: the
 //! number of messages read so far goes to `received` and the last one to
 //! `last`, so a host test can see when, and how often, the host woke the
@@ -21,7 +22,8 @@ use oxidhome_sdk::streaming::discovery::{self, DiscoverySocket};
 use oxidhome_sdk::streaming::http::{BodyReader, Request};
 use oxidhome_sdk::streaming::wasi::http::outgoing_handler;
 use oxidhome_sdk::streaming::wasi::http::types::{
-    Fields, IncomingBody, Method, OutgoingBody, OutgoingRequest, RequestOptions, Scheme,
+    Fields, FutureIncomingResponse, IncomingBody, Method, OutgoingBody, OutgoingRequest,
+    RequestOptions, Scheme,
 };
 use oxidhome_sdk::streaming::wasi::io::streams::StreamError;
 use oxidhome_sdk::{Plugin, StreamingPlugin};
@@ -46,6 +48,7 @@ struct NetProbe {
     tcp: Vec<TcpStream>,
     discovery: Vec<DiscoverySocket>,
     bodies: Vec<BodyReader>,
+    heads: Vec<FutureIncomingResponse>,
     ticks: i64,
     received: i64,
 }
@@ -83,6 +86,10 @@ impl Plugin for NetProbe {
                         "held".to_owned()
                     })
                     .map_err(|e| sdk_err(&e)),
+                Some(("hold-head", url)) => http_start(url).map(|pending| {
+                    self.heads.push(pending);
+                    "held".to_owned()
+                }),
                 _ => run(op),
             };
             let result = match result {
@@ -145,6 +152,19 @@ impl Plugin for NetProbe {
                 }
             }
             true
+        });
+        // A response is taken once it's there, never waited for; its
+        // status counts as a message.
+        self.heads.retain(|pending| match pending.get() {
+            None => true,
+            Some(response) => {
+                last = Some(match response {
+                    Ok(Ok(response)) => response.status().to_string(),
+                    other => format!("{other:?}"),
+                });
+                self.received += 1;
+                false
+            }
         });
         // `received` last: a test that sees it can read `last`.
         if let Some(last) = last {
@@ -462,7 +482,8 @@ fn http(url: &str) -> Result<String, String> {
 /// GET `url` once. With `block`, wait on the response's pollable;
 /// without, call `get` until it answers (as a plugin polling from `tick`
 /// would).
-fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), String> {
+/// Send a `GET` to `url` over raw `wasi:http`; the response is pending.
+fn http_start(url: &str) -> Result<FutureIncomingResponse, String> {
     let (scheme, rest) = url.split_once("://").ok_or("no scheme")?;
     // No `/` after the authority: leave the path unset (`none`).
     let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
@@ -491,7 +512,11 @@ fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), St
     options
         .set_connect_timeout(Some(10_000_000_000))
         .map_err(|()| "connect timeout")?;
-    let pending = outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))?;
+    outgoing_handler::handle(request, Some(options)).map_err(|e| format!("{e:?}"))
+}
+
+fn http_get(url: &str, block: bool) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    let pending = http_start(url)?;
     let ready = if block {
         pending.subscribe().block();
         pending.get()

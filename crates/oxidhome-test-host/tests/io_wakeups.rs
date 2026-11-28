@@ -411,6 +411,55 @@ async fn a_response_body_wakes_the_plugin_before_its_tick() {
     drop(next);
 }
 
+/// A pending `wasi:http` response the plugin keeps (raw
+/// `future-incoming-response`) wakes it when the head arrives; once the
+/// plugin has taken it, nothing wakes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_response_wakes_the_plugin_before_its_tick() {
+    let host = TestHost::with_virtual_clock().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http peer");
+    let peer = listener.local_addr().expect("local addr");
+    let (answer_tx, answer_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        // The head only when the test says so.
+        let _ = answer_rx.recv();
+        let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        let _ = stream.flush();
+        // Open until the test is done.
+        let _ = answer_rx.recv();
+    });
+    let dir = probe(&format!("tcp://{peer}"), Some(HOUR_MS));
+    let instance = start(&host, &dir, &format!("hold-head http://{peer}/slow")).await;
+    let storage = instance.storage();
+    // Nothing to read yet: no tick.
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(int(&storage, "ticks"), 0);
+
+    // The head wakes it.
+    answer_tx.send(()).unwrap();
+    wait_for(&storage, "received", 1).await;
+    assert_eq!(string(&storage, "last"), "204");
+    assert_eq!(int(&storage, "ticks"), 1);
+    assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
+
+    // Taken: no more wakeups.
+    wait_for_gate(&host).await;
+    host.advance(GAP * 5).await.unwrap();
+    tokio::time::sleep(QUIET).await;
+    host.advance(GAP * 5).await.unwrap();
+    assert_eq!(int(&storage, "ticks"), 1);
+    instance.stop().await.unwrap();
+    drop(answer_tx);
+}
+
 /// One total timeout covers every phase of an SDK request, even under a
 /// virtual clock (the guest's clock stands still, its timers don't):
 /// a head and a body that each come within the limit, but not both.

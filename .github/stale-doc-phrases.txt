@@ -32,3 +32,8 @@ devices:command
 blobs:read
 SensitiveGuard
 delete-forced
+
+# The SDK HTTP client's total timeout is on by default (30 s), and
+# pending `wasi:http` responses wake a streaming plugin.
+optional total timeout
+responses still pending are not watched
