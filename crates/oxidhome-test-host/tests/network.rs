@@ -579,6 +579,29 @@ fn trickling_server() -> (SocketAddr, std::sync::mpsc::Receiver<Duration>) {
     (addr, rx)
 }
 
+/// A server on loopback that answers one request with its head at once
+/// and its 2-byte body `ok` after `delay`.
+fn slow_body_server(delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow-body server");
+    let addr = listener.local_addr().expect("local addr");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+            line.clear();
+        }
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n");
+        let _ = stream.flush();
+        std::thread::sleep(delay);
+        let _ = stream.write_all(b"ok");
+        let _ = stream.flush();
+    });
+    addr
+}
+
 /// A server on loopback that accepts one connection and never reads
 /// from it, until the test drops the returned sender.
 fn stalled_server() -> (SocketAddr, std::sync::mpsc::Sender<()>) {
@@ -617,6 +640,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     let cut = dropping_server();
     let (trickle, connected) = trickling_server();
     let (trickle_streamed, streamed_connected) = trickling_server();
+    let slow_body = slow_body_server(Duration::from_millis(1500));
     let (stalled, _stalled_open) = stalled_server();
     // Freed after the other servers started, so none of them takes it.
     let closing = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -634,6 +658,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
             format!("tcp://127.0.0.1:{}", ok.port()),
             format!("tcp://{trickle}"),
             format!("tcp://{trickle_streamed}"),
+            format!("tcp://{slow_body}"),
             format!("tcp://{closed}"),
             format!("tcp://{stalled}"),
             format!("https://{cut}"),
@@ -657,6 +682,9 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
             format!("stream-total 1000 4096 http://{trickle_streamed}/"),
             format!("stream-total 5000 16 http://127.0.0.1:{}/", ok.port()),
             format!("stream-total 5000 3 http://127.0.0.1:{}/", ok.port()),
+            // The total timeout ends with the head: `read_blocking` waits
+            // past it.
+            format!("stream-slow 500 http://{slow_body}/"),
         ],
     )
     .await;
@@ -704,6 +732,7 @@ async fn the_sdk_client_bounds_exchanges_and_says_what_went_out() {
     );
     assert_eq!(results[11], "ok:200:hello");
     assert_eq!(results[12], "err:BodyTooLarge { limit: 3 }|sent:true");
+    assert_eq!(results[13], "ok:200:ok");
     assert_eq!(ok.accepted(), 6);
 }
 

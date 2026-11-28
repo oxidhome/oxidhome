@@ -36,6 +36,7 @@ storage_quota_kb = 16
 #   post-total <ms> <len> <url> POST <len> bytes with the SDK client and that total timeout
 #   get-big <len> <url> GET with the SDK client and a <len>-byte header value
 #   stream <url>       GET with the SDK client's streaming body, read to the end
+#   stream-slow <ms> <url> `stream` with that total timeout (it ends with the head)
 #   stream-total <ms> <max> <url> GET with send_streaming and that total timeout, then read_to_end(max)
 #   hdr <len>          append a header with a <len>-byte name to new fields
 #   hdrval <len>       append a header with a <len>-byte value to new fields

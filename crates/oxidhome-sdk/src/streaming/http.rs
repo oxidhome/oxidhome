@@ -38,11 +38,12 @@
 //!   that trickles its body can't keep [`Request::send`] busy: a call
 //!   blocked inside the host is out of the liveness watchdog's reach.
 //!   With [`Request::send_streaming`] it bounds everything up to the
-//!   response head; the body is then read without a deadline, only
+//!   response head (and the end of the request body); the body is then read without a deadline, only
 //!   [`Request::timeout`] between chunks, except by
-//!   [`BodyReader::read_to_end`], which keeps to it. Raise it for a big or slow
-//!   download or a long poll, or turn it off with
-//!   [`Request::no_total_timeout`].
+//!   [`BodyReader::read_to_end`], which keeps to it. Raise it for a big
+//!   or slow download or a long poll, or turn it off with
+//!   [`Request::no_total_timeout`]; a server that takes longer than
+//!   [`Request::timeout`] to answer (a long poll) needs that raised too.
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
 //!   the request with [`Error::BodyTooLarge`]. The host caps a request's
 //!   headers at [`MAX_HEADER_BYTES`]; more fails it with
@@ -482,9 +483,9 @@ impl Request {
 
     /// Bound the whole exchange, from the call to [`Request::send`] until
     /// the body has arrived (redirects included), or until the response
-    /// head has arrived for [`Request::send_streaming`] (its
-    /// [`BodyReader`] keeps to it only in [`BodyReader::read_to_end`]).
-    /// [`DEFAULT_TOTAL_TIMEOUT`] by
+    /// head has arrived (and the request body has been sent) for
+    /// [`Request::send_streaming`], whose [`BodyReader`] keeps to it only
+    /// in [`BodyReader::read_to_end`]. [`DEFAULT_TOTAL_TIMEOUT`] by
     /// default.
     ///
     /// The host's connect timeout is kept up to 10 % (at most 500 ms,

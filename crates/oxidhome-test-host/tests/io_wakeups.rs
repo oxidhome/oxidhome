@@ -450,7 +450,7 @@ async fn a_pending_response_wakes_the_plugin_before_its_tick() {
     assert_eq!(int(&storage, "ticks"), 1);
     assert_eq!(host.virtual_clock().unwrap().elapsed(), Duration::ZERO);
 
-    // Taken: no more wakeups.
+    // Taken (the plugin keeps the emptied future): no more wakeups.
     wait_for_gate(&host).await;
     host.advance(GAP * 5).await.unwrap();
     tokio::time::sleep(QUIET).await;
