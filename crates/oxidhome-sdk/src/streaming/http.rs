@@ -33,17 +33,25 @@
 //! - **Timeouts.** [`Request::timeout`] (30 s by default) bounds
 //!   connecting, waiting for the response head, and each gap between
 //!   body chunks, each on its own. [`Request::total_timeout`]
-//!   ([`DEFAULT_TOTAL_TIMEOUT`], 30 s, by default) bounds the whole
+//!   ([`DEFAULT_TOTAL_TIMEOUT`], 25 s, by default) bounds the whole
 //!   exchange, redirects included ([`Error::TotalTimeout`]), so a server
-//!   that trickles its body can't keep [`Request::send`] busy: a call
-//!   blocked inside the host is out of the liveness watchdog's reach.
-//!   With [`Request::send_streaming`] it bounds everything up to the
-//!   response head (and the end of the request body); the body is then read without a deadline, only
+//!   that trickles its body can't keep [`Request::send`] busy. The
+//!   default is under the host's 30 s limit on one plugin call: a call
+//!   blocked inside the host is out of the liveness watchdog's reach,
+//!   but the watchdog stops the instance once the call returns late, so
+//!   a request that runs out its total timeout still leaves the plugin
+//!   time to handle the error. With [`Request::send_streaming`] it
+//!   bounds everything up to the response head (and the end of the
+//!   request body); the body is then read without a deadline, only
 //!   [`Request::timeout`] between chunks, except by
 //!   [`BodyReader::read_to_end`], which keeps to it. Raise it for a big
-//!   or slow download or a long poll, or turn it off with
-//!   [`Request::no_total_timeout`]; a server that takes longer than
-//!   [`Request::timeout`] to answer (a long poll) needs that raised too.
+//!   or slow download (from `init`, a command or a service call, each
+//!   under the same call limit), or turn it off with
+//!   [`Request::no_total_timeout`]. A server that may take longer than
+//!   that to answer (a long poll) is better served across calls: send
+//!   it with raw `wasi:http` (`outgoing-handler.handle`), keep the
+//!   `future-incoming-response`, and take the response with `get` from
+//!   the `tick` its arrival wakes.
 //! - **Limits.** Bodies over [`Request::max_body`] (1 MiB by default) end
 //!   the request with [`Error::BodyTooLarge`]. The host caps a request's
 //!   headers at [`MAX_HEADER_BYTES`]; more fails it with
@@ -91,8 +99,10 @@ pub const MAX_REDIRECTS: u8 = 5;
 pub const DEFAULT_MAX_BODY: usize = 1024 * 1024;
 /// Default [`Request::timeout`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default [`Request::total_timeout`].
-pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default [`Request::total_timeout`]: under the host's 30 s limit on
+/// one plugin call, so a request that runs it out still returns in time
+/// for the plugin to handle the error.
+pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(25);
 /// The host's budget for a request's headers: each name once and every
 /// value, plus a few dozen bytes of bookkeeping for each, so the headers
 /// that fit are somewhat less than this. The host's own limit (its
@@ -476,8 +486,10 @@ impl Request {
 
     /// Bound connecting, the wait for the response head, and each gap
     /// between body chunks (each separately). [`Request::total_timeout`]
-    /// still bounds them all: raising this past it needs that raised
-    /// too.
+    /// still bounds them all until [`Request::send`] /
+    /// [`Request::send_streaming`] returns (and in
+    /// [`BodyReader::read_to_end`]): raising this past it needs that
+    /// raised too.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -930,14 +942,7 @@ fn read_stream(
         }
         let room = max_body.saturating_sub(body.len()) as u64 + 1;
         match stream.read(room.min(READ_CHUNK)) {
-            Ok(chunk) if chunk.is_empty() => match expiry {
-                Some(expiry) => {
-                    if !poll(&[ready, &expiry.timer]).contains(&0) {
-                        return Err(expiry.deadline.expired());
-                    }
-                }
-                None => ready.block(),
-            },
+            Ok(chunk) if chunk.is_empty() => wait(ready, expiry)?,
             Ok(chunk) => {
                 // Checked before growing the buffer.
                 if chunk.len() > max_body - body.len() {
